@@ -1,0 +1,154 @@
+---
+# =============================================================================
+# jira_oracle_upgrade.yml
+#
+# Jira-driven Oracle 21c -> 26ai upgrade dispatcher (AutoUpgrade).
+#
+# Reference procedure:
+#   https://oracle-base.com/articles/26/multitenant-upgrade-to-26-autoupgrade
+#
+# Flow:
+#   1. Pre-flight Jira API token guard (/rest/api/2/myself) -- an expired
+#      token makes searches silently return empty, so we hard-fail here.
+#   2. Pre-flight check that the 26ai software home exists on the DB host.
+#   3. Find open issues in the UPG project.
+#   4. For each issue, include jira_oracle_upgrade_job.yml which runs the
+#      full analyze -> deploy -> verify cycle and transitions the issue.
+#
+# The ORACLE_SID for each job is parsed from the issue summary, e.g.:
+#      "Upgrade cdb1 to 26ai"
+# Falls back to default_oracle_sid if no match. NOTE: SID case matters on
+# Linux and is used verbatim -- the rebuilt lnx001 runs uppercase CDB1, so
+# issue summaries must carry the exact case (e.g. "Upgrade CDB1 to 26ai").
+#
+# Credentials: export JIRA_USER (Atlassian account email) and jira_api_token
+# (API token) in the environment, or override the vars below (vault).
+# =============================================================================
+
+- name: Jira-driven Oracle 21c to 26ai upgrades via AutoUpgrade
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Pre-flight: Jira token guard.
+    #    community.general.jira / searches silently return [] on an expired
+    #    token, so verify authentication explicitly before doing anything.
+    # -------------------------------------------------------------------------
+    - name: "PRE | Verify Jira API token is valid (/rest/api/2/myself)"
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/myself"
+        method: GET
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: jira_myself
+
+    - name: "PRE | Assert Jira identity resolved"
+      ansible.builtin.assert:
+        that:
+          - jira_myself.json.accountId is defined
+        fail_msg: >-
+          Jira authentication check failed -- token likely expired or invalid.
+          Regenerate the API token before re-running.
+        success_msg: "Authenticated to Jira as {{ jira_myself.json.displayName | default(jira_user) }}"
+
+    # -------------------------------------------------------------------------
+    # 1. Pre-flight: confirm the 26ai software home is installed on lnx001.
+    #    (Software-only install per the article; done outside this playbook.)
+    # -------------------------------------------------------------------------
+    - name: "PRE | Check 26ai Oracle home exists on {{ oracle_host }}"
+      ansible.builtin.stat:
+        path: "{{ oracle_target_home }}/bin/sqlplus"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: target_home_check
+
+    - name: "PRE | Assert 26ai home is installed"
+      ansible.builtin.assert:
+        that:
+          - target_home_check.stat.exists
+        fail_msg: >-
+          26ai software home not found at {{ oracle_target_home }} on
+          {{ oracle_host }}. Install the 26ai software first (runInstaller
+          -silent, software-only) and ensure the
+          oracle-ai-database-preinstall-26ai package has been applied.
+
+    - name: "PRE | Check autoupgrade.jar exists in 26ai home"
+      ansible.builtin.stat:
+        path: "{{ autoupgrade_jar }}"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: autoupgrade_jar_check
+
+    - name: "PRE | Assert autoupgrade.jar is present"
+      ansible.builtin.assert:
+        that:
+          - autoupgrade_jar_check.stat.exists
+        fail_msg: >-
+          {{ autoupgrade_jar }} not found. It ships with the 26ai home; if it
+          was removed, download the latest from
+          https://download.oracle.com/otn-pub/otn_software/autoupgrade.jar
+          into {{ oracle_target_home }}/rdbms/admin/.
+
+    # -------------------------------------------------------------------------
+    # 2. Find open UPG issues.
+    #    Uses the newer /rest/api/3/search/jql endpoint (the legacy
+    #    /rest/api/2/search POST endpoint has been retired on Jira Cloud).
+    # -------------------------------------------------------------------------
+    - name: "PRE | Search for open {{ jira_upg_project }} issues"
+      ansible.builtin.uri:
+        url: >-
+          {{ jira_url }}/rest/api/3/search/jql?jql={{ jira_jql_upg | urlencode }}&fields=summary&maxResults={{ jira_max_results }}
+        method: GET
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: upg_search
+
+    - name: "PRE | Build upgrade job list from issues"
+      ansible.builtin.set_fact:
+        upg_jobs: >-
+          {{ upg_jobs | default([]) + [ {
+               'issue_key':  item.key,
+               'summary':    item.fields.summary,
+               'oracle_sid': (item.fields.summary
+                              | regex_search('(?i)upgrade\s+([a-zA-Z0-9_$]+)', '\1')
+                              | default([default_oracle_sid], true)
+                              | first)
+             } ] }}
+      loop: "{{ upg_search.json.issues | default([]) }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "PRE | Nothing to do?"
+      ansible.builtin.debug:
+        msg: "No open issues found in project {{ jira_upg_project }}. Exiting."
+      when: upg_jobs | default([]) | length == 0
+
+    - name: "PRE | Upgrade jobs queued"
+      ansible.builtin.debug:
+        msg: "{{ upg_jobs | map(attribute='issue_key') | zip(upg_jobs | map(attribute='oracle_sid')) | list }}"
+      when: upg_jobs | default([]) | length > 0
+
+    # -------------------------------------------------------------------------
+    # 3. Run each upgrade job. A failure inside one job is handled by the
+    #    job file's rescue block (worklog + transition to Failed), so one
+    #    bad ticket does not stop the remaining tickets.
+    # -------------------------------------------------------------------------
+    - name: "JOB | Dispatch upgrade job per issue"
+      ansible.builtin.include_tasks: jira_oracle_upgrade_job.yml
+      loop: "{{ upg_jobs | default([]) }}"
+      loop_control:
+        loop_var: job
+        label: "{{ job.issue_key }} ({{ job.oracle_sid }})"

@@ -1,0 +1,351 @@
+---
+# jira_oracle_schema_refresh.yml
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   1. Search      : find all open REF issues matching the configured JQL
+#   2. Fetch       : retrieve each issue and parse customfield_10456 value
+#                    formatted as "SOURCE_SERVICE:SOURCE_SCHEMA=>TARGET_SERVICE:TARGET_SCHEMA"
+#                    e.g. "PRO:SOURCE=>UAT:TARGET"
+#   3. Pre-flight  : verify expdp/impdp exist on the DB host, confirm
+#                    source schema exists in the source Oracle instance
+#   4. Export      : run expdp on the source instance as the oracle OS user
+#   5. Import      : run impdp into the target instance with REMAP_SCHEMA
+#                    and TABLE_EXISTS_ACTION=REPLACE
+#   6. Verify      : count objects in target schema to confirm import
+#   7. Worklog     : posted per job by jira_oracle_schema_refresh_job.yml
+#                    (detailed export/import output incl. tables + row counts)
+#   8. Transition  : move issue to "Done" on success, "Failed" on error
+#   9. Summary     : print final outcome table
+#
+# CHANGES (July 2026):
+#   * Worklogs are now posted per-job inside jira_oracle_schema_refresh_job.yml
+#     with full datapump output. The legacy PLAY 3 worklog script tasks and the
+#     credentials sidecar file have been removed.
+#   * PLAY 1 now deletes any stale /tmp/jira_refresh_outcomes.json before the
+#     run, so an aborted previous run cannot leak old outcomes into PLAY 3.
+#
+# customfield_10456 format:
+#   "PRO:SOURCE=>UAT:TARGET"
+#    ^^^  ^^^^^^  ^^^  ^^^^^^
+#    |    |       |    └─ target schema name
+#    |    |       └─ target Oracle service/SID
+#    |    └─ source schema name
+#    └─ source Oracle service/SID
+#
+# Required vars (vars/main.yml — vault-encrypt sensitive values):
+#   # Jira
+#   jira_url          : "https://yourorg.atlassian.net"
+#   jira_user         : "ansible-svc@yourorg.com"
+#   jira_api_token    : !vault |  ...
+#   jira_jql_ref      : "project = REF AND issuetype = Task AND status = 'To Do'"
+#   jira_max_results  : 50
+#   jira_cloud        : true
+#   jira_status_done  : "Done"
+#   jira_status_failed: "Failed"
+#
+#   # Oracle DB host (SSH target)
+#   oracle_host       : "dbserver.yourorg.internal"
+#   oracle_os_user    : "oracle"
+#   oracle_base       : "/u01/app/oracle"
+#   oracle_home       : "/u01/app/oracle/product/19c/dbhome_1"
+#   datapump_dir      : "/u01/app/oracle/admin/orcl/dpdump"
+#   oracle_dba_user   : "system"
+#   oracle_dba_pass   : !vault |  ...
+#
+#   # Datapump tuning
+#   datapump_parallel    : 4
+#   datapump_compression : "ALL"
+#   cleanup_dump_files   : true
+#
+# Usage:
+#   ansible-playbook jira_oracle_schema_refresh.yml --ask-vault-pass
+
+# ── PLAY 1: Ansible controller — fetch Jira issues ──────────────────────────
+- name: "PLAY 1 | Fetch Jira refresh tasks and validate customfield_10456"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK — connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  - name: "PRE-FLIGHT | Remove stale outcomes file from any aborted previous run"
+    ansible.builtin.file:
+      path: "/tmp/jira_refresh_outcomes.json"
+      state: absent
+
+  - name: "1 | Search for open Jira refresh issues matching JQL"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: search
+      jql: "{{ jira_jql_ref }}"
+      maxresults: "{{ jira_max_results }}"
+      cloud: "{{ jira_cloud }}"
+    register: jira_search
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: >-
+        No Tasks Found — no Jira issues currently match JQL: {{ jira_jql_ref }}. Nothing to process; exiting cleanly.
+    when: jira_search.meta.issues | length == 0
+
+  - name: "1 | End play gracefully when no issues are found"
+    ansible.builtin.meta: end_play
+    when: jira_search.meta.issues | length == 0
+
+  - name: "1 | Show issues found"
+    ansible.builtin.debug:
+      msg: >-
+        Found {{ jira_search.meta.issues | length }} refresh issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}
+
+  - name: "2 | Fetch full details for each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: fetch
+      issue: "{{ item.key }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ jira_search.meta.issues }}"
+    loop_control:
+      label: "{{ item.key }}"
+    register: jira_issue_details
+
+  # Parse customfield_10456 value: "PRO:SOURCE=>UAT:TARGET"
+  # Strip whitespace, split on "=>", then split each side on ":"
+  # Result per issue: { issue_key, raw_spec,
+  #                     source_service, source_schema,
+  #                     target_service, target_schema }
+  - name: "2 | Parse refresh spec from customfield_10456"
+    ansible.builtin.set_fact:
+      refresh_jobs: >-
+        {{
+          refresh_jobs | default([]) + [{
+            'issue_key':      item.meta.key,
+            'raw_spec':       item.meta.fields.customfield_10456.value | trim,
+            'source_service': (item.meta.fields.customfield_10456.value | trim).split('=>')[0].split(':')[0] | upper,
+            'source_schema':  (item.meta.fields.customfield_10456.value | trim).split('=>')[0].split(':')[1] | upper,
+            'target_service': (item.meta.fields.customfield_10456.value | trim).split('=>')[1].split(':')[0] | upper,
+            'target_schema':  (item.meta.fields.customfield_10456.value | trim).split('=>')[1].split(':')[1] | upper
+          }]
+        }}
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+
+  - name: "2 | Show parsed refresh jobs"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} — {{ item.raw_spec }} | export {{ item.source_schema }}@{{ item.source_service }} → import {{ item.target_schema }}@{{ item.target_service }}
+    loop: "{{ refresh_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  # Persist refresh_jobs into a temp file so PLAY 2 (running on the DB host)
+  # can access it.  PLAY 2 slurps this file back at the start of its run.
+  - name: "2 | Write refresh job list to temp file for PLAY 2"
+    ansible.builtin.copy:
+      content: "{{ refresh_jobs | to_json }}"
+      dest: "/tmp/jira_refresh_jobs.json"
+      mode: '0600'
+    no_log: true
+
+# ── PLAY 2: Oracle DB host — run expdp/impdp per refresh job ────────────────
+- name: "PLAY 2 | Run Oracle schema refresh jobs on the DB host"
+  hosts: "{{ oracle_host }}"
+  gather_facts: true
+  become: true
+  become_user: "{{ oracle_os_user }}"
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    oracle_env:
+      ORACLE_HOME: "{{ oracle_home }}"
+      ORACLE_BASE: "{{ oracle_base }}"
+      PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/bin"
+      NLS_DATE_FORMAT: "YYYY-MM-DD HH24:MI:SS"
+
+  tasks:
+
+  # Slurp the job list written by PLAY 1 from the controller's /tmp
+  # (the controller delegates a fetch back to localhost to read it)
+  - name: "PLAY2-INIT | Read refresh job list from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_refresh_jobs.json"
+    register: refresh_jobs_raw
+    delegate_to: localhost
+    become: false
+
+  - name: "PLAY2-INIT | Decode refresh job list"
+    ansible.builtin.set_fact:
+      refresh_jobs: "{{ refresh_jobs_raw.content | b64decode | from_json }}"
+
+  - name: "PRE-FLIGHT | Confirm expdp binary exists"
+    ansible.builtin.stat:
+      path: "{{ oracle_home }}/bin/expdp"
+    register: expdp_stat
+
+  - name: "PRE-FLIGHT | Fail if expdp not found"
+    ansible.builtin.fail:
+      msg: "expdp not found at {{ oracle_home }}/bin/expdp. Check oracle_home in vars/main.yml."
+    when: not expdp_stat.stat.exists
+
+  - name: "PRE-FLIGHT | Confirm impdp binary exists"
+    ansible.builtin.stat:
+      path: "{{ oracle_home }}/bin/impdp"
+    register: impdp_stat
+
+  - name: "PRE-FLIGHT | Fail if impdp not found"
+    ansible.builtin.fail:
+      msg: "impdp not found at {{ oracle_home }}/bin/impdp. Check oracle_home in vars/main.yml."
+    when: not impdp_stat.stat.exists
+
+  - name: "PRE-FLIGHT | Confirm DATA_PUMP_DIR filesystem path exists and is writable"
+    ansible.builtin.file:
+      path: "{{ datapump_dir }}"
+      state: directory
+      mode: '0750'
+
+  # ── Run each refresh job sequentially ────────────────────────────────────
+  # Using include_tasks with loop so variables are scoped per job cleanly.
+  # NOTE: each job posts its own detailed worklog entry (export/import output
+  # with tables and row counts) from inside the included task file.
+
+  - name: "3-6 | Execute each refresh job"
+    ansible.builtin.include_tasks: jira_oracle_schema_refresh_job.yml
+    loop: "{{ refresh_jobs }}"
+    loop_control:
+      loop_var: job
+      label: "{{ job.issue_key }} | {{ job.source_schema }}@{{ job.source_service }} => {{ job.target_schema }}@{{ job.target_service }}"
+
+# ── PLAY 3: Ansible controller — transition issues ───────────────────────────
+- name: "PLAY 3 | Transition issues based on refresh outcomes"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY3-INIT | Read job outcomes from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_refresh_outcomes.json"
+    register: outcomes_raw
+
+  - name: "PLAY3-INIT | Decode job outcomes"
+    ansible.builtin.set_fact:
+      refresh_outcomes: "{{ outcomes_raw.content | b64decode | from_json }}"
+
+  - name: "7 | Show outcome per issue"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} | {{ item.source_schema }}@{{ item.source_service }} => {{ item.target_schema }}@{{ item.target_service }} : {{ item.status | upper }}
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "8 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: transition
+      issue: "{{ item.issue_key }}"
+      status: "{{ jira_status_done }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    ignore_errors: true
+
+  - name: "8 | Post failure comment for FAILED issues"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.issue_key }}"
+      comment: |
+        Automated schema refresh FAILED.
+
+        Spec: {{ item.raw_spec }}
+        Error: {{ item.error | default('See Ansible controller logs for details.') }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+
+        See the worklog entry on this issue for the full export/import output.
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    ignore_errors: true
+
+  - name: "8 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: transition
+      issue: "{{ item.issue_key }}"
+      status: "{{ jira_status_failed }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    ignore_errors: true
+
+  - name: "9 | Print final summary"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: >-
+      {{
+        [
+          '══════════════════════════════════════════════════════',
+          '  Jira Oracle Schema Refresh Summary',
+          '══════════════════════════════════════════════════════',
+          '  Run timestamp : ' + ansible_date_time.iso8601,
+          '  Issues found  : ' + (refresh_outcomes | length | string),
+          '  Succeeded     : ' + (refresh_outcomes | selectattr('status','equalto','done')   | list | length | string),
+          '  Failed        : ' + (refresh_outcomes | selectattr('status','equalto','failed') | list | length | string),
+          '  ──────────────────────────────────────────────────'
+        ]
+        + (refresh_outcomes | map(attribute='issue_key') | zip(
+             refresh_outcomes | map(attribute='status')
+           ) | map('join', '   →   ') | map('regex_replace', '^', '  ') | list)
+        + ['══════════════════════════════════════════════════════']
+      }}
+    loop_control:
+      label: "summary"
+
+  - name: "9 | Clean up temp files on controller"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "/tmp/jira_refresh_jobs.json"
+    - "/tmp/jira_refresh_outcomes.json"
+    loop_control:
+      label: "{{ item | basename }}"

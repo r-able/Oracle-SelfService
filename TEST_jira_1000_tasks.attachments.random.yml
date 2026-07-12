@@ -1,0 +1,62 @@
+---
+- name: Create 1000 JIRA tasks in DCR project
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: Set fact for Ansible date_time
+    delegate_to: localhost
+    run_once: true
+    set_fact:
+      currentdate: "{{ ansible_date_time.date }}"
+    tags: linux
+
+  - name: Display Ansible date fact
+    ansible.builtin.debug:
+      var: currentdate
+    run_once: true
+    tags: linux
+
+  - name: Build shuffled attachment list
+    run_once: true
+    set_fact:
+      dcr_attachments: "{{ (range(0, 21) | list | map('regex_replace', '^(.*)$', '/etc/ansible/attachments/DCR_0\\1.sql') | list) | shuffle }}"
+
+  - name: Create 1000 Jira tasks
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: create
+      #      project: "{{ project_key }}"
+      project: "DCR"
+      issuetype: Task
+      assignee: "Automation API"
+      summary: "Oracle DCR artf-{{ item }} submitted by DEVOPS on {{ ansible_facts['date_time'].iso8601[:19] }}"
+      description: "This is a Data Change Request to be executed by Ansible CTRL+ node."
+    loop: "{{ range(1, 1001) | list }}"
+    register: created_issues
+
+  - name: Attach all DCR_000-020.sql files to each Jira task in random order
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: attach
+      issue: "{{ item[0].meta.key }}"
+      attachment:
+        filename: "{{ item[1] }}"
+    loop: "{{ created_issues.results | product(dcr_attachments) | list }}"
+    loop_control:
+      label: "{{ item[0].meta.key }} <- {{ item[1] }}"
+
+  - name: Summary of created issues
+    ansible.builtin.debug:
+      msg: "Successfully created issue: {{ item.meta.key }}"
+    loop: "{{ created_issues.results }}"
+    loop_control:
+      label: "{{ item.item }}"
