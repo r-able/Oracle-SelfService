@@ -1,6 +1,6 @@
 ---
 # main.yml
-# encrypt this file with ansible-vault to protect sensitive information
+# encrypt this file with ansible-vault to protect sensitive information "ansible-vault encrypt main.yml"
 jira_url: <REDACTED>
 # Your Atlassian account email
 jira_user: "<REDACTED>"
