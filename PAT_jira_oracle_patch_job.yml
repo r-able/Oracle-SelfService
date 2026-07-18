@@ -1,5 +1,6 @@
 ---
 # PAT_jira_oracle_patch_job.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Included by jira_oracle_patch.yml for each patch job.
 # Loop variable: `job` — dict with:

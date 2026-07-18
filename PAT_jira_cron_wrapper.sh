@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # PAT_jira_cron_wrapper.sh
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Cron-safe wrapper for the DCR playbook (DCR_jira_data_change.yml).
 #

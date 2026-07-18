@@ -1,5 +1,6 @@
 ---
 # REF_jira_oracle_schema_refresh_job.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Included by jira_oracle_schema_refresh.yml for each refresh job.
 # Loop variable: `job`  (a dict with issue_key, source_service, source_schema,

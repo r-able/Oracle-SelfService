@@ -1,5 +1,6 @@
 ---
 # CAU_jira_oracle_create_user_self.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Workflow:
 #   0. Pre-flight : validate Jira API token via /rest/api/2/myself

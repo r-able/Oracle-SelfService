@@ -1,5 +1,6 @@
 ---
-# jira_execute_and_transition.yml
+# DCR_jira_data_change.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Workflow:
 #   0. Pre-flight: validate Jira API token via /rest/api/2/myself (catches
@@ -594,11 +595,7 @@
   - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.key }} could NOT be transitioned to
-        '{{ jira_status_done }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_done in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
     loop: "{{ done_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.key | default('skipped') }}"
@@ -664,11 +661,7 @@
   - name: "9 | WARN when no '{{ jira_status_failed }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.key }} could NOT be transitioned to
-        '{{ jira_status_failed }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
     loop: "{{ failed_dcr_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.key | default('skipped') }}"

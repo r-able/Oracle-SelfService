@@ -1,6 +1,7 @@
 ---
 # =============================================================================
 # COMMON_jira_shepherd_statuses.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Pre-execution status shepherd, included by every project playbook BEFORE
 # its main JQL search:
@@ -53,9 +54,7 @@
 - name: "SHEP | {{ shepherd_project }} | Shepherd queue summary"
   ansible.builtin.debug:
     msg: >-
-      {{ shepherd_project }}: {{ shep_issues | length }} issue(s) in
-      '{{ jira_status_todo }}'/'{{ jira_status_pending_approval }}'
-      ({{ shep_issues | map(attribute='key') | list | join(', ') | default('none', true) }})
+      {{ shepherd_project }}: {{ shep_issues | length }} issue(s) in '{{ jira_status_todo }}'/'{{ jira_status_pending_approval }}' ({{ shep_issues | map(attribute='key') | list | join(', ') | default('none', true) }})
 
 # --- To Do -> Pending Approval ----------------------------------------------
 
@@ -106,11 +105,7 @@
 - name: "SHEP | {{ shepherd_project }} | WARN when no '{{ jira_status_pending_approval }}' transition is available"
   ansible.builtin.debug:
     msg: >-
-      WARNING: {{ item.item.key }} is in '{{ jira_status_todo }}' but could NOT
-      be transitioned to '{{ jira_status_pending_approval }}' -- the workflow
-      only offers these transitions from the current status:
-      {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-      Check jira_status_pending_approval in vars/main.yml against the project workflow.
+      WARNING: {{ item.item.key }} is in '{{ jira_status_todo }}' but could NOT be transitioned to '{{ jira_status_pending_approval }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Check jira_status_pending_approval in vars/main.yml against the project workflow.
   loop: "{{ shep_todo_transitions.results | default([]) }}"
   loop_control:
     label: "{{ item.item.key | default('skipped') }}"
@@ -184,11 +179,7 @@
 - name: "SHEP | {{ shepherd_project }} | WARN when no '{{ jira_status_in_progress }}' transition is available"
   ansible.builtin.debug:
     msg: >-
-      WARNING: {{ item.item.key }} is APPROVED but could NOT be transitioned to
-      '{{ jira_status_in_progress }}' -- the workflow only offers these
-      transitions from the current status:
-      {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-      Check jira_status_in_progress in vars/main.yml against the project workflow.
+      WARNING: {{ item.item.key }} is APPROVED but could NOT be transitioned to '{{ jira_status_in_progress }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Check jira_status_in_progress in vars/main.yml against the project workflow.
   loop: "{{ shep_appr_transitions.results | default([]) }}"
   loop_control:
     label: "{{ item.item.key | default('skipped') }}"

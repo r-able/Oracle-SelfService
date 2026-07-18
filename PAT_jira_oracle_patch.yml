@@ -1,5 +1,6 @@
 ---
-# jira_oracle_patch.yml
+# PAT_jira_oracle_patch.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Workflow:
 #   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
@@ -156,17 +157,9 @@
     ansible.builtin.debug:
       msg:
       - >-
-        WARNING: {{ item.meta.key }} has no usable target in
-        {{ patch_host_field }} (got: '{{ pat_target }}', host: '{{ pat_host }}',
-        known hosts: {{ oracle_instance_map.keys() | list | join(', ') }})
-        -- this issue will be SKIPPED. If the PAT form changed, update
-        patch_host_field / patch_number_field in vars/main.yml using the
-        field dump below.
+        WARNING: {{ item.meta.key }} has no usable target in {{ patch_host_field }} (got: '{{ pat_target }}', host: '{{ pat_host }}', known hosts: {{ oracle_instance_map.keys() | list | join(', ') }}) -- this issue will be SKIPPED. If the PAT form changed, update patch_host_field / patch_number_field in vars/main.yml using the field dump below.
       - "Populated custom fields on {{ item.meta.key }}:"
-      - "{{ item.meta.fields | dict2items
-            | selectattr('key', 'match', '^customfield_')
-            | rejectattr('value', 'none')
-            | items2dict }}"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
     loop: "{{ jira_issue_details.results }}"
     loop_control:
       label: "{{ item.meta.key }}"
@@ -353,11 +346,7 @@
   - name: "11 | WARN when no '{{ jira_status_done }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
-        '{{ jira_status_done }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_done in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
     loop: "{{ done_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.issue_key | default('skipped') }}"
@@ -442,11 +431,7 @@
   - name: "11 | WARN when no '{{ jira_status_failed }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
-        '{{ jira_status_failed }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
     loop: "{{ failed_pat_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.issue_key | default('skipped') }}"

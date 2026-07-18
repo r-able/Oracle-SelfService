@@ -1,5 +1,5 @@
 Project Title: 
-Oracle-JIRA-Autopilot
+Oracle-SelfService (JIRA)
 
 Description:
 This is a combination of Ansible, JIRA and LINUX shell files intended to auto-execute most common Oracle Database Administration (DBA) JIRA requests, such as upgrades, migrations, password resets, user creation, etc. 

@@ -1,5 +1,6 @@
 ---
-# jira_oracle_create_user.yml
+# CAU_jira_create_user.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Workflow:
 #   0. Pre-flight : validate Jira API token via /rest/api/2/myself
@@ -50,7 +51,7 @@
 #     PRO: "PRODB"
 #
 # Usage:
-#   ansible-playbook jira_oracle_create_user.yml --ask-vault-pass
+#   ansible-playbook CAU_jira_create_user.yml --ask-vault-pass
 #
 # Requirements:
 #   ansible-galaxy collection install community.general
@@ -159,15 +160,9 @@
     ansible.builtin.debug:
       msg:
       - >-
-        WARNING: {{ item.meta.key }} has no value in {{ jira_cau_user_field }}
-        (jira_cau_user_field) -- this issue will be SKIPPED. If the CAU form
-        changed, update jira_cau_user_field / jira_cau_approver_field /
-        jira_cau_db_field in vars/main.yml using the field dump below.
+        WARNING: {{ item.meta.key }} has no value in {{ jira_cau_user_field }} (jira_cau_user_field) -- this issue will be SKIPPED. If the CAU form changed, update jira_cau_user_field / jira_cau_approver_field / jira_cau_db_field in vars/main.yml using the field dump below.
       - "Populated custom fields on {{ item.meta.key }}:"
-      - "{{ item.meta.fields | dict2items
-            | selectattr('key', 'match', '^customfield_')
-            | rejectattr('value', 'none')
-            | items2dict }}"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
     loop: "{{ jira_issue_details.results }}"
     loop_control:
       label: "{{ item.meta.key }}"
@@ -603,11 +598,7 @@
   - name: "6 | WARN when no '{{ jira_status_done }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.key }} could NOT be transitioned to
-        '{{ jira_status_done }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_done in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
     loop: "{{ done_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.key | default('skipped') }}"
@@ -693,11 +684,7 @@
   - name: "6 | WARN when no '{{ jira_status_failed }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.key }} could NOT be transitioned to
-        '{{ jira_status_failed }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
     loop: "{{ failed_cau_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.key | default('skipped') }}"

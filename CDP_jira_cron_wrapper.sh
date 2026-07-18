@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 # CDP_jira_cron_wrapper.sh
 #
 # Cron-safe wrapper for the DCR playbook (DCR_jira_data_change.yml).

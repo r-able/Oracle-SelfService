@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# CAU_jira_create_user.yml
-#
+# CAU_jira_cron_wrapper.sh
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 # Cron-safe wrapper for the DCR playbook (DCR_jira_data_change.yml).
 #
 # Uses a PID-based lock file to guarantee only one instance runs at a time.

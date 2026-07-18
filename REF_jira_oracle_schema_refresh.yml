@@ -1,5 +1,6 @@
 ---
-# jira_oracle_schema_refresh.yml
+# REF_jira_oracle_schema_refresh.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Workflow:
 #   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
@@ -166,9 +167,7 @@
   - name: "2 | Warn and skip issues with a missing or invalid refresh spec"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.meta.key }} has no usable refresh spec in
-        {{ jira_ref_spec_field }} (value: {{ item.meta.fields[jira_ref_spec_field] | default('(field missing)') }})
-        -- skipping this issue.
+        WARNING: {{ item.meta.key }} has no usable refresh spec in {{ jira_ref_spec_field }} (value: {{ item.meta.fields[jira_ref_spec_field] | default('(field missing)') }}) -- skipping this issue.
     loop: "{{ jira_issue_details.results }}"
     loop_control:
       label: "{{ item.meta.key }}"
@@ -369,11 +368,7 @@
   - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
-        '{{ jira_status_done }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_done in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
     loop: "{{ done_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.issue_key | default('skipped') }}"
@@ -458,11 +453,7 @@
   - name: "8 | WARN when no '{{ jira_status_failed }}' transition is available"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
-        '{{ jira_status_failed }}' -- the workflow only offers these transitions
-        from the current status:
-        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
-        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
     loop: "{{ failed_ref_transitions.results | default([]) }}"
     loop_control:
       label: "{{ item.item.issue_key | default('skipped') }}"

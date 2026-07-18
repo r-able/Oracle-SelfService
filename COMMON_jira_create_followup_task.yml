@@ -1,6 +1,7 @@
 ---
 # =============================================================================
 # COMMON_jira_create_followup_task.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Creates a DBA repair follow-up task in the SAME project as a failed issue,
 # optionally assigns it to the Database Administrators account, verifies it
@@ -64,8 +65,7 @@
 - name: "FUP | {{ fu_original_key }} | Warn if follow-up creation failed"
   ansible.builtin.debug:
     msg: >-
-      WARNING: could not create DBA follow-up task for {{ fu_original_key }}:
-      {{ fu_create_result.msg | default('unknown error') }}
+      WARNING: could not create DBA follow-up task for {{ fu_original_key }}: {{ fu_create_result.msg | default('unknown error') }}
   when: fu_created_key | length == 0
 
 # ── 2. Verify the new task is in "To Do" (transition if it is not) ───────────
@@ -175,9 +175,7 @@
     operation: comment
     issue: "{{ fu_original_key }}"
     comment: >-
-      DBA repair follow-up task {{ fu_created_key }} has been created in
-      "{{ jira_status_todo }}" for the Database Administrators. The failure
-      logs from this run are attached to that task.
+      DBA repair follow-up task {{ fu_created_key }} has been created in "{{ jira_status_todo }}" for the Database Administrators. The failure logs from this run are attached to that task.
     cloud: "{{ jira_cloud }}"
   ignore_errors: true
   when: fu_created_key | length > 0
@@ -185,6 +183,5 @@
 - name: "FUP | {{ fu_original_key }} | Follow-up creation summary"
   ansible.builtin.debug:
     msg: >-
-      {{ fu_original_key }} -> follow-up {{ fu_created_key }} created
-      ({{ fu_attach_stat.results | default([]) | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length }} log file(s) attached)
+      {{ fu_original_key }} -> follow-up {{ fu_created_key }} created ({{ fu_attach_stat.results | default([]) | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length }} log file(s) attached)
   when: fu_created_key | length > 0

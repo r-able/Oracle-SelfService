@@ -1,9 +1,10 @@
 ---
 # =============================================================================
 # UPG_jira_oracle_upgrade_job.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
 # Per-issue Oracle 21c -> 26ai AutoUpgrade job. Included from
-# jira_oracle_upgrade.yml with loop_var `job`:
+# UPG_jira_oracle_upgrade.yml with loop_var `job`:
 #     job.issue_key   e.g. UPG-1
 #     job.summary     issue summary text
 #     job.oracle_sid  e.g. CDB1 (case-sensitive, used verbatim)
@@ -414,7 +415,6 @@
           id: "{{ (done_transitions.json.transitions | selectattr('name', 'equalto', jira_status_done) | list | first).id }}"
       status_code: 204
     when: done_transitions.json.transitions | selectattr('name', 'equalto', jira_status_done) | list | length > 0
-
   # ===========================================================================
   # RESCUE: detect -> halt -> notify. Never auto-clears recovery data.
   # ===========================================================================
@@ -553,7 +553,6 @@
   - name: "JOB | {{ job.issue_key }} | Continue to next issue"
     ansible.builtin.debug:
       msg: "Job {{ job.issue_key }} halted and transitioned to Failed. Continuing with remaining issues."
-
   # ===========================================================================
   # ALWAYS: remove temp scripts from lnx001
   # ===========================================================================

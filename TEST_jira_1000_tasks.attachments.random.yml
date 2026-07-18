@@ -1,4 +1,5 @@
 ---
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 - name: Create 1000 JIRA tasks in DCR project
   hosts: localhost
   connection: local
