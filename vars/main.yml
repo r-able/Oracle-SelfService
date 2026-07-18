@@ -1,25 +1,70 @@
 ---
 # main.yml
-# encrypt this file with ansible-vault to protect sensitive information "ansible-vault encrypt main.yml"
-# replace the <REDACTED> variables with your own
+# JIRA variables
 jira_url: <REDACTED>
 # Your Atlassian account email
 jira_user: "<REDACTED>"
 # The API token generated from your Atlassian account security settings
 jira_api_token: "<REDACTED>"
-jira_jql_ref: "project = REF AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_dcr: "project = 'DCR' AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_cnu: "project = CNU AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_cdp: "project = CDP AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_pat: "project = PAT AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_upg: "project = UPG AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
-jira_jql_cau: "project = CAU AND issuetype = Task AND status NOT IN ('Done', 'Failed') ORDER BY created ASC"
+#New CNU parameters
+# All projects (July 2026 re-creation): issues only reach 'In Progress' after
+# the Approvals step, so every JQL gates on it -- 'Pending Approval' issues
+# are never picked up by the automation.
+jira_jql_ref: "project = REF AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
+# REF refresh-spec field in the re-created (July 2026) REF project form.
+# Accepts either the legacy "SRC_SERVICE:SRC_SCHEMA=>TGT_SERVICE:TGT_SCHEMA"
+# format or the new form's "SRC_SERVICE:TGT_SERVICE" select option (schemas
+# then default to source_schema / target_schema below).
+jira_ref_spec_field: "customfield_10746"
+# CAU form fields (re-created July 2026 project). If the form changes again,
+# run the playbook once: the "field IDs may have changed" WARNING lists every
+# populated custom field on the issue so the new IDs can be read off directly.
+jira_cau_user_field: "customfield_10742"      # user picker: the user to create
+jira_cau_approver_field: "customfield_10739"  # user picker: approver (optional)
+jira_cau_db_field: "customfield_10743"        # multi-select: target databases
+# Identity map of known DB names plus form aliases (PROD -> PRO etc.), used to
+# normalize the databases multi-select values to oracle_databases keys.
+oracle_db_name_aliases: "{{ dict(oracle_databases.keys() | list | zip(oracle_databases.keys() | list)) | combine(oracle_service_aliases) }}"
+# Normalize form service names to actual Oracle service names
+oracle_service_aliases:
+  PROD: "PRO"
+  PRODUCTION: "PRO"
+jira_jql_dcr: "project = 'DCR' AND status = 'In Progress' ORDER BY created ASC"
+jira_jql_cnu: "project = CNU AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
+#jira_jql_cdp: "project = CDP AND status = 'In Progress' ORDER BY created ASC"
+jira_jql_cdp: "project = CDP AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
+jira_jql_pat: "project = PAT AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
+jira_jql_upg: "project = UPG AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
+jira_jql_cau: "project = CAU AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
 jira_upg_project: "UPG"
 jira_max_results: 50
 jira_cloud: true
 jira_status_done: "Done"
 jira_status_failed: "Failed"
 jira_review_transition: "In Review"
+##### DBA follow-up (repair) task settings ##########################
+# When an issue is transitioned to "Failed", a follow-up repair task is
+# created in the SAME project, in "To Do", for the Database Administrators,
+# with the failure logs attached (see COMMON_jira_create_followup_task.yml).
+jira_followup_enabled: true
+jira_followup_issue_type: "Task"
+jira_followup_label: "dba-repair"
+jira_status_todo: "To Do"
+##### Status shepherd (pre-execution, all projects) #################
+# Before searching for work, every playbook shepherds its project's queue:
+# To Do -> Pending Approval, and APPROVED Pending Approval -> In Progress
+# (see COMMON_jira_shepherd_statuses.yml). All other statuses are ignored.
+jira_status_pending_approval: "Pending Approval"
+jira_approvals_field: "customfield_10025"   # Jira approvals panel data (site-wide field)
+#####################################################################
+# Atlassian accountId to assign the follow-up to (e.g. the Database
+# Administrators service account). Find it with:
+#   GET {{ jira_url }}rest/api/3/user/search?query=<name-or-email>
+# Leave empty ("") to create the follow-up unassigned.
+jira_dba_account_id: ""
+# Controller-side directory where failure logs for follow-ups are staged
+followup_log_dir: "{{ log_path }}/followups"
+#####################################################################
 oracle_databases:
   DEV: "DEV"      # Oracle service name for each environment
   UAT: "UAT"
@@ -32,8 +77,9 @@ oracle_port: 1521
 oracle_dba_user: "system"          # DBA account that can ALTER USER
 oracle_dba_pass: "<REDACTED>"
 log_path: /etc/ansible/logs
+#####################
 oracle_host: "lnx001"
-oracle_os_user: "<REDACTED>"
+oracle_os_user: "oracle"
 oracle_base: "/u01/app/oracle"
 oracle_home: "/u01/app/oracle/product/21.0.0/dbhome_1"
 oracle_source_home: /u01/app/oracle/product/21.0.0/dbhome_1
@@ -51,15 +97,21 @@ target_schema:         "TARGET"
 datapump_parallel:     4
 datapump_compression:  "ALL"
 cleanup_dump_files:    true
+####specific vars
 work_dir: "/dcr_runtime/jira_dcr_{{ ansible_facts['date_time'].iso8601[:19] }}"
 dcr_oracle_home: . /home/ansible_admin/setEnv.sh
-dcr_connect_credentials: "$ORACLE_HOME/bin/sqlplus system/<REDACTED>@//lnx001:1521/cdb1 <<EOF"
+dcr_connect_credentials: "$ORACLE_HOME/bin/sqlplus system/oracle@//lnx001:1521/cdb1 <<EOF"
 issue_key_length: 8
 jira_new_issue_type: "Issue" # false for Jira Server / Data Center
 jira_status_in_progress: "In Progress"
 target_status: "Done"
+#jira_cloud: true
 oracle_service: "ORCLPDB"
-patch_host_field: "customfield_10494"   # check your PAT issue metadata for the correct ID
+####Patching
+# PAT form fields (re-created July 2026 project). If the form changes again,
+# run the playbook once: the WARNING task dumps every populated custom field.
+patch_host_field: "customfield_10745"    # select: target as "host:SID", e.g. "lnx001:CDB1"
+patch_number_field: "customfield_10744"  # number: the Oracle patch number (falls back to summary digits)
 patch_stage_dir: "/patch"
 mos_username: "<REDACTED>"
 mos_password: "<REDACTED>"       # vault-encrypt this
@@ -71,6 +123,7 @@ oracle_instance_map:
     oracle_user: "oracle"
 autoupgrade_java: "/u01/app/oracle/product/26.0.0/dbhome_1/jdk/bin/java"
 autoupgrade_jar: "/u01/app/oracle/product/26.0.0/dbhome_1/rdbms/admin/autoupgrade.jar"
+####UPG vars
 deploy_async_seconds: 86400
 deploy_poll_retries: 1440
 deploy_poll_delay: 60
