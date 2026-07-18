@@ -6,7 +6,7 @@
 #   1. Search     : find all open issues matching the configured JQL
 #   2. Fetch      : retrieve each issue - extract reporter displayName
 #                   (Jira Cloud - reporter.name is absent on Cloud) and
-#                   target databases from customfield_10348[].value
+#                   target databases from the databases field ({{ jira_cau_db_field }})[].value
 #   3. Generate   : create one random password per issue (shared across
 #                   all target databases for that user)
 #   4. Create     : for each issue x each target database:
@@ -22,7 +22,7 @@
 # Assumptions:
 #   - This is a Jira Cloud instance. reporter.displayName is used as the
 #     Oracle username (reporter.name is not populated on Jira Cloud).
-#   - Target databases are stored in customfield_10348 as a list of
+#   - Target databases are stored in the databases field ({{ jira_cau_db_field }}) as a list of
 #     checkbox option objects: [ { "id": "...", "value": "DEV" }, ... ]
 #     Values are matched against oracle_databases keys (case-insensitive).
 #   - vars/main.yml defines oracle_databases as a dict keyed by the
@@ -54,24 +54,24 @@
 #
 # Requirements:
 #   ansible-galaxy collection install community.general
-#   pip install oracledb        # thin driver — no Oracle Client needed
+#   pip install oracledb        # thin driver -- no Oracle Client needed
 #   # OR: pip install cx_Oracle # requires Oracle Instant Client on host
 
-- name: Jira → Get reporter + components → Create Oracle user → Transition issue
+- name: Jira -> Get reporter + components -> Create Oracle user -> Transition issue
   hosts: localhost
   gather_facts: true
   vars_files:
   - vars/main.yml
 
   vars:
-    # Built at runtime — do not edit
+    # Built at runtime -- do not edit
     issue_outcomes: {} # { "OPS-123": "done" | "failed" }
-    db_results_flat: [] # [ { issue_key, oracle_user, db_name, rc, stdout, stderr }, … ]
+    db_results_flat: [] # [ { issue_key, oracle_user, db_name, rc, stdout, stderr }, ... ]
 
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ===========================================================================
   tasks:
 
-  # ── PRE-FLIGHT: validate API token ───────────────────────────────────────
+  # -- PRE-FLIGHT: validate API token ---------------------------------------
   # community.general.jira silently returns zero results on auth failure.
   # Hitting /myself first gives an explicit HTTP 401 and a clear message.
 
@@ -90,9 +90,18 @@
   - name: "PRE-FLIGHT | Confirm authenticated identity"
     ansible.builtin.debug:
       msg: >-
-        Jira authentication OK — connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
 
-  # ── 1. Search Jira ───────────────────────────────────────────────────────
+  # -- 1. Search Jira -------------------------------------------------------
+
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd CAU intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "CAU"
 
   - name: "1 | Search for open Jira issues matching JQL"
     community.general.jira:
@@ -108,7 +117,7 @@
   - name: "1 | Show 'No Tasks Found' message when no issues match the JQL"
     ansible.builtin.debug:
       msg: >-
-        No Tasks Found — no Jira issues currently match JQL: {{ jira_jql_cau }} in project CAU. Nothing to process; exiting cleanly.
+        No Tasks Found -- no Jira issues currently match JQL: {{ jira_jql_cau }} in project CAU. Nothing to process; exiting cleanly.
     when: jira_search.meta.issues | length == 0
 
   - name: "1 | End play gracefully when no issues are found"
@@ -121,11 +130,11 @@
         Found {{ jira_search.meta.issues | length }} issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}
     when: jira_search.meta.issues | length > 0
 
-  # -- 2. Fetch full issue data - reporter + customfield_10348 ----------------
+  # -- 2. Fetch full issue data - reporter + the databases field ({{ jira_cau_db_field }}) ----------------
   # Jira Cloud does not populate reporter.name - displayName is used as the
   # Oracle username instead.
   #
-  # Target databases come from customfield_10348: a list of checkbox option
+  # Target databases come from the databases field ({{ jira_cau_db_field }}): a list of checkbox option
   # objects with a "value" key (e.g. "DEV", "UAT", "SIT", "STG", "CER", "PRO").
   # Values are uppercased and intersected against oracle_databases keys;
   # unrecognised values are silently ignored.
@@ -142,6 +151,28 @@
       label: "{{ item.key }}"
     register: jira_issue_details
 
+  # Self-diagnosing guard: if the expected user field is empty/missing, the
+  # form field IDs have probably changed again. This dump lists every
+  # populated custom field on the issue so the new IDs can be read directly
+  # from the run output, then updated in vars/main.yml.
+  - name: "2 | WARN on issues missing the user field (form field IDs may have changed)"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} has no value in {{ jira_cau_user_field }}
+        (jira_cau_user_field) -- this issue will be SKIPPED. If the CAU form
+        changed, update jira_cau_user_field / jira_cau_approver_field /
+        jira_cau_db_field in vars/main.yml using the field dump below.
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items
+            | selectattr('key', 'match', '^customfield_')
+            | rejectattr('value', 'none')
+            | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    when: item.meta.fields[jira_cau_user_field] | default([]) | length == 0
+
   - name: "2 | Build issue -> user + target databases mapping"
     ansible.builtin.set_fact:
       issues_to_process: >-
@@ -150,24 +181,25 @@
             'issue_key':   item.meta.key,
             'oracle_user': (
               (
-                item.meta.fields.customfield_10564[0].displayName.split(' ')[0][0]
-                + item.meta.fields.customfield_10564[0].displayName.split(' ')[-1]
+                item.meta.fields[jira_cau_user_field][0].displayName.split(' ')[0][0]
+                + item.meta.fields[jira_cau_user_field][0].displayName.split(' ')[-1]
               )
-              if (item.meta.fields.customfield_10564[0].displayName.split(' ') | length) > 1
-              else item.meta.fields.customfield_10564[0].displayName
+              if (item.meta.fields[jira_cau_user_field][0].displayName.split(' ') | length) > 1
+              else item.meta.fields[jira_cau_user_field][0].displayName
             ) | upper,
-            'display_name': item.meta.fields.customfield_10564[0].displayName,
+            'display_name': item.meta.fields[jira_cau_user_field][0].displayName,
             'approver': (
-              item.meta.fields.customfield_10563[0].displayName
-              if item.meta.fields.customfield_10563 | default([]) | length > 0
+              item.meta.fields[jira_cau_approver_field][0].displayName
+              if item.meta.fields[jira_cau_approver_field] | default([]) | length > 0
               else 'not specified'
             ),
             'target_dbs': (
-              item.meta.fields.customfield_10562
+              item.meta.fields[jira_cau_db_field]
               | default([])
               | map(attribute='value')
               | map('upper')
-              | select('in', oracle_databases.keys() | list)
+              | select('in', oracle_db_name_aliases.keys() | list)
+              | map('extract', oracle_db_name_aliases)
               | list
             )
           }]
@@ -176,14 +208,14 @@
     loop_control:
       label: "{{ item.meta.key }}"
     when:
-    - item.meta.fields.customfield_10564 | default([]) | length > 0
+    - item.meta.fields[jira_cau_user_field] | default([]) | length > 0
 
-  - name: "2 | Warn on issues with no recognised values in customfield_10348"
+  - name: "2 | Warn on issues with no recognised values in the databases field ({{ jira_cau_db_field }})"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.issue_key }} - no recognised database values found in customfield_10348 (got: {{ jira_issue_details.results
+        WARNING: {{ item.issue_key }} - no recognised database values found in the databases field ({{ jira_cau_db_field }}) (got: {{ jira_issue_details.results
           | selectattr('meta.key', 'equalto', item.issue_key)
-          | map(attribute='meta.fields.customfield_10348')
+          | map(attribute='meta.fields.' + jira_cau_db_field)
           | first | default([]) | map(attribute='value') | list | join(', ') | default('none') }}).
         Valid values are: {{ oracle_databases.keys() | list | join(', ') }}. This issue will be skipped.
     loop: "{{ issues_to_process | default([]) }}"
@@ -191,20 +223,20 @@
       label: "{{ item.issue_key }}"
     when: item.target_dbs | length == 0
 
-  - name: "2 | Show user → Oracle username → target databases mapping"
+  - name: "2 | Show user -> Oracle username -> target databases mapping"
     ansible.builtin.debug:
       msg: >-
-        {{ item.issue_key }} → display name: {{ item.display_name }} | oracle user: {{ item.oracle_user }} | databases: {{ item.target_dbs | join(', ') }}
+        {{ item.issue_key }} -> display name: {{ item.display_name }} | oracle user: {{ item.oracle_user }} | databases: {{ item.target_dbs | join(', ') }}
     loop: "{{ issues_to_process | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.target_dbs | length > 0
 
-  # ── 3. Generate one random password per issue ─────────────────────────────
+  # -- 3. Generate one random password per issue -----------------------------
   # The same password is used across all target databases for a given issue
   # so the user only needs to remember one credential set.
   #
-  # Password policy: 16 chars — guaranteed upper + lower + digit + special.
+  # Password policy: 16 chars -- guaranteed upper + lower + digit + special.
   # Special chars limited to @ # $ % to avoid shell-metacharacter issues.
   # no_log: true keeps passwords out of Ansible logs throughout.
 
@@ -246,16 +278,16 @@
     when: not (item.skipped | default(false))
     no_log: true
 
-  # ── 4. Create user in each target database ────────────────────────────────
+  # -- 4. Create user in each target database --------------------------------
   # We loop over every (issue, database) combination using subelements so
   # each pair gets its own task result and can succeed/fail independently.
   #
   # Logic inside the Python script:
   #   1. Connect to the target database service
   #   2. Check dba_users for the target username
-  #   3a. User absent  → CREATE USER "X" IDENTIFIED BY "P"
-  #   3b. User present → skip CREATE, print a notice
-  #   4.  GRANT CONNECT, DBA TO "X"  (idempotent — safe to run either way)
+  #   3a. User absent  -> CREATE USER "X" IDENTIFIED BY "P"
+  #   3b. User present -> skip CREATE, print a notice
+  #   4.  GRANT CONNECT, DBA TO "X"  (idempotent -- safe to run either way)
   #
   # All identifiers and passwords come from environment variables so no
   # Jinja2 interpolation happens inside the heredoc (PYEOF is single-quoted).
@@ -304,10 +336,10 @@
         user_exists = cur.fetchone()[0] > 0
 
         if user_exists:
-            print(f"NOTICE: [{db_name}] User '{target_user}' already exists — "
+            print(f"NOTICE: [{db_name}] User '{target_user}' already exists -- "
                   f"skipping CREATE USER, re-granting privileges only.")
         else:
-            # CREATE USER — identifiers cannot use bind variables
+            # CREATE USER -- identifiers cannot use bind variables
             cur.execute(
                 f'CREATE USER "{target_user}" IDENTIFIED BY "{new_pass}" '
                 f'DEFAULT TABLESPACE USERS '
@@ -315,7 +347,7 @@
             )
             print(f"OK: [{db_name}] User '{target_user}' created successfully.")
 
-        # GRANT — always applied so existing users get any missing privileges
+        # GRANT -- always applied so existing users get any missing privileges
         cur.execute(f'GRANT CONNECT, DBA TO "{target_user}"')
         conn.commit()
         print(f"OK: [{db_name}] Granted CONNECT, DBA to '{target_user}'.")
@@ -334,22 +366,22 @@
       ORA_DB_NAME: "{{ item.1 }}"
     loop: "{{ issues_to_process | default([]) | subelements('target_dbs') }}"
     loop_control:
-      label: "{{ item.0.issue_key }} | {{ item.0.oracle_user }} → {{ item.1 }}"
+      label: "{{ item.0.issue_key }} | {{ item.0.oracle_user }} -> {{ item.1 }}"
     register: oracle_create_results
     ignore_errors: true
     no_log: true
 
-  # ── 4b. Show sanitised per-database outcome (no passwords) ───────────────
+  # -- 4b. Show sanitised per-database outcome (no passwords) ---------------
 
   - name: "4b | Show create-user outcome per issue per database"
     ansible.builtin.debug:
       msg: >-
-        {{ item.item.0.issue_key }} | {{ item.item.0.oracle_user }} → {{ item.item.1 }}: {{ 'SUCCESS' if item.rc == 0 else 'FAILED (rc=' + (item.rc | string) + ')' }} {% if item.rc == 0 %}| {{ item.stdout | default('') | trim }}{% endif %} {% if item.rc != 0 %}| stderr: {{ item.stderr | default('(none)') | trim }}{% endif %}
+        {{ item.item.0.issue_key }} | {{ item.item.0.oracle_user }} -> {{ item.item.1 }}: {{ 'SUCCESS' if item.rc == 0 else 'FAILED (rc=' + (item.rc | string) + ')' }} {% if item.rc == 0 %}| {{ item.stdout | default('') | trim }}{% endif %} {% if item.rc != 0 %}| stderr: {{ item.stderr | default('(none)') | trim }}{% endif %}
     loop: "{{ oracle_create_results.results | default([]) }}"
     loop_control:
       label: "{{ item.item.0.issue_key }} / {{ item.item.1 }}"
 
-  # ── 5. Post worklog entry summarising all database outcomes ───────────────
+  # -- 5. Post worklog entry summarising all database outcomes ---------------
   # One worklog entry per issue, listing every database attempted with its
   # individual outcome.  The new password is included so the DBA team has
   # an audit trail inside Jira.
@@ -484,7 +516,7 @@
     loop_control:
       label: "{{ item | basename }}"
 
-  # ── 6. Compute per-issue outcome and transition ───────────────────────────
+  # -- 6. Compute per-issue outcome and transition ---------------------------
   # An issue is "done"   only if ALL its target databases returned rc == 0.
   # An issue is "failed" if ANY database returned rc != 0.
 
@@ -524,20 +556,72 @@
         | length
       ) > 0
 
-  - name: "6 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  - name: "6 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.key }}"
-      status: "{{ jira_status_done }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ issue_outcomes | dict2items }}"
     loop_control:
       label: "{{ item.key }}"
     when: item.value == 'done'
-    ignore_errors: true
+    register: done_transitions
+    failed_when: false
+
+  - name: "6 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "6 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to
+        '{{ jira_status_done }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_done in vars/main.yml to one of the target statuses above.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
 
   - name: "6 | Post failure comment for FAILED issues"
     community.general.jira:
@@ -562,29 +646,150 @@
     when: item.value == 'failed'
     ignore_errors: true
 
-  - name: "6 | Transition FAILED issues to '{{ jira_status_failed }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  - name: "6 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.key }}"
-      status: "{{ jira_status_failed }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ issue_outcomes | dict2items }}"
     loop_control:
       label: "{{ item.key }}"
     when: item.value == 'failed'
-    ignore_errors: true
+    register: failed_cau_transitions
+    failed_when: false
 
-  # ── 7. Final summary ──────────────────────────────────────────────────────
+  - name: "6 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ failed_cau_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "6 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to
+        '{{ jira_status_failed }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+    loop: "{{ failed_cau_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 6c. Create DBA repair follow-up task per FAILED issue ------------------
+  #
+  # One follow-up per failed issue, created in the same project, in "To Do",
+  # for the Database Administrators, with a per-database failure report
+  # attached. Passwords are never written to the report (rc/stdout/stderr of
+  # the create-user step contain no credentials).
+
+  - name: "6c | Set follow-up run timestamp"
+    ansible.builtin.set_fact:
+      fu_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    when: jira_followup_enabled | default(true) | bool
+
+  - name: "6c | Ensure follow-up log dir exists on controller"
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - issue_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length > 0
+
+  - name: "6c | Write failure report per FAILED issue"
+    ansible.builtin.copy:
+      content: |
+        Automated Oracle User Provisioning FAILURE LOG - {{ ansible_date_time.iso8601 }}
+        Issue : {{ item.key }}
+
+        Per-database results:
+        {% for r in oracle_create_results.results | default([]) if r.item.0.issue_key == item.key %}
+        --- {{ r.item.1 }} : {{ 'SUCCESS' if r.rc == 0 else 'FAILED' }} (rc={{ r.rc }}) ---
+        stdout: {{ r.stdout | default('(none)') | trim }}
+        {% if r.rc != 0 %}
+        stderr: {{ r.stderr | default('(none)') | trim }}
+        {% endif %}
+        {% endfor %}
+      dest: "{{ followup_log_dir }}/{{ item.key }}_failure_{{ fu_run_ts }}.log"
+      mode: "0640"
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - item.value == 'failed'
+
+  - name: "6c | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.value == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.key }}"
+      fu_summary: "DBA repair required: Oracle user provisioning failed for {{ fu_item.key }}"
+      fu_description: |-
+        Automated Oracle user provisioning FAILED in one or more databases and
+        the original issue has been transitioned to "{{ jira_status_failed }}".
+        Please investigate and repair.
+
+        Databases attempted : {{ oracle_create_results.results | default([]) | selectattr('item.0.issue_key', 'equalto', fu_item.key) | list | length }}
+        Databases failed    : {{ oracle_create_results.results | default([]) | selectattr('item.0.issue_key', 'equalto', fu_item.key) | selectattr('rc', 'ne', 0) | list | length }}
+
+        The per-database failure report is attached to this task. The user's
+        credentials are in the worklog entry on {{ fu_item.key }}.
+      fu_attach_files:
+      - "{{ followup_log_dir }}/{{ fu_item.key }}_failure_{{ fu_run_ts }}.log"
+
+  # -- 7. Final summary ------------------------------------------------------
 
   - name: "7 | Build per-issue summary lines"
     ansible.builtin.set_fact:
       summary_lines: >-
         {{
           summary_lines | default([]) + [
-            '  ' + item.key + '   →   ' + (item.value | upper)
+            '  ' + item.key + '   ->   ' + (item.value | upper)
             + '   (user: '
             + (
                 issues_to_process
@@ -612,19 +817,19 @@
     loop: >-
       {{
         [
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Jira Oracle User Provisioning Summary',
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Run timestamp    : ' + ansible_date_time.iso8601,
           '  Issues found     : ' + (jira_search.meta.issues | length | string),
           '  DB ops attempted : ' + (oracle_create_results.results | default([]) | length | string),
           '  DB ops OK        : ' + (oracle_create_results.results | default([]) | selectattr('rc', 'equalto', 0) | list | length | string),
           '  DB ops FAILED    : ' + (oracle_create_results.results | default([]) | selectattr('rc', 'ne', 0) | list | length | string),
-          '  ──────────────────────────────────────────────────',
+          '  --------------------------------------------------',
           '  Per-issue outcomes:'
         ]
         + (summary_lines | default(['  (none)']))
-        + ['══════════════════════════════════════════════════════']
+        + ['======================================================']
       }}
     loop_control:
       label: "summary"

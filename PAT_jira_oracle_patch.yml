@@ -4,9 +4,9 @@
 # Workflow:
 #   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
 #   1. Search      : find all open PAT project issues matching the JQL
-#   2. Fetch       : retrieve each issue — extract patch number from summary
+#   2. Fetch       : retrieve each issue -- extract patch number from summary
 #                    and target host from a custom field
-#   3. Build       : resolve ORACLE_SID / ORACLE_HOME from the host→instance
+#   3. Build       : resolve ORACLE_SID / ORACLE_HOME from the host->instance
 #                    mapping in vars/main.yml; write job list to temp file
 #   4. Download    : SSH to each target host; download the patch zip from
 #                    Oracle MOS using wget + cookie-based auth
@@ -22,7 +22,7 @@
 # Jira issue structure (project PAT):
 #   summary         : the patch number, e.g. "35940141"
 #   customfield_XXXX: target hostname, e.g. "lnx001"
-#                     → set patch_host_field in vars/main.yml to the correct
+#                     -> set patch_host_field in vars/main.yml to the correct
 #                       customfield ID after inspecting your issue metadata
 #
 # Required vars (vars/main.yml):
@@ -44,7 +44,7 @@
 #   # Custom field ID that holds the target hostname on PAT issues
 #   patch_host_field      : "customfield_10500"     # adjust to your field ID
 #
-#   # Host → Oracle instance mapping
+#   # Host -> Oracle instance mapping
 #   oracle_instance_map:
 #     lnx001:
 #       oracle_sid  : "ORCL"
@@ -68,7 +68,7 @@
 #   ansible-galaxy collection install community.general
 #   wget must be installed on each target host (yum install wget)
 
-# ── PLAY 1: localhost — fetch Jira issues and build patch job list ───────────
+# -- PLAY 1: localhost -- fetch Jira issues and build patch job list -----------
 - name: "PLAY 1 | Fetch Jira PAT issues and build patch job list"
   hosts: localhost
   gather_facts: true
@@ -92,7 +92,16 @@
   - name: "PRE-FLIGHT | Confirm authenticated identity"
     ansible.builtin.debug:
       msg: >-
-        Jira authentication OK — connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd PAT intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "PAT"
 
   - name: "1 | Search for open PAT issues"
     community.general.jira:
@@ -108,7 +117,7 @@
   - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
     ansible.builtin.debug:
       msg: >-
-        No Tasks Found — no PAT issues match JQL: {{ jira_jql_pat }}. Exiting cleanly.
+        No Tasks Found -- no PAT issues match JQL: {{ jira_jql_pat }}. Exiting cleanly.
     when: jira_search.meta.issues | length == 0
 
   - name: "1 | End play gracefully when no issues found"
@@ -133,60 +142,76 @@
       label: "{{ item.key }}"
     register: jira_issue_details
 
-  # Parse each issue:
-  #   patch_number  ← extracted from issue summary using regex
-  #                   Summary may be bare "36127154" or descriptive
-  #                   "Patch 36127154: MERGE ON DATABASE..." — either way
-  #                   we extract the first run of digits (the patch ID).
-  #   target_host   ← patch_host_field custom field value
-  #   oracle_sid    ← looked up from oracle_instance_map[target_host]
-  #   oracle_home   ← looked up from oracle_instance_map[target_host]
+  # Parse each issue (re-created July 2026 PAT form):
+  #   patch_number  <- patch_number_field (dedicated number field); falls back
+  #                    to the first run of 5+ digits in the summary for
+  #                    legacy-style issues
+  #   target        <- patch_host_field select value, format "host:SID"
+  #                    (e.g. "lnx001:CDB1"); the host part selects the entry
+  #                    in oracle_instance_map, which supplies SID/home/base
+  #   Issues with a missing/unknown target are warned about and skipped
+  #   (see the WARNING task below for the field dump).
+
+  - name: "2 | WARN and skip issues with a missing or unknown patch target"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} has no usable target in
+        {{ patch_host_field }} (got: '{{ pat_target }}', host: '{{ pat_host }}',
+        known hosts: {{ oracle_instance_map.keys() | list | join(', ') }})
+        -- this issue will be SKIPPED. If the PAT form changed, update
+        patch_host_field / patch_number_field in vars/main.yml using the
+        field dump below.
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items
+            | selectattr('key', 'match', '^customfield_')
+            | rejectattr('value', 'none')
+            | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      pat_target_raw: "{{ item.meta.fields[patch_host_field] | default('') }}"
+      pat_target: "{{ (pat_target_raw.value if pat_target_raw is mapping else pat_target_raw) | trim }}"
+      pat_host: "{{ pat_target.split(':')[0] | trim }}"
+    when: pat_target | length == 0 or pat_host not in oracle_instance_map
+
   - name: "2 | Build patch job list from issue details"
     ansible.builtin.set_fact:
       patch_jobs: >-
         {{
           patch_jobs | default([]) + [{
             'issue_key':    item.meta.key,
-            'patch_number': item.meta.fields.summary | trim
-                            | regex_search('[0-9]{5,}'),
-            'target_host':  item.meta.fields[patch_host_field].value
-                            if item.meta.fields[patch_host_field] is mapping
-                            else item.meta.fields[patch_host_field] | trim,
-            'oracle_sid':   oracle_instance_map[
-                              item.meta.fields[patch_host_field].value
-                              if item.meta.fields[patch_host_field] is mapping
-                              else item.meta.fields[patch_host_field] | trim
-                            ].oracle_sid,
-            'oracle_home':  oracle_instance_map[
-                              item.meta.fields[patch_host_field].value
-                              if item.meta.fields[patch_host_field] is mapping
-                              else item.meta.fields[patch_host_field] | trim
-                            ].oracle_home,
-            'oracle_base':  oracle_instance_map[
-                              item.meta.fields[patch_host_field].value
-                              if item.meta.fields[patch_host_field] is mapping
-                              else item.meta.fields[patch_host_field] | trim
-                            ].oracle_base,
-            'oracle_user':  oracle_instance_map[
-                              item.meta.fields[patch_host_field].value
-                              if item.meta.fields[patch_host_field] is mapping
-                              else item.meta.fields[patch_host_field] | trim
-                            ].oracle_user,
-            'oracle_group': oracle_instance_map[
-                              item.meta.fields[patch_host_field].value
-                              if item.meta.fields[patch_host_field] is mapping
-                              else item.meta.fields[patch_host_field] | trim
-                            ].oracle_group | default('oinstall')
+            'patch_number': pat_patch_number,
+            'target_host':  pat_host,
+            'oracle_sid':   oracle_instance_map[pat_host].oracle_sid,
+            'oracle_home':  oracle_instance_map[pat_host].oracle_home,
+            'oracle_base':  oracle_instance_map[pat_host].oracle_base,
+            'oracle_user':  oracle_instance_map[pat_host].oracle_user,
+            'oracle_group': oracle_instance_map[pat_host].oracle_group | default('oinstall')
           }]
         }}
     loop: "{{ jira_issue_details.results }}"
     loop_control:
       label: "{{ item.meta.key }}"
+    vars:
+      pat_target_raw: "{{ item.meta.fields[patch_host_field] | default('') }}"
+      pat_target: "{{ (pat_target_raw.value if pat_target_raw is mapping else pat_target_raw) | trim }}"
+      pat_host: "{{ pat_target.split(':')[0] | trim }}"
+      pat_patch_number: >-
+        {{
+          (item.meta.fields[patch_number_field] | default(0) | int)
+          if (item.meta.fields[patch_number_field] | default(0) | int) > 0
+          else (item.meta.fields.summary | trim | regex_search('[0-9]{5,}'))
+        }}
+    when:
+    - pat_target | length > 0
+    - pat_host in oracle_instance_map
 
   - name: "2 | Show patch jobs"
     ansible.builtin.debug:
       msg: >-
-        {{ item.issue_key }} — patch {{ item.patch_number }} → {{ item.target_host }} (SID={{ item.oracle_sid }}, HOME={{ item.oracle_home }})
+        {{ item.issue_key }} -- patch {{ item.patch_number }} -> {{ item.target_host }} (SID={{ item.oracle_sid }}, HOME={{ item.oracle_home }})
     loop: "{{ patch_jobs | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }}"
@@ -213,7 +238,7 @@
       mode: '0600'
     no_log: true
 
-# ── PLAY 2: target DB hosts — apply the patch ────────────────────────────────
+# -- PLAY 2: target DB hosts -- apply the patch --------------------------------
 #
 # We use `hosts: all` with a dynamic `add_host` approach: PLAY 2 actually
 # runs on localhost but delegates each job's heavy lifting to the target host
@@ -238,13 +263,13 @@
       patch_jobs: "{{ patch_jobs_raw.content | b64decode | from_json }}"
 
   - name: "4-9 | Run patch job for each issue"
-    ansible.builtin.include_tasks: jira_oracle_patch_job.yml
+    ansible.builtin.include_tasks: PAT_jira_oracle_patch_job.yml
     loop: "{{ patch_jobs }}"
     loop_control:
       loop_var: job
-      label: "{{ job.issue_key }} | patch {{ job.patch_number }} → {{ job.target_host }}"
+      label: "{{ job.issue_key }} | patch {{ job.patch_number }} -> {{ job.target_host }}"
 
-# ── PLAY 3: localhost — post worklog and transition issues ───────────────────
+# -- PLAY 3: localhost -- post worklog and transition issues -------------------
 - name: "PLAY 3 | Post Jira worklog entries and transition PAT issues"
   hosts: localhost
   gather_facts: true
@@ -265,7 +290,7 @@
   - name: "10 | Show outcome per issue"
     ansible.builtin.debug:
       msg: >-
-        {{ item.issue_key }} | patch {{ item.patch_number }} → {{ item.target_host }} : {{ item.status | upper }} {% if item.status == 'failed' %}| {{ item.error }}{% endif %}
+        {{ item.issue_key }} | patch {{ item.patch_number }} -> {{ item.target_host }} : {{ item.status | upper }} {% if item.status == 'failed' %}| {{ item.error }}{% endif %}
     loop: "{{ patch_outcomes }}"
     loop_control:
       label: "{{ item.issue_key }}"
@@ -281,20 +306,72 @@
     ansible.builtin.debug:
       msg: "{{ worklog_result.stdout_lines | default(['(no output)']) }}"
 
-  - name: "11 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  - name: "11 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.issue_key }}"
-      status: "{{ jira_status_done }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ patch_outcomes }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.status == 'done'
-    ignore_errors: true
+    register: done_transitions
+    failed_when: false
+
+  - name: "11 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "11 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
+        '{{ jira_status_done }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_done in vars/main.yml to one of the target statuses above.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
 
   - name: "11 | Post failure comment for FAILED issues"
     community.general.jira:
@@ -318,20 +395,137 @@
     when: item.status == 'failed'
     ignore_errors: true
 
-  - name: "11 | Transition FAILED issues to '{{ jira_status_failed }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  - name: "11 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.issue_key }}"
-      status: "{{ jira_status_failed }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ patch_outcomes }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.status == 'failed'
-    ignore_errors: true
+    register: failed_pat_transitions
+    failed_when: false
+
+  - name: "11 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ failed_pat_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "11 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
+        '{{ jira_status_failed }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+    loop: "{{ failed_pat_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 11b. Create DBA repair follow-up task per FAILED issue ----------------
+  # One follow-up per failed patch job, in the same project, in "To Do",
+  # for the Database Administrators, with a failure report attached.
+
+  - name: "11b | Set follow-up run timestamp"
+    ansible.builtin.set_fact:
+      fu_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    when: jira_followup_enabled | default(true) | bool
+
+  - name: "11b | Ensure follow-up log dir exists on controller"
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - patch_outcomes | selectattr('status', 'equalto', 'failed') | list | length > 0
+
+  - name: "11b | Write failure report per FAILED issue"
+    ansible.builtin.copy:
+      content: |
+        Automated Oracle Patching FAILURE LOG - {{ ansible_date_time.iso8601 }}
+        Issue        : {{ item.issue_key }}
+        Patch number : {{ item.patch_number }}
+        Target host  : {{ item.target_host }}
+        Oracle SID   : {{ item.oracle_sid }}
+        Result       : {{ item.status | upper }}
+
+        Error:
+        {{ item.error | default('(no error text captured - see Ansible controller logs)') }}
+
+        Full patch/OPatch logs remain on {{ item.target_host }} under the
+        patch staging and $ORACLE_HOME/cfgtoollogs directories.
+      dest: "{{ followup_log_dir }}/PAT_{{ item.issue_key }}_failure_{{ fu_run_ts }}.log"
+      mode: "0640"
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - item.status == 'failed'
+
+  - name: "11b | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.status == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.issue_key }}"
+      fu_summary: "DBA repair required: Oracle patch {{ fu_item.patch_number }} failed on {{ fu_item.target_host }} ({{ fu_item.issue_key }})"
+      fu_description: |-
+        Automated Oracle patching FAILED and the original issue has been
+        transitioned to "{{ jira_status_failed }}". Please investigate and repair.
+
+        Patch number : {{ fu_item.patch_number }}
+        Target host  : {{ fu_item.target_host }}
+        Oracle SID   : {{ fu_item.oracle_sid }}
+        Error        : {{ fu_item.error | default('See attached failure report.') }}
+      fu_attach_files:
+      - "{{ followup_log_dir }}/PAT_{{ fu_item.issue_key }}_failure_{{ fu_run_ts }}.log"
 
   - name: "12 | Print final summary"
     ansible.builtin.debug:
@@ -339,21 +533,21 @@
     loop: >-
       {{
         [
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Jira Oracle Patching Summary',
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Run timestamp : ' + ansible_date_time.iso8601,
           '  Issues found  : ' + (patch_outcomes | length | string),
           '  Succeeded     : ' + (patch_outcomes | selectattr('status','equalto','done')   | list | length | string),
           '  Failed        : ' + (patch_outcomes | selectattr('status','equalto','failed') | list | length | string),
-          '  ──────────────────────────────────────────────────'
+          '  --------------------------------------------------'
         ]
         + (patch_outcomes | map(attribute='issue_key') | zip(
              patch_outcomes | map(attribute='patch_number'),
              patch_outcomes | map(attribute='target_host'),
              patch_outcomes | map(attribute='status')
            ) | map('join', ' | ') | map('regex_replace', '^', '  ') | list)
-        + ['══════════════════════════════════════════════════════']
+        + ['======================================================']
       }}
     loop_control:
       label: "summary"

@@ -104,6 +104,15 @@
     #    Uses the newer /rest/api/3/search/jql endpoint (the legacy
     #    /rest/api/2/search POST endpoint has been retired on Jira Cloud).
     # -------------------------------------------------------------------------
+    # Shepherd the intake queue before searching for work:
+    #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+    # All other statuses are ignored. Freshly promoted issues are picked up
+    # by the search below in this same run.
+    - name: "0 | Shepherd UPG intake queue toward '{{ jira_status_in_progress }}'"
+      ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+      vars:
+        shepherd_project: "UPG"
+
     - name: "PRE | Search for open {{ jira_upg_project }} issues"
       ansible.builtin.uri:
         url: >-
@@ -147,7 +156,7 @@
     #    bad ticket does not stop the remaining tickets.
     # -------------------------------------------------------------------------
     - name: "JOB | Dispatch upgrade job per issue"
-      ansible.builtin.include_tasks: jira_oracle_upgrade_job.yml
+      ansible.builtin.include_tasks: UPG_jira_oracle_upgrade_job.yml
       loop: "{{ upg_jobs | default([]) }}"
       loop_control:
         loop_var: job

@@ -208,6 +208,43 @@
 
 # ── Write outcome for PLAY 3 ─────────────────────────────────────────────────
 
+# ── Preserve failure evidence on the controller (failed jobs only) ──────────
+# The expdp/impdp stdout is written to {{ followup_log_dir }} so PLAY 3 can
+# attach it to the DBA repair follow-up task. The full datapump logs also
+# remain on the DB host (cleanup is gated on import success).
+
+- name: "JOB | {{ job.issue_key }} | Ensure follow-up log dir exists on controller (failed only)"
+  ansible.builtin.file:
+    path: "{{ followup_log_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+  when: job_impdp.rc != 0
+
+- name: "JOB | {{ job.issue_key }} | Preserve export/import output on controller (failed only)"
+  ansible.builtin.copy:
+    content: |
+      Automated Oracle Schema Refresh FAILURE LOG - {{ ansible_date_time.iso8601 }}
+      Issue   : {{ job.issue_key }}
+      Spec    : {{ job.raw_spec }}
+      Source  : {{ job.source_schema }}@{{ job.source_service }}
+      Target  : {{ job.target_schema }}@{{ job.target_service }}
+      Export  : rc={{ job_expdp.rc }}
+      Import  : rc={{ job_impdp.rc }}
+      Datapump logs on {{ oracle_host }}: {{ job_exp_log_path }} / {{ job_imp_log_path }}
+
+      ══════ expdp output ══════════════════════════════════════════
+      {{ job_expdp.stdout | default('(no output)') }}
+
+      ══════ impdp output ══════════════════════════════════════════
+      {{ job_impdp.stdout | default('(no output)') }}
+    dest: "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
+    mode: "0640"
+  delegate_to: localhost
+  become: false
+  when: job_impdp.rc != 0
+
 - name: "JOB | {{ job.issue_key }} | Write outcome to controller temp file"
   ansible.builtin.shell:
     cmd: |
@@ -231,7 +268,8 @@
           "export_rc":      {{ job_expdp.rc }},
           "import_rc":      {{ job_impdp.rc }},
           "object_count":   {{ job_verify.stdout_lines | length }},
-          "error":          "" if {{ job_impdp.rc }} == 0 else "impdp rc={{ job_impdp.rc }}"
+          "error":          "" if {{ job_impdp.rc }} == 0 else "impdp rc={{ job_impdp.rc }}",
+          "failure_log":    "" if {{ job_impdp.rc }} == 0 else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
       })
 
       with open(outfile, "w") as f:

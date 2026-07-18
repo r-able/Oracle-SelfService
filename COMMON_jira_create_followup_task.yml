@@ -1,0 +1,190 @@
+---
+# =============================================================================
+# COMMON_jira_create_followup_task.yml
+#
+# Creates a DBA repair follow-up task in the SAME project as a failed issue,
+# optionally assigns it to the Database Administrators account, verifies it
+# sits in "To Do", attaches the failure logs, links it to the original issue
+# and leaves a traceability comment on the original.
+#
+# Include from a localhost play with these vars:
+#   fu_original_key : key of the FAILED issue, e.g. "REF-42"  (required)
+#   fu_summary      : summary for the new follow-up task       (required)
+#   fu_description  : plain-text description body              (required)
+#   fu_attach_files : list of controller-local log file paths  (optional;
+#                     missing/empty entries are skipped silently)
+#
+# Uses vars/main.yml settings:
+#   jira_followup_enabled, jira_followup_issue_type, jira_followup_label,
+#   jira_status_todo, jira_dba_account_id
+#
+# Every task here is failure-tolerant on purpose: a Jira hiccup while raising
+# the follow-up must never abort the calling playbook's remaining work.
+# =============================================================================
+
+# ── 1. Create the follow-up task in the same project ─────────────────────────
+# Project key is derived from the failed issue key (e.g. REF-42 -> REF).
+# New issues land in the project workflow's initial status ("To Do"); step 3
+# below double-checks that and transitions if a non-standard workflow put it
+# somewhere else.
+
+- name: "FUP | {{ fu_original_key }} | Create DBA repair task in project {{ fu_original_key.split('-')[0] }}"
+  community.general.jira:
+    uri: "{{ jira_url }}"
+    username: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    operation: create
+    project: "{{ fu_original_key.split('-')[0] }}"
+    issuetype: "{{ jira_followup_issue_type }}"
+    summary: "{{ fu_summary }}"
+    description: |
+      {{ fu_description }}
+
+      ----
+      Original failed issue : {{ fu_original_key }}
+      Assigned team         : Database Administrators
+      Raised automatically by Ansible at {{ '%Y-%m-%dT%H:%M:%S' | strftime }}.
+
+      The failure logs are attached to this task. See also the worklog and
+      attachments on {{ fu_original_key }} for the full automation history.
+    fields: >-
+      {{
+        {'labels': [jira_followup_label]}
+        | combine({'assignee': {'accountId': jira_dba_account_id}}
+                  if (jira_dba_account_id | default('') | length > 0) else {})
+      }}
+    cloud: "{{ jira_cloud }}"
+  register: fu_create_result
+  ignore_errors: true
+
+- name: "FUP | {{ fu_original_key }} | Record new follow-up issue key"
+  ansible.builtin.set_fact:
+    fu_created_key: "{{ fu_create_result.meta.key | default('') }}"
+
+- name: "FUP | {{ fu_original_key }} | Warn if follow-up creation failed"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not create DBA follow-up task for {{ fu_original_key }}:
+      {{ fu_create_result.msg | default('unknown error') }}
+  when: fu_created_key | length == 0
+
+# ── 2. Verify the new task is in "To Do" (transition if it is not) ───────────
+
+- name: "FUP | {{ fu_original_key }} | Read status of {{ fu_created_key | default('n/a') }}"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ fu_created_key }}?fields=status"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: fu_issue_status
+  failed_when: false
+  when: fu_created_key | length > 0
+
+- name: "FUP | {{ fu_original_key }} | Get transitions (only if not already in '{{ jira_status_todo }}')"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ fu_created_key }}/transitions"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: fu_transitions
+  failed_when: false
+  when:
+  - fu_created_key | length > 0
+  - (fu_issue_status.json.fields.status.name | default(jira_status_todo)) != jira_status_todo
+
+- name: "FUP | {{ fu_original_key }} | Transition {{ fu_created_key | default('n/a') }} to '{{ jira_status_todo }}'"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ fu_created_key }}/transitions"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      transition:
+        id: "{{ (fu_transitions.json.transitions | selectattr('name', 'equalto', jira_status_todo) | list | first).id }}"
+    status_code: 204
+  failed_when: false
+  when:
+  - fu_created_key | length > 0
+  - fu_transitions is not skipped
+  - fu_transitions.json is defined
+  - fu_transitions.json.transitions | default([]) | selectattr('name', 'equalto', jira_status_todo) | list | length > 0
+
+# ── 3. Attach failure logs (missing files skipped silently) ──────────────────
+
+- name: "FUP | {{ fu_original_key }} | Check which failure log files exist"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ fu_attach_files | default([]) | select() | list }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  register: fu_attach_stat
+  when: fu_created_key | length > 0
+
+- name: "FUP | {{ fu_original_key }} | Attach failure logs to {{ fu_created_key | default('n/a') }}"
+  community.general.jira:
+    uri: "{{ jira_url }}"
+    username: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    operation: attach
+    issue: "{{ fu_created_key }}"
+    attachment:
+      filename: "{{ item.item }}"
+    cloud: "{{ jira_cloud }}"
+  loop: "{{ fu_attach_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('n/a') | basename }}"
+  when:
+  - fu_created_key | length > 0
+  - item.stat.exists | default(false)
+  ignore_errors: true
+
+# ── 4. Link follow-up to the original issue + traceability comment ───────────
+
+- name: "FUP | {{ fu_original_key }} | Link {{ fu_created_key | default('n/a') }} to original issue"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issueLink"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      type:
+        name: "Relates"
+      inwardIssue:
+        key: "{{ fu_created_key }}"
+      outwardIssue:
+        key: "{{ fu_original_key }}"
+    status_code: 201
+  failed_when: false
+  when: fu_created_key | length > 0
+
+- name: "FUP | {{ fu_original_key }} | Comment on original issue with follow-up reference"
+  community.general.jira:
+    uri: "{{ jira_url }}"
+    username: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    operation: comment
+    issue: "{{ fu_original_key }}"
+    comment: >-
+      DBA repair follow-up task {{ fu_created_key }} has been created in
+      "{{ jira_status_todo }}" for the Database Administrators. The failure
+      logs from this run are attached to that task.
+    cloud: "{{ jira_cloud }}"
+  ignore_errors: true
+  when: fu_created_key | length > 0
+
+- name: "FUP | {{ fu_original_key }} | Follow-up creation summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ fu_original_key }} -> follow-up {{ fu_created_key }} created
+      ({{ fu_attach_stat.results | default([]) | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length }} log file(s) attached)
+  when: fu_created_key | length > 0

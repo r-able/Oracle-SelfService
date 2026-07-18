@@ -44,12 +44,34 @@ For example, the unencrypted DCR cron entry
 should be change to as follows (if you are inclined to store the Vault password on disk):
 */1 * * * * ansible-playbook jira_oracle_password_reset.yml --vault-password-file /etc/ansible/.vault_pass >> /tmp/cron.DCR.log 2>&1
 
+Logging tree:
+
+[ansible_admin@HPsuperdome ~]$  pwd
+/home/ansible_admin
+[ansible_admin@HPsuperdome ~]$ tree -d
+.
++-- jira_cau
+��� +-- logs
++-- jira_cdp
+��� +-- logs
++-- jira_dcr
+��� +-- logs
++-- jira_pat
+��� +-- logs
++-- jira_ref
+��� +-- logs
++-- jira_upg
+��� +-- logs
+
+
+JIRA statuses transition:
+
+"To Do" => "Pending Approval" => "In Progress" if approved, "Rejected" if rejected => "Done" if successful, "Failed" if failed
+
 Authors:
 Vlad von Grigorian
 @GRIGORIANV
 grigorianvlad@gmail
-ex. Dominique Pizzie
-ex. @DomPizzie
 
 Version History:
 0.2

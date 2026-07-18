@@ -1,0 +1,205 @@
+---
+# =============================================================================
+# COMMON_jira_shepherd_statuses.yml
+#
+# Pre-execution status shepherd, included by every project playbook BEFORE
+# its main JQL search:
+#
+#   To Do             -> Pending Approval   (puts the request in front of the
+#                                            approvers)
+#   Pending Approval  -> In Progress        (ONLY when the Jira approval has
+#                                            been granted: every entry in the
+#                                            approvals field has
+#                                            finalDecision == 'approved')
+#   any other status  -> ignored
+#
+# Because this runs before the main search (which gates on In Progress),
+# issues approved since the last run are promoted and executed in the SAME
+# run. Unapproved and declined requests never advance.
+#
+# Include with:
+#   shepherd_project : project key, e.g. "REF"
+#
+# Uses vars/main.yml:
+#   jira_status_todo, jira_status_pending_approval, jira_status_in_progress,
+#   jira_approvals_field, jira_max_results
+#
+# Every task is failure-tolerant: a shepherd hiccup must never block
+# execution of the already-In-Progress queue. Status names are matched
+# case-insensitively throughout.
+# =============================================================================
+
+- name: "SHEP | {{ shepherd_project }} | Find issues in '{{ jira_status_todo }}' or '{{ jira_status_pending_approval }}'"
+  ansible.builtin.uri:
+    url: >-
+      {{ jira_url }}/rest/api/3/search/jql?jql={{
+        ("project = " + shepherd_project
+         + " AND status IN ('" + jira_status_todo + "', '" + jira_status_pending_approval + "')"
+         + " ORDER BY created ASC") | urlencode
+      }}&fields=status,{{ jira_approvals_field }}&maxResults={{ jira_max_results }}
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: shep_search
+  failed_when: false
+
+- name: "SHEP | {{ shepherd_project }} | Collect issues to shepherd"
+  ansible.builtin.set_fact:
+    shep_issues: "{{ shep_search.json.issues | default([]) }}"
+
+- name: "SHEP | {{ shepherd_project }} | Shepherd queue summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ shepherd_project }}: {{ shep_issues | length }} issue(s) in
+      '{{ jira_status_todo }}'/'{{ jira_status_pending_approval }}'
+      ({{ shep_issues | map(attribute='key') | list | join(', ') | default('none', true) }})
+
+# --- To Do -> Pending Approval ----------------------------------------------
+
+- name: "SHEP | {{ shepherd_project }} | Get transitions for '{{ jira_status_todo }}' issues"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  loop: "{{ shep_issues }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: (item.fields.status.name | default('')) | lower == jira_status_todo | lower
+  register: shep_todo_transitions
+  failed_when: false
+
+- name: "SHEP | {{ shepherd_project }} | Transition '{{ jira_status_todo }}' issues to '{{ jira_status_pending_approval }}'"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      transition:
+        id: "{{ tr_match.id }}"
+    status_code: 204
+  loop: "{{ shep_todo_transitions.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('skipped') }}"
+  vars:
+    tr_all: "{{ item.json.transitions | default([]) }}"
+    tr_match: >-
+      {{
+        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_pending_approval | regex_escape) + '$') | list)
+         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_pending_approval | regex_escape) + '$') | list))
+        | first | default({})
+      }}
+  when:
+  - item is not skipped
+  - tr_match.id is defined
+  failed_when: false
+
+- name: "SHEP | {{ shepherd_project }} | WARN when no '{{ jira_status_pending_approval }}' transition is available"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ item.item.key }} is in '{{ jira_status_todo }}' but could NOT
+      be transitioned to '{{ jira_status_pending_approval }}' -- the workflow
+      only offers these transitions from the current status:
+      {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+      Check jira_status_pending_approval in vars/main.yml against the project workflow.
+  loop: "{{ shep_todo_transitions.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('skipped') }}"
+  vars:
+    tr_all: "{{ item.json.transitions | default([]) }}"
+    tr_match: >-
+      {{
+        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_pending_approval | regex_escape) + '$') | list)
+         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_pending_approval | regex_escape) + '$') | list))
+        | first | default({})
+      }}
+  when:
+  - item is not skipped
+  - tr_match.id is not defined
+
+# --- Pending Approval -> In Progress (approved requests only) ----------------
+
+- name: "SHEP | {{ shepherd_project }} | Get transitions for APPROVED '{{ jira_status_pending_approval }}' issues"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  loop: "{{ shep_issues }}"
+  loop_control:
+    label: "{{ item.key }}"
+  vars:
+    shep_approvals: "{{ item.fields[jira_approvals_field] | default([], true) }}"
+    shep_approved: >-
+      {{
+        shep_approvals | length > 0
+        and (shep_approvals | selectattr('finalDecision', 'equalto', 'approved') | list | length) == (shep_approvals | length)
+      }}
+  when:
+  - (item.fields.status.name | default('')) | lower == jira_status_pending_approval | lower
+  - shep_approved | bool
+  register: shep_appr_transitions
+  failed_when: false
+
+- name: "SHEP | {{ shepherd_project }} | Transition APPROVED issues to '{{ jira_status_in_progress }}'"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      transition:
+        id: "{{ tr_match.id }}"
+    status_code: 204
+  loop: "{{ shep_appr_transitions.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('skipped') }}"
+  vars:
+    tr_all: "{{ item.json.transitions | default([]) }}"
+    tr_match: >-
+      {{
+        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_in_progress | regex_escape) + '$') | list)
+         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_in_progress | regex_escape) + '$') | list))
+        | first | default({})
+      }}
+  when:
+  - item is not skipped
+  - tr_match.id is defined
+  failed_when: false
+
+- name: "SHEP | {{ shepherd_project }} | WARN when no '{{ jira_status_in_progress }}' transition is available"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ item.item.key }} is APPROVED but could NOT be transitioned to
+      '{{ jira_status_in_progress }}' -- the workflow only offers these
+      transitions from the current status:
+      {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+      Check jira_status_in_progress in vars/main.yml against the project workflow.
+  loop: "{{ shep_appr_transitions.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('skipped') }}"
+  vars:
+    tr_all: "{{ item.json.transitions | default([]) }}"
+    tr_match: >-
+      {{
+        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_in_progress | regex_escape) + '$') | list)
+         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_in_progress | regex_escape) + '$') | list))
+        | first | default({})
+      }}
+  when:
+  - item is not skipped
+  - tr_match.id is not defined

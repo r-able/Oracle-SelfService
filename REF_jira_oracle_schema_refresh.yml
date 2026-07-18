@@ -4,9 +4,8 @@
 # Workflow:
 #   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
 #   1. Search      : find all open REF issues matching the configured JQL
-#   2. Fetch       : retrieve each issue and parse customfield_10456 value
-#                    formatted as "SOURCE_SERVICE:SOURCE_SCHEMA=>TARGET_SERVICE:TARGET_SCHEMA"
-#                    e.g. "PRO:SOURCE=>UAT:TARGET"
+#   2. Fetch       : retrieve each issue and parse the refresh spec from the
+#                    field named by jira_ref_spec_field (vars/main.yml)
 #   3. Pre-flight  : verify expdp/impdp exist on the DB host, confirm
 #                    source schema exists in the source Oracle instance
 #   4. Export      : run expdp on the source instance as the oracle OS user
@@ -16,6 +15,7 @@
 #   7. Worklog     : posted per job by jira_oracle_schema_refresh_job.yml
 #                    (detailed export/import output incl. tables + row counts)
 #   8. Transition  : move issue to "Done" on success, "Failed" on error
+#                    ("Failed" also opens a DBA repair follow-up task)
 #   9. Summary     : print final outcome table
 #
 # CHANGES (July 2026):
@@ -24,16 +24,26 @@
 #     credentials sidecar file have been removed.
 #   * PLAY 1 now deletes any stale /tmp/jira_refresh_outcomes.json before the
 #     run, so an aborted previous run cannot leak old outcomes into PLAY 3.
+#   * Projects/forms were re-created (July 2026): the spec moved to
+#     customfield_10746 (configurable via jira_ref_spec_field) and an
+#     Approvals step was added, so the JQL now gates on status='In Progress'
+#     (issues only reach it after approval).
 #
-# customfield_10456 format:
-#   "PRO:SOURCE=>UAT:TARGET"
-#    ^^^  ^^^^^^  ^^^  ^^^^^^
-#    |    |       |    └─ target schema name
-#    |    |       └─ target Oracle service/SID
-#    |    └─ source schema name
-#    └─ source Oracle service/SID
+# Refresh spec formats (both accepted; select-option and plain-text fields
+# are both handled):
+#   legacy: "PRO:SOURCE=>UAT:TARGET"
+#            ^^^  ^^^^^^  ^^^  ^^^^^^
+#            |    |       |    `- target schema name
+#            |    |       `- target Oracle service/SID
+#            |    `- source schema name
+#            `- source Oracle service/SID
+#   new   : "PROD:DEV"
+#            ^^^^  ^^^
+#            |     `- target Oracle service (schema = target_schema var)
+#            `- source Oracle service (schema = source_schema var);
+#            service names normalized via oracle_service_aliases (PROD->PRO)
 #
-# Required vars (vars/main.yml — vault-encrypt sensitive values):
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
 #   # Jira
 #   jira_url          : "https://yourorg.atlassian.net"
 #   jira_user         : "ansible-svc@yourorg.com"
@@ -61,8 +71,8 @@
 # Usage:
 #   ansible-playbook jira_oracle_schema_refresh.yml --ask-vault-pass
 
-# ── PLAY 1: Ansible controller — fetch Jira issues ──────────────────────────
-- name: "PLAY 1 | Fetch Jira refresh tasks and validate customfield_10456"
+# -- PLAY 1: Ansible controller -- fetch Jira issues --------------------------
+- name: "PLAY 1 | Fetch Jira refresh tasks and validate the refresh spec field"
   hosts: localhost
   gather_facts: true
   vars_files:
@@ -85,12 +95,21 @@
   - name: "PRE-FLIGHT | Confirm authenticated identity"
     ansible.builtin.debug:
       msg: >-
-        Jira authentication OK — connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
 
   - name: "PRE-FLIGHT | Remove stale outcomes file from any aborted previous run"
     ansible.builtin.file:
       path: "/tmp/jira_refresh_outcomes.json"
       state: absent
+
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd REF intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "REF"
 
   - name: "1 | Search for open Jira refresh issues matching JQL"
     community.general.jira:
@@ -106,7 +125,7 @@
   - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
     ansible.builtin.debug:
       msg: >-
-        No Tasks Found — no Jira issues currently match JQL: {{ jira_jql_ref }}. Nothing to process; exiting cleanly.
+        No Tasks Found -- no Jira issues currently match JQL: {{ jira_jql_ref }}. Nothing to process; exiting cleanly.
     when: jira_search.meta.issues | length == 0
 
   - name: "1 | End play gracefully when no issues are found"
@@ -131,32 +150,63 @@
       label: "{{ item.key }}"
     register: jira_issue_details
 
-  # Parse customfield_10456 value: "PRO:SOURCE=>UAT:TARGET"
-  # Strip whitespace, split on "=>", then split each side on ":"
+  # Parse the refresh spec from {{ jira_ref_spec_field }} (vars/main.yml).
+  # Two formats are supported:
+  #   legacy : "PRO:SOURCE=>UAT:TARGET"  (service:schema => service:schema)
+  #   new    : "PROD:DEV"                (source_service:target_service from
+  #            the re-created form's select option; schemas default to the
+  #            source_schema / target_schema vars)
+  # Select-option fields arrive as {'id':..,'value':'PROD:DEV'}; plain text
+  # fields arrive as a string -- both are handled. Form service names are
+  # normalized via oracle_service_aliases (e.g. PROD -> PRO).
   # Result per issue: { issue_key, raw_spec,
   #                     source_service, source_schema,
   #                     target_service, target_schema }
-  - name: "2 | Parse refresh spec from customfield_10456"
+
+  - name: "2 | Warn and skip issues with a missing or invalid refresh spec"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.meta.key }} has no usable refresh spec in
+        {{ jira_ref_spec_field }} (value: {{ item.meta.fields[jira_ref_spec_field] | default('(field missing)') }})
+        -- skipping this issue.
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      ref_spec_raw: "{{ item.meta.fields[jira_ref_spec_field] | default('') }}"
+      ref_spec: "{{ (ref_spec_raw.value if ref_spec_raw is mapping else ref_spec_raw) | default('') | trim }}"
+    when: "':' not in ref_spec"
+
+  - name: "2 | Parse refresh spec from {{ jira_ref_spec_field }}"
     ansible.builtin.set_fact:
       refresh_jobs: >-
         {{
           refresh_jobs | default([]) + [{
             'issue_key':      item.meta.key,
-            'raw_spec':       item.meta.fields.customfield_10456.value | trim,
-            'source_service': (item.meta.fields.customfield_10456.value | trim).split('=>')[0].split(':')[0] | upper,
-            'source_schema':  (item.meta.fields.customfield_10456.value | trim).split('=>')[0].split(':')[1] | upper,
-            'target_service': (item.meta.fields.customfield_10456.value | trim).split('=>')[1].split(':')[0] | upper,
-            'target_schema':  (item.meta.fields.customfield_10456.value | trim).split('=>')[1].split(':')[1] | upper
+            'raw_spec':       ref_spec,
+            'source_service': (oracle_service_aliases | default({})).get(ref_src_service, ref_src_service),
+            'source_schema':  ref_src_schema,
+            'target_service': (oracle_service_aliases | default({})).get(ref_tgt_service, ref_tgt_service),
+            'target_schema':  ref_tgt_schema
           }]
         }}
     loop: "{{ jira_issue_details.results }}"
     loop_control:
       label: "{{ item.meta.key }}"
+    vars:
+      ref_spec_raw: "{{ item.meta.fields[jira_ref_spec_field] | default('') }}"
+      ref_spec: "{{ (ref_spec_raw.value if ref_spec_raw is mapping else ref_spec_raw) | default('') | trim }}"
+      ref_legacy: "{{ '=>' in ref_spec }}"
+      ref_src_service: "{{ (ref_spec.split('=>')[0].split(':')[0] if ref_legacy | bool else ref_spec.split(':')[0]) | trim | upper }}"
+      ref_src_schema: "{{ (ref_spec.split('=>')[0].split(':')[1] if ref_legacy | bool else source_schema) | trim | upper }}"
+      ref_tgt_service: "{{ (ref_spec.split('=>')[1].split(':')[0] if ref_legacy | bool else ref_spec.split(':')[1]) | trim | upper }}"
+      ref_tgt_schema: "{{ (ref_spec.split('=>')[1].split(':')[1] if ref_legacy | bool else target_schema) | trim | upper }}"
+    when: "':' in ref_spec"
 
   - name: "2 | Show parsed refresh jobs"
     ansible.builtin.debug:
       msg: >-
-        {{ item.issue_key }} — {{ item.raw_spec }} | export {{ item.source_schema }}@{{ item.source_service }} → import {{ item.target_schema }}@{{ item.target_service }}
+        {{ item.issue_key }} -- {{ item.raw_spec }} | export {{ item.source_schema }}@{{ item.source_service }} -> import {{ item.target_schema }}@{{ item.target_service }}
     loop: "{{ refresh_jobs | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }}"
@@ -170,7 +220,7 @@
       mode: '0600'
     no_log: true
 
-# ── PLAY 2: Oracle DB host — run expdp/impdp per refresh job ────────────────
+# -- PLAY 2: Oracle DB host -- run expdp/impdp per refresh job ----------------
 - name: "PLAY 2 | Run Oracle schema refresh jobs on the DB host"
   hosts: "{{ oracle_host }}"
   gather_facts: true
@@ -227,19 +277,19 @@
       state: directory
       mode: '0750'
 
-  # ── Run each refresh job sequentially ────────────────────────────────────
+  # -- Run each refresh job sequentially ------------------------------------
   # Using include_tasks with loop so variables are scoped per job cleanly.
   # NOTE: each job posts its own detailed worklog entry (export/import output
   # with tables and row counts) from inside the included task file.
 
   - name: "3-6 | Execute each refresh job"
-    ansible.builtin.include_tasks: jira_oracle_schema_refresh_job.yml
+    ansible.builtin.include_tasks: REF_jira_oracle_schema_refresh_job.yml
     loop: "{{ refresh_jobs }}"
     loop_control:
       loop_var: job
       label: "{{ job.issue_key }} | {{ job.source_schema }}@{{ job.source_service }} => {{ job.target_schema }}@{{ job.target_service }}"
 
-# ── PLAY 3: Ansible controller — transition issues ───────────────────────────
+# -- PLAY 3: Ansible controller -- transition issues ---------------------------
 - name: "PLAY 3 | Transition issues based on refresh outcomes"
   hosts: localhost
   gather_facts: true
@@ -265,20 +315,79 @@
     loop_control:
       label: "{{ item.issue_key }}"
 
-  - name: "8 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  # Transitions are done via the REST API directly instead of the jira
+  # module: the re-created (team-managed) projects don't reliably expose a
+  # transition literally named "Done"/"Failed", so we fetch each issue's
+  # available transitions and match on the TARGET status (to.name) first,
+  # falling back to the transition name. When nothing matches, a WARNING
+  # lists what the workflow actually offers instead of failing silently.
+
+  - name: "8 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.issue_key }}"
-      status: "{{ jira_status_done }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ refresh_outcomes }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.status == 'done'
-    ignore_errors: true
+    register: done_transitions
+    failed_when: false
+
+  - name: "8 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
+        '{{ jira_status_done }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_done in vars/main.yml to one of the target statuses above.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
 
   - name: "8 | Post failure comment for FAILED issues"
     community.general.jira:
@@ -302,20 +411,104 @@
     when: item.status == 'failed'
     ignore_errors: true
 
-  - name: "8 | Transition FAILED issues to '{{ jira_status_failed }}'"
-    community.general.jira:
-      uri: "{{ jira_url }}"
-      username: "{{ jira_user }}"
+  - name: "8 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
       password: "{{ jira_api_token }}"
-      operation: transition
-      issue: "{{ item.issue_key }}"
-      status: "{{ jira_status_failed }}"
-      cloud: "{{ jira_cloud }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
     loop: "{{ refresh_outcomes }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.status == 'failed'
-    ignore_errors: true
+    register: failed_ref_transitions
+    failed_when: false
+
+  - name: "8 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ failed_ref_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to
+        '{{ jira_status_failed }}' -- the workflow only offers these transitions
+        from the current status:
+        {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}.
+        Set jira_status_failed in vars/main.yml to one of the target statuses above.
+    loop: "{{ failed_ref_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 8b. Create DBA repair follow-up task per FAILED issue -----------------
+  # One follow-up per failed refresh, in the same project, in "To Do", for
+  # the Database Administrators, with the preserved expdp/impdp output
+  # attached (written by the job file to {{ followup_log_dir }}).
+
+  - name: "8b | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.status == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.issue_key }}"
+      fu_summary: "DBA repair required: schema refresh failed for {{ fu_item.issue_key }} ({{ fu_item.source_schema }}@{{ fu_item.source_service }} => {{ fu_item.target_schema }}@{{ fu_item.target_service }})"
+      fu_description: |-
+        Automated Oracle schema refresh FAILED and the original issue has been
+        transitioned to "{{ jira_status_failed }}". Please investigate and repair.
+
+        Spec           : {{ fu_item.raw_spec }}
+        Source         : {{ fu_item.source_schema }}@{{ fu_item.source_service }}
+        Target         : {{ fu_item.target_schema }}@{{ fu_item.target_service }}
+        Export rc      : {{ fu_item.export_rc | default('n/a') }}
+        Import rc      : {{ fu_item.import_rc | default('n/a') }}
+        Error          : {{ fu_item.error | default('See attached log and Ansible controller logs.') }}
+
+        Dump and datapump log files were preserved on {{ oracle_host }} in the
+        REFRESH directory for diagnosis (failed jobs are never cleaned up).
+      fu_attach_files: "{{ [fu_item.failure_log | default('')] | select() | list }}"
 
   - name: "9 | Print final summary"
     ansible.builtin.debug:
@@ -323,19 +516,19 @@
     loop: >-
       {{
         [
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Jira Oracle Schema Refresh Summary',
-          '══════════════════════════════════════════════════════',
+          '======================================================',
           '  Run timestamp : ' + ansible_date_time.iso8601,
           '  Issues found  : ' + (refresh_outcomes | length | string),
           '  Succeeded     : ' + (refresh_outcomes | selectattr('status','equalto','done')   | list | length | string),
           '  Failed        : ' + (refresh_outcomes | selectattr('status','equalto','failed') | list | length | string),
-          '  ──────────────────────────────────────────────────'
+          '  --------------------------------------------------'
         ]
         + (refresh_outcomes | map(attribute='issue_key') | zip(
              refresh_outcomes | map(attribute='status')
-           ) | map('join', '   →   ') | map('regex_replace', '^', '  ') | list)
-        + ['══════════════════════════════════════════════════════']
+           ) | map('join', '   ->   ') | map('regex_replace', '^', '  ') | list)
+        + ['======================================================']
       }}
     loop_control:
       label: "summary"
