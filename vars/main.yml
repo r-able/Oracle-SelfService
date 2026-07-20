@@ -1,11 +1,42 @@
 ---
 # main.yml
+# SNOW variables
+sn_instance: <REDACTED>
+sn_username: <REDACTED>
+sn_password: <REDACTED>
+#data variables
+sn_severity: 2
+sn_priority: 2
+sn_type: standard
+template_name: refresh
+##### ServiceNow conversion settings ################################
+# The change_request table is shared; each project finds its work by
+# short_description prefix "<TAG> | <spec...>" (see COMMON_snow_intake.yml).
+# Spec formats after the tag:
+#   REF | PROD:DEV                     (or legacy PRO:HR=>UAT:HR_COPY)
+#   PAT | lnx001:CDB1 | 234234234      (target | patch number)
+#   CAU | Vlad Grigorian | PROD,DEV,SIT
+#   CDP | Vlad Grigorian
+#   UPG | CDB1
+#   DCR | <free title>                 (.sql scripts as attachments)
+sn_max_results: 50
+# Raw state codes of the change_request table (reads via the table API use
+# these; writes go through servicenow.itsm.change_request friendly names)
+snow_state_new: "-5"
+snow_state_assess: "-4"
+snow_state_scheduled: "-2"
+snow_state_implement: "-1"
+snow_state_review: "0"
+snow_state_closed: "3"
+snow_followup_enabled: true
+snow_work_dir: "/dcr_runtime/snow_dcr_{{ ansible_facts['date_time'].iso8601[:19] }}"
+#####################################################################
 # JIRA variables
 jira_url: <REDACTED>
 # Your Atlassian account email
-jira_user: "<REDACTED>"
+jira_user: <REDACTED>
 # The API token generated from your Atlassian account security settings
-jira_api_token: "<REDACTED>"
+jira_api_token: <REDACTED>
 #New CNU parameters
 # All projects (July 2026 re-creation): issues only reach 'In Progress' after
 # the Approvals step, so every JQL gates on it -- 'Pending Approval' issues
@@ -31,7 +62,6 @@ oracle_service_aliases:
   PRODUCTION: "PRO"
 jira_jql_dcr: "project = 'DCR' AND status = 'In Progress' ORDER BY created ASC"
 jira_jql_cnu: "project = CNU AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
-#jira_jql_cdp: "project = CDP AND status = 'In Progress' ORDER BY created ASC"
 jira_jql_cdp: "project = CDP AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
 jira_jql_pat: "project = PAT AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
 jira_jql_upg: "project = UPG AND issuetype = Task AND status = 'In Progress' ORDER BY created ASC"
@@ -75,7 +105,7 @@ oracle_databases:
 #End of new CNU parameters
 oracle_port: 1521
 oracle_dba_user: "system"          # DBA account that can ALTER USER
-oracle_dba_pass: "<REDACTED>"
+oracle_dba_pass: <REDACTED>
 log_path: /etc/ansible/logs
 #####################
 oracle_host: "lnx001"
@@ -85,14 +115,14 @@ oracle_home: "/u01/app/oracle/product/21.0.0/dbhome_1"
 oracle_source_home: /u01/app/oracle/product/21.0.0/dbhome_1
 oracle_target_home: /u01/app/oracle/product/26.0.0/dbhome_1
 datapump_dir: "REFRESH"
-default_oracle_sid: CDB1 
+default_oracle_sid: CDB1
 source_service:        "PRO"
 source_dba_user:       "system"
-source_dba_pass:       "<REDACTED>"
+source_dba_pass:       <REDACTED>
 source_schema:         "SOURCE"
 #target_service:        "DEV"
 target_dba_user:       "system"
-target_dba_pass:       "<REDACTED>"
+target_dba_pass:       <REDACTED>
 target_schema:         "TARGET"
 datapump_parallel:     4
 datapump_compression:  "ALL"
@@ -113,8 +143,8 @@ oracle_service: "ORCLPDB"
 patch_host_field: "customfield_10745"    # select: target as "host:SID", e.g. "lnx001:CDB1"
 patch_number_field: "customfield_10744"  # number: the Oracle patch number (falls back to summary digits)
 patch_stage_dir: "/patch"
-mos_username: "<REDACTED>"
-mos_password: "<REDACTED>"       # vault-encrypt this
+mos_username: <REDACTED>
+mos_password: <REDACTED>       # vault-encrypt this
 oracle_instance_map:
   lnx001:
     oracle_sid:  "CDB1"
