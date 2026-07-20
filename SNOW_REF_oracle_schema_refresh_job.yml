@@ -1,0 +1,279 @@
+---
+# SNOW_REF_oracle_schema_refresh_job.yml
+#
+# Included by SNOW_REF_oracle_schema_refresh.yml for each refresh job.
+# Loop variable: `job`  (a dict with issue_key, source_service, source_schema,
+#                         target_service, target_schema, raw_spec)
+#
+# Writes its outcome into /tmp/snow_refresh_outcomes.json on the controller
+# for PLAY 3 to pick up.
+#
+# CHANGES (July 2026):
+#   * New task posts export/import results directly to the issue's Jira
+#     worklog (before cleanup, so it reflects final state and full output).
+#   * Cleanup of dump/log files now only runs when the import succeeded,
+#     so failed refreshes preserve their evidence for diagnosis.
+#   * no_log stays OFF on expdp/impdp: their stdout contains no credentials
+#     (the password is only in the registered cmd field, which is never
+#     posted), and the worklog needs the stdout.
+
+- name: "JOB | {{ job.issue_key }} | Set per-job file names"
+  ansible.builtin.set_fact:
+    job_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+    job_dump: "{{ job.source_schema }}_to_{{ job.target_schema }}_{{ ansible_date_time.iso8601_basic_short }}.dmp"
+    job_exp_log: "{{ job.source_schema }}_export_{{ ansible_date_time.iso8601_basic_short }}.log"
+    job_imp_log: "{{ job.target_schema }}_import_{{ ansible_date_time.iso8601_basic_short }}.log"
+
+- name: "JOB | {{ job.issue_key }} | Set per-job full paths"
+  ansible.builtin.set_fact:
+    job_dump_path: "{{ datapump_dir }}/{{ job_dump }}"
+    job_exp_log_path: "{{ datapump_dir }}/{{ job_exp_log }}"
+    job_imp_log_path: "{{ datapump_dir }}/{{ job_imp_log }}"
+
+- name: "JOB | {{ job.issue_key }} | Pre-flight: confirm source schema exists in {{ job.source_service }}"
+  ansible.builtin.shell:
+    cmd: |
+      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.source_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT COUNT(*) FROM dba_users WHERE username = UPPER('{{ job.source_schema }}');
+      EXIT;
+      EOF
+  environment: "{{ oracle_env }}"
+  register: job_src_check
+  no_log: true
+  changed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Fail if source schema does not exist"
+  ansible.builtin.fail:
+    msg: >-
+      Schema '{{ job.source_schema }}' does not exist in {{ job.source_service }}. Aborting refresh for {{ job.issue_key }}.
+  when: (job_src_check.stdout | trim) == '0'
+
+# -- Export ------------------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Export {{ job.source_schema }}@{{ job.source_service }}"
+  ansible.builtin.shell:
+    cmd: >-
+      {{ oracle_home }}/bin/expdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.source_service }} SCHEMAS={{ job.source_schema }} DIRECTORY=REFRESH DUMPFILE={{ job_dump }} LOGFILE={{ job_exp_log }} PARALLEL={{ datapump_parallel }} COMPRESSION={{ datapump_compression }} REUSE_DUMPFILES=YES
+  environment: "{{ oracle_env }}"
+  register: job_expdp
+  async: 14400
+  poll: 30
+
+- name: "JOB | {{ job.issue_key }} | Show export status"
+  ansible.builtin.debug:
+    msg: >-
+      Export {{ 'OK' if job_expdp.rc == 0 else 'FAILED (rc=' + (job_expdp.rc | string) + ')' }} | log: {{ job_exp_log_path }}
+
+- name: "JOB | {{ job.issue_key }} | Fail if export failed"
+  ansible.builtin.fail:
+    msg: "expdp failed (rc={{ job_expdp.rc }}). Review {{ job_exp_log_path }}."
+  when: job_expdp.rc != 0
+
+# -- Drop target schema before import -----------------------------------------
+# Uses a PL/SQL block so the task is idempotent -- if the user does not exist
+# the DROP is skipped silently rather than raising ORA-01918.
+# All variables reference job.* so they are resolved from the Jira issue
+# customfield_10456 value, not from vars/main.yml (which does not contain
+# per-job target_service / target_schema since they vary per issue).
+
+- name: "JOB | {{ job.issue_key }} | Drop target schema {{ job.target_schema }} from {{ job.target_service }} (idempotent)"
+  ansible.builtin.shell:
+    cmd: |
+      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+      SET SERVEROUTPUT ON
+      DECLARE
+        v_count NUMBER;
+      BEGIN
+        SELECT COUNT(*) INTO v_count
+        FROM   dba_users
+        WHERE  username = UPPER('{{ job.target_schema }}');
+        IF v_count > 0 THEN
+          EXECUTE IMMEDIATE 'DROP USER {{ job.target_schema }} CASCADE';
+          DBMS_OUTPUT.PUT_LINE('Dropped user {{ job.target_schema }}');
+        ELSE
+          DBMS_OUTPUT.PUT_LINE('User {{ job.target_schema }} does not exist - skipping drop');
+        END IF;
+      END;
+      /
+      EXIT;
+      EOF
+  environment: "{{ oracle_env }}"
+  register: drop_user_target
+  changed_when: "'Dropped user' in drop_user_target.stdout"
+
+- name: "JOB | {{ job.issue_key }} | Show drop user result"
+  ansible.builtin.debug:
+    msg: "{{ drop_user_target.stdout_lines | default(['(no output)']) }}"
+
+# -- Import ------------------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Import {{ job.target_schema }}@{{ job.target_service }}"
+  ansible.builtin.shell:
+    cmd: >-
+      {{ oracle_home }}/bin/impdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }} SCHEMAS={{ job.source_schema }} REMAP_SCHEMA={{ job.source_schema }}:{{ job.target_schema }} DIRECTORY=REFRESH DUMPFILE={{ job_dump }} LOGFILE={{ job_imp_log }} PARALLEL={{ datapump_parallel }} TABLE_EXISTS_ACTION=REPLACE
+  environment: "{{ oracle_env }}"
+  register: job_impdp
+  async: 14400
+  poll: 30
+  ignore_errors: true
+
+- name: "JOB | {{ job.issue_key }} | Show import status"
+  ansible.builtin.debug:
+    msg: >-
+      Import {{ 'OK' if job_impdp.rc == 0 else 'FAILED (rc=' + (job_impdp.rc | string) + ')' }} | log: {{ job_imp_log_path }}
+
+# -- Verify ------------------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Count objects in {{ job.target_schema }}@{{ job.target_service }}"
+  ansible.builtin.shell:
+    cmd: |
+      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
+      SELECT object_type || ':' || COUNT(*)
+      FROM   dba_objects
+      WHERE  owner = UPPER('{{ job.target_schema }}')
+      GROUP BY object_type
+      ORDER BY object_type;
+      EXIT;
+      EOF
+  environment: "{{ oracle_env }}"
+  register: job_verify
+  no_log: true
+  changed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Show object counts"
+  ansible.builtin.debug:
+    msg: "{{ job_verify.stdout_lines | default(['(no output)']) }}"
+
+# -- Post refresh summary to Jira worklog -------------------------------------
+# One compact worklog entry per refresh job (original summary format):
+# spec, source/target, export/import status, object-type count, result.
+# Posted BEFORE cleanup so it reflects final state. Full datapump logs remain
+# on the DB host at {{ datapump_dir }} when a job fails (cleanup is gated on
+# import success), so detail is still recoverable when it matters.
+
+- name: "JOB | {{ job.issue_key }} | Post export/import results as a ServiceNow work note"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ job.sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    status_code: 200
+    body_format: json
+    body:
+      work_notes: |-
+        Automated Oracle Schema Refresh - {{ ansible_date_time.iso8601 }}
+
+        Spec:           {{ job.raw_spec }}
+        Source:         {{ job.source_schema }}@{{ job.source_service }}
+        Target:         {{ job.target_schema }}@{{ job.target_service }}
+        Export status:  {{ 'OK' if job_expdp.rc == 0 else 'FAILED (rc=' + (job_expdp.rc | string) + ')' }}
+        Import status:  {{ 'OK' if job_impdp.rc == 0 else 'FAILED (rc=' + (job_impdp.rc | string) + ')' }}
+        Objects found:  {{ job_verify.stdout_lines | default([]) | length }} object type(s) in target schema
+        Overall result: {{ 'DONE' if job_impdp.rc == 0 else 'FAILED' }}
+        Performed by:   {{ sn_username }} (Ansible automation)
+        Timestamp:      {{ ansible_date_time.iso8601 }}
+
+        Please verify the refreshed schema before resuming work in the target environment.
+  delegate_to: localhost
+  become: false
+  ignore_errors: true
+
+# -- Cleanup ------------------------------------------------------------------
+# Only runs when the import succeeded, so failed refreshes preserve their
+# dump and log files for diagnosis.
+
+- name: "JOB | {{ job.issue_key }} | Remove dump and log files (success only)"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+  - "{{ job_dump_path }}"
+  - "{{ job_exp_log_path }}"
+  - "{{ job_imp_log_path }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  when:
+  - cleanup_dump_files | default(true) | bool
+  - job_impdp.rc | default(1) == 0
+
+# -- Write outcome for PLAY 3 -------------------------------------------------
+
+# -- Preserve failure evidence on the controller (failed jobs only) ----------
+# The expdp/impdp stdout is written to {{ followup_log_dir }} so PLAY 3 can
+# attach it to the DBA repair follow-up task. The full datapump logs also
+# remain on the DB host (cleanup is gated on import success).
+
+- name: "JOB | {{ job.issue_key }} | Ensure follow-up log dir exists on controller (failed only)"
+  ansible.builtin.file:
+    path: "{{ followup_log_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+  when: job_impdp.rc != 0
+
+- name: "JOB | {{ job.issue_key }} | Preserve export/import output on controller (failed only)"
+  ansible.builtin.copy:
+    content: |
+      Automated Oracle Schema Refresh FAILURE LOG - {{ ansible_date_time.iso8601 }}
+      Issue   : {{ job.issue_key }}
+      Spec    : {{ job.raw_spec }}
+      Source  : {{ job.source_schema }}@{{ job.source_service }}
+      Target  : {{ job.target_schema }}@{{ job.target_service }}
+      Export  : rc={{ job_expdp.rc }}
+      Import  : rc={{ job_impdp.rc }}
+      Datapump logs on {{ oracle_host }}: {{ job_exp_log_path }} / {{ job_imp_log_path }}
+
+      ====== expdp output ==========================================
+      {{ job_expdp.stdout | default('(no output)') }}
+
+      ====== impdp output ==========================================
+      {{ job_impdp.stdout | default('(no output)') }}
+    dest: "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
+    mode: "0640"
+  delegate_to: localhost
+  become: false
+  when: job_impdp.rc != 0
+
+- name: "JOB | {{ job.issue_key }} | Write outcome to controller temp file"
+  ansible.builtin.shell:
+    cmd: |
+      python3 - << 'PYEOF'
+      import json, os
+
+      outfile = "/tmp/snow_refresh_outcomes.json"
+      outcomes = []
+      if os.path.exists(outfile):
+          with open(outfile) as f:
+              outcomes = json.load(f)
+
+      outcomes.append({
+          "issue_key":      "{{ job.issue_key }}",
+          "sys_id":         "{{ job.sys_id }}",
+          "raw_spec":       "{{ job.raw_spec }}",
+          "source_service": "{{ job.source_service }}",
+          "source_schema":  "{{ job.source_schema }}",
+          "target_service": "{{ job.target_service }}",
+          "target_schema":  "{{ job.target_schema }}",
+          "status":         "done" if {{ job_impdp.rc }} == 0 else "failed",
+          "export_rc":      {{ job_expdp.rc }},
+          "import_rc":      {{ job_impdp.rc }},
+          "object_count":   {{ job_verify.stdout_lines | length }},
+          "error":          "" if {{ job_impdp.rc }} == 0 else "impdp rc={{ job_impdp.rc }}",
+          "failure_log":    "" if {{ job_impdp.rc }} == 0 else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
+      })
+
+      with open(outfile, "w") as f:
+          json.dump(outcomes, f)
+
+      print(f"Outcome written for {{ job.issue_key }}: {'done' if {{ job_impdp.rc }} == 0 else 'failed'}")
+      PYEOF
+  delegate_to: localhost
+  become: false

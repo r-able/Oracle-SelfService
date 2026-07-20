@@ -1,0 +1,415 @@
+---
+# jira_oracle_patch.yml
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   1. Search      : find all open PAT project issues matching the JQL
+#   2. Fetch       : retrieve each issue -- extract patch number from summary
+#                    and target host from a custom field
+#   3. Build       : resolve ORACLE_SID / ORACLE_HOME from the host->instance
+#                    mapping in vars/main.yml; write job list to temp file
+#   4. Download    : SSH to each target host; download the patch zip from
+#                    Oracle MOS using wget + cookie-based auth
+#   5. Pre-patch   : run opatch lsinventory to confirm patch not already applied
+#   6. Shutdown    : gracefully shut down the database and listener (offline)
+#   7. Apply       : unzip patch and run opatch apply
+#   8. Startup     : bring listener and database back online
+#   9. Verify      : run opatch lsinventory to confirm patch is now listed
+#  10. Worklog     : post outcome as a Jira worklog entry
+#  11. Transition  : move issue to Done / Failed
+#  12. Summary     : print final outcome table
+#
+# Jira issue structure (project PAT):
+#   summary         : the patch number, e.g. "35940141"
+#   customfield_XXXX: target hostname, e.g. "lnx001"
+#                     -> set patch_host_field in vars/main.yml to the correct
+#                       customfield ID after inspecting your issue metadata
+#
+# Required vars (vars/main.yml):
+#   # Jira
+#   jira_url              : "https://yourorg.atlassian.net"
+#   jira_user             : "ansible-svc@yourorg.com"
+#   jira_api_token        : "..."
+#   jira_jql_pat          : "project = PAT AND issuetype = Task AND status = 'To Do'"
+#   jira_max_results      : 50
+#   jira_cloud            : true
+#   jira_status_done      : "Done"
+#   jira_status_failed    : "Failed"
+#
+#   # MOS download credentials (same for all hosts)
+#   mos_username          : "you@yourorg.com"
+#   mos_password          : "..."
+#   patch_stage_dir       : "/tmp/oracle_patches"   # writable by oracle OS user
+#
+#   # Custom field ID that holds the target hostname on PAT issues
+#   patch_host_field      : "customfield_10500"     # adjust to your field ID
+#
+#   # Host -> Oracle instance mapping
+#   oracle_instance_map:
+#     lnx001:
+#       oracle_sid  : "ORCL"
+#       oracle_home : "/u01/app/oracle/product/21.0.0/dbhome_1"
+#       oracle_base : "/u01/app/oracle"
+#       oracle_user : "oracle"          # OS user that owns Oracle
+#     lnx002:
+#       oracle_sid  : "PROD"
+#       oracle_home : "/u01/app/oracle/product/21.0.0/dbhome_1"
+#       oracle_base : "/u01/app/oracle"
+#       oracle_user : "oracle"
+#
+#   # Common Oracle DBA credentials
+#   oracle_dba_user       : "system"
+#   oracle_dba_pass       : "oracle"
+#
+# Usage:
+#   ansible-playbook jira_oracle_patch.yml --ask-vault-pass
+#
+# Requirements:
+#   ansible-galaxy collection install community.general
+#   wget must be installed on each target host (yum install wget)
+
+# -- PLAY 1: localhost -- fetch Jira issues and build patch job list -----------
+- name: "PLAY 1 | Fetch ServiceNow PAT changes and build patch job list"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+  # ServiceNow intake + shepherd: finds "PAT | ..." change requests, promotes
+  # eligible new ones to implement, returns the executable queue in snow_work.
+  - name: "0-1 | ServiceNow intake and shepherd for PAT"
+    ansible.builtin.include_tasks: COMMON_snow_intake.yml
+    vars:
+      snow_tag: "PAT"
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: "No Tasks Found -- no ServiceNow change requests tagged 'PAT |' are ready to execute. Exiting cleanly."
+    when: snow_work | length == 0
+
+  - name: "1 | End play gracefully when no work is found"
+    ansible.builtin.meta: end_play
+    when: snow_work | length == 0
+
+  # Parse "PAT | host:SID | patch_number" from short_description. The host
+  # part keys oracle_instance_map (SID/home/base/user); the patch number
+  # falls back to the first run of 5+ digits anywhere in the description.
+  - name: "2 | WARN and skip changes with a missing or unknown patch target"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.number }} has no usable target
+        (short_description: '{{ item.short_description }}', host: '{{ pat_host }}',
+        known hosts: {{ oracle_instance_map.keys() | list | join(', ') }}) -- skipping.
+        Expected 'PAT | host:SID | patch_number'.
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      pat_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
+      pat_target: "{{ pat_parts[1] | default('') }}"
+      pat_host: "{{ pat_target.split(':')[0] | trim }}"
+    when: pat_target | length == 0 or pat_host not in oracle_instance_map
+
+  - name: "2 | Build patch job list from change requests"
+    ansible.builtin.set_fact:
+      patch_jobs: >-
+        {{
+          patch_jobs | default([]) + [{
+            'issue_key':    item.number,
+            'sys_id':       item.sys_id,
+            'patch_number': pat_patch_number,
+            'target_host':  pat_host,
+            'oracle_sid':   oracle_instance_map[pat_host].oracle_sid,
+            'oracle_home':  oracle_instance_map[pat_host].oracle_home,
+            'oracle_base':  oracle_instance_map[pat_host].oracle_base,
+            'oracle_user':  oracle_instance_map[pat_host].oracle_user,
+            'oracle_group': oracle_instance_map[pat_host].oracle_group | default('oinstall')
+          }]
+        }}
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      pat_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
+      pat_target: "{{ pat_parts[1] | default('') }}"
+      pat_host: "{{ pat_target.split(':')[0] | trim }}"
+      pat_patch_number: >-
+        {{
+          (pat_parts[2] | default('') | regex_search('[0-9]{5,}'))
+          if (pat_parts[2] | default('') | regex_search('[0-9]{5,}')) is not none
+          else (item.description | default('') | regex_search('[0-9]{5,}'))
+        }}
+    when:
+    - pat_target | length > 0
+    - pat_host in oracle_instance_map
+  - name: "2 | Show patch jobs"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} -- patch {{ item.patch_number }} -> {{ item.target_host }} (SID={{ item.oracle_sid }}, HOME={{ item.oracle_home }})
+    loop: "{{ patch_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "3 | Write patch job list to temp file for PLAY 2"
+    ansible.builtin.copy:
+      content: "{{ patch_jobs | to_json }}"
+      dest: "/tmp/snow_patch_jobs.json"
+      mode: '0600'
+
+  - name: "3 | Write ServiceNow credential sidecar for work-note script"
+    ansible.builtin.copy:
+      content: >-
+        {{
+          {
+            'sn_instance':    sn_instance,
+            'sn_username':    sn_username,
+            'sn_password':    sn_password,
+            'provisioned_by': sn_username + ' (Ansible automation)',
+            'timestamp':      ansible_date_time.iso8601
+          } | to_json
+        }}
+      dest: "/tmp/snow_patch_creds.json"
+      mode: '0600'
+    no_log: true
+
+# -- PLAY 2: target DB hosts -- apply the patch --------------------------------
+#
+# We use `hosts: all` with a dynamic `add_host` approach: PLAY 2 actually
+# runs on localhost but delegates each job's heavy lifting to the target host
+# via `delegate_to`. This avoids needing a dynamic inventory refresh between
+# plays while still running commands on the correct remote host.
+
+- name: "PLAY 2 | Apply Oracle patches on target hosts"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY2-INIT | Read patch job list"
+    ansible.builtin.slurp:
+      src: "/tmp/snow_patch_jobs.json"
+    register: patch_jobs_raw
+
+  - name: "PLAY2-INIT | Decode patch job list"
+    ansible.builtin.set_fact:
+      patch_jobs: "{{ patch_jobs_raw.content | b64decode | from_json }}"
+
+  - name: "4-9 | Run patch job for each issue"
+    ansible.builtin.include_tasks: SNOW_PAT_oracle_patch_job.yml
+    loop: "{{ patch_jobs }}"
+    loop_control:
+      loop_var: job
+      label: "{{ job.issue_key }} | patch {{ job.patch_number }} -> {{ job.target_host }}"
+
+# -- PLAY 3: localhost -- post worklog and transition issues -------------------
+- name: "PLAY 3 | Post ServiceNow work notes and close PAT changes"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY3-INIT | Read patch outcomes"
+    ansible.builtin.slurp:
+      src: "/tmp/snow_patch_outcomes.json"
+    register: outcomes_raw
+
+  - name: "PLAY3-INIT | Decode patch outcomes"
+    ansible.builtin.set_fact:
+      patch_outcomes: "{{ outcomes_raw.content | b64decode | from_json }}"
+
+  - name: "10 | Show outcome per issue"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} | patch {{ item.patch_number }} -> {{ item.target_host }} : {{ item.status | upper }} {% if item.status == 'failed' %}| {{ item.error }}{% endif %}
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "10 | Post worklog entry per issue"
+    ansible.builtin.shell:
+      cmd: "python3 /tmp/snow_patch_worklog.py /tmp/snow_patch_outcomes.json"
+    register: worklog_result
+    no_log: true
+    ignore_errors: true
+
+  - name: "10 | Show worklog post outcome"
+    ansible.builtin.debug:
+      msg: "{{ worklog_result.stdout_lines | default(['(no output)']) }}"
+  # -- 11. Close change requests based on outcome ---------------------------
+  - name: "11 | Move SUCCESSFUL changes to review"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: review
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    failed_when: false
+
+  - name: "11 | Close SUCCESSFUL changes (close_code successful)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: closed
+      close_code: successful
+      close_notes: |-
+        Automated Oracle Patching COMPLETED - {{ ansible_date_time.iso8601 }}
+        Patch {{ item.patch_number }} on {{ item.target_host }} (SID {{ item.oracle_sid }}).
+        Full lsinventory evidence is in the work notes.
+        Please verify database connectivity before resuming workloads.
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    failed_when: false
+
+  - name: "11 | Work-note FAILED changes with the failure summary"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        work_notes: |-
+          Automated Oracle Patching FAILED - {{ ansible_date_time.iso8601 }}
+          Patch {{ item.patch_number }} on {{ item.target_host }} (SID {{ item.oracle_sid }})
+          Error: {{ item.error | default('(no error text captured)') }}
+          A DBA repair follow-up change request is being raised with the failure report attached.
+      status_code: 200
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    failed_when: false
+
+  - name: "11 | Close FAILED changes (close_code unsuccessful)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: closed
+      close_code: unsuccessful
+      close_notes: "Automated patching failed; see work notes and the DBA repair follow-up change."
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    failed_when: false
+
+  - name: "11b | Set follow-up run timestamp"
+    ansible.builtin.set_fact:
+      fu_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    when: snow_followup_enabled | default(true) | bool
+
+  - name: "11b | Ensure follow-up log dir exists on controller"
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    when:
+    - snow_followup_enabled | default(true) | bool
+    - patch_outcomes | selectattr('status', 'equalto', 'failed') | list | length > 0
+
+  - name: "11b | Write failure report per FAILED issue"
+    ansible.builtin.copy:
+      content: |
+        Automated Oracle Patching FAILURE LOG - {{ ansible_date_time.iso8601 }}
+        Issue        : {{ item.issue_key }}
+        Patch number : {{ item.patch_number }}
+        Target host  : {{ item.target_host }}
+        Oracle SID   : {{ item.oracle_sid }}
+        Result       : {{ item.status | upper }}
+
+        Error:
+        {{ item.error | default('(no error text captured - see Ansible controller logs)') }}
+
+        Full patch/OPatch logs remain on {{ item.target_host }} under the
+        patch staging and $ORACLE_HOME/cfgtoollogs directories.
+      dest: "{{ followup_log_dir }}/PAT_{{ item.issue_key }}_failure_{{ fu_run_ts }}.log"
+      mode: "0640"
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when:
+    - snow_followup_enabled | default(true) | bool
+    - item.status == 'failed'
+  - name: "11b | Create DBA repair follow-up change for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when:
+    - snow_followup_enabled | default(true) | bool
+    - fu_item.status == 'failed'
+    vars:
+      fu_tag: "PAT"
+      fu_original_number: "{{ fu_item.issue_key }}"
+      fu_original_sys_id: "{{ fu_item.sys_id }}"
+      fu_summary: "Oracle patch {{ fu_item.patch_number }} failed on {{ fu_item.target_host }} ({{ fu_item.issue_key }})"
+      fu_description: |-
+        Automated Oracle patching FAILED and the change request has been
+        closed unsuccessful. Please investigate and repair.
+
+        Patch number : {{ fu_item.patch_number }}
+        Target host  : {{ fu_item.target_host }}
+        Oracle SID   : {{ fu_item.oracle_sid }}
+        Error        : {{ fu_item.error | default('See attached failure report.') }}
+      fu_attach_files:
+      - "{{ followup_log_dir }}/PAT_{{ fu_item.issue_key }}_failure_{{ fu_run_ts }}.log"
+  - name: "12 | Print final summary"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: >-
+      {{
+        [
+          '======================================================',
+          '  Jira Oracle Patching Summary',
+          '======================================================',
+          '  Run timestamp : ' + ansible_date_time.iso8601,
+          '  Issues found  : ' + (patch_outcomes | length | string),
+          '  Succeeded     : ' + (patch_outcomes | selectattr('status','equalto','done')   | list | length | string),
+          '  Failed        : ' + (patch_outcomes | selectattr('status','equalto','failed') | list | length | string),
+          '  --------------------------------------------------'
+        ]
+        + (patch_outcomes | map(attribute='issue_key') | zip(
+             patch_outcomes | map(attribute='patch_number'),
+             patch_outcomes | map(attribute='target_host'),
+             patch_outcomes | map(attribute='status')
+           ) | map('join', ' | ') | map('regex_replace', '^', '  ') | list)
+        + ['======================================================']
+      }}
+    loop_control:
+      label: "summary"
+
+  - name: "12 | Clean up temp files on controller"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "/tmp/snow_patch_jobs.json"
+    - "/tmp/snow_patch_outcomes.json"
+    - "/tmp/snow_patch_creds.json"
+    - "/tmp/snow_patch_worklog.py"
+    loop_control:
+      label: "{{ item | basename }}"
+
+  - name: "12 | Clean up per-issue outcome files on controller"
+    ansible.builtin.shell:
+      cmd: "rm -f /tmp/snow_patch_outcome_*.json"

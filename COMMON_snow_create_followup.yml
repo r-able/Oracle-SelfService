@@ -1,0 +1,92 @@
+---
+# =============================================================================
+# COMMON_snow_create_followup.yml
+#
+# Creates a DBA repair follow-up CHANGE REQUEST when an automated change fails
+# (the ServiceNow counterpart of COMMON_jira_create_followup_task.yml). The
+# follow-up carries the same project tag, lands in state new, gets the failure
+# logs attached, and the ORIGINAL change request receives a work note
+# referencing it.
+#
+# Include with:
+#   fu_tag             : project tag, e.g. "REF"           (required)
+#   fu_original_number : number of the failed CR           (required)
+#   fu_original_sys_id : sys_id of the failed CR           (required)
+#   fu_summary         : short summary of the failure      (required)
+#   fu_description     : plain-text description body       (required)
+#   fu_attach_files    : list of controller-local log paths (optional;
+#                        missing/empty entries skipped silently)
+#
+# Every task is failure-tolerant.
+# =============================================================================
+
+- name: "FUP | {{ fu_original_number }} | Check which failure log files exist"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ fu_attach_files | default([]) | select() | list }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  register: fu_attach_stat
+
+- name: "FUP | {{ fu_original_number }} | Create DBA repair follow-up change request"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    type: "{{ sn_type }}"
+    state: new
+    short_description: "{{ fu_tag }} | DBA repair required: {{ fu_summary }}"
+    description: |
+      {{ fu_description }}
+
+      ----
+      Original failed change : {{ fu_original_number }}
+      Assigned team          : Database Administrators
+      Raised automatically by Ansible at {{ '%Y-%m-%dT%H:%M:%S' | strftime }}.
+
+      The failure logs are attached to this change request. See also the work
+      notes on {{ fu_original_number }} for the full automation history.
+    attachments: >-
+      {{
+        fu_attach_stat.results | default([])
+        | selectattr('stat.exists', 'defined') | selectattr('stat.exists')
+        | map(attribute='item') | map('community.general.dict_kv', 'path') | list
+      }}
+  register: fu_create_result
+  failed_when: false
+
+- name: "FUP | {{ fu_original_number }} | Record follow-up number"
+  ansible.builtin.set_fact:
+    fu_created_number: "{{ fu_create_result.record.number | default('') }}"
+
+- name: "FUP | {{ fu_original_number }} | Warn if follow-up creation failed"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not create DBA follow-up change request for
+      {{ fu_original_number }}: {{ fu_create_result.msg | default('unknown error') }}
+  when: fu_created_number | length == 0
+
+- name: "FUP | {{ fu_original_number }} | Work-note the original change with the follow-up reference"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ fu_original_sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      work_notes: >-
+        DBA repair follow-up change {{ fu_created_number }} has been created
+        for the Database Administrators. The failure logs from this run are
+        attached to that change request.
+    status_code: 200
+  failed_when: false
+  when: fu_created_number | length > 0
+
+- name: "FUP | {{ fu_original_number }} | Follow-up creation summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ fu_original_number }} -> follow-up {{ fu_created_number }} created
+      ({{ fu_attach_stat.results | default([]) | selectattr('stat.exists', 'defined') | selectattr('stat.exists') | list | length }} log file(s) attached)
+  when: fu_created_number | length > 0

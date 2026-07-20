@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# jira_oracle_upgrade.yml
+#
+# Jira-driven Oracle 21c -> 26ai upgrade dispatcher (AutoUpgrade).
+#
+# Reference procedure:
+#   https://oracle-base.com/articles/26/multitenant-upgrade-to-26-autoupgrade
+#
+# Flow:
+#   1. Pre-flight Jira API token guard (/rest/api/2/myself) -- an expired
+#      token makes searches silently return empty, so we hard-fail here.
+#   2. Pre-flight check that the 26ai software home exists on the DB host.
+#   3. Find open issues in the UPG project.
+#   4. For each issue, include jira_oracle_upgrade_job.yml which runs the
+#      full analyze -> deploy -> verify cycle and transitions the issue.
+#
+# The ORACLE_SID for each job is parsed from the issue summary, e.g.:
+#      "Upgrade cdb1 to 26ai"
+# Falls back to default_oracle_sid if no match. NOTE: SID case matters on
+# Linux and is used verbatim -- the rebuilt lnx001 runs uppercase CDB1, so
+# issue summaries must carry the exact case (e.g. "Upgrade CDB1 to 26ai").
+#
+# Credentials: export JIRA_USER (Atlassian account email) and jira_api_token
+# (API token) in the environment, or override the vars below (vault).
+# =============================================================================
+
+- name: ServiceNow-driven Oracle 21c to 26ai upgrades via AutoUpgrade
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # 0. Pre-flight: Jira token guard.
+    #    community.general.jira / searches silently return [] on an expired
+    #    token, so verify authentication explicitly before doing anything.
+    # -------------------------------------------------------------------------
+    - name: "PRE | Check 26ai Oracle home exists on {{ oracle_host }}"
+      ansible.builtin.stat:
+        path: "{{ oracle_target_home }}/bin/sqlplus"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: target_home_check
+
+    - name: "PRE | Assert 26ai home is installed"
+      ansible.builtin.assert:
+        that:
+          - target_home_check.stat.exists
+        fail_msg: >-
+          26ai software home not found at {{ oracle_target_home }} on
+          {{ oracle_host }}. Install the 26ai software first (runInstaller
+          -silent, software-only) and ensure the
+          oracle-ai-database-preinstall-26ai package has been applied.
+
+    - name: "PRE | Check autoupgrade.jar exists in 26ai home"
+      ansible.builtin.stat:
+        path: "{{ autoupgrade_jar }}"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: autoupgrade_jar_check
+
+    - name: "PRE | Assert autoupgrade.jar is present"
+      ansible.builtin.assert:
+        that:
+          - autoupgrade_jar_check.stat.exists
+        fail_msg: >-
+          {{ autoupgrade_jar }} not found. It ships with the 26ai home; if it
+          was removed, download the latest from
+          https://download.oracle.com/otn-pub/otn_software/autoupgrade.jar
+          into {{ oracle_target_home }}/rdbms/admin/.
+
+    # ServiceNow intake + shepherd: finds "UPG | ..." change requests,
+    # promotes eligible new ones to implement, returns snow_work.
+    - name: "PRE | ServiceNow intake and shepherd for UPG"
+      ansible.builtin.include_tasks: COMMON_snow_intake.yml
+      vars:
+        snow_tag: "UPG"
+
+    - name: "PRE | Nothing to do?"
+      ansible.builtin.debug:
+        msg: "No ServiceNow change requests tagged 'UPG |' are ready to execute. Exiting."
+      when: snow_work | length == 0
+
+    - name: "PRE | End play when queue is empty"
+      ansible.builtin.meta: end_play
+      when: snow_work | length == 0
+
+    # Parse "UPG | <SID>" from short_description; falls back to
+    # default_oracle_sid when no SID token is present after the tag.
+    - name: "PRE | Build upgrade job list from change requests"
+      ansible.builtin.set_fact:
+        upg_jobs: >-
+          {{ upg_jobs | default([]) + [ {
+               'issue_key':  item.number,
+               'sys_id':     item.sys_id,
+               'summary':    item.short_description,
+               'oracle_sid': (item.short_description.split('|')[1] | default('')
+                              | trim | regex_search('[A-Za-z0-9_$]+')
+                              | default(default_oracle_sid, true))
+             } ] }}
+      loop: "{{ snow_work }}"
+      loop_control:
+        label: "{{ item.number }}"
+
+    - name: "PRE | Upgrade jobs queued"
+      ansible.builtin.debug:
+        msg: "{{ upg_jobs | map(attribute='issue_key') | zip(upg_jobs | map(attribute='oracle_sid')) | list }}"
+    # -------------------------------------------------------------------------
+    - name: "JOB | Dispatch upgrade job per issue"
+      ansible.builtin.include_tasks: SNOW_UPG_oracle_upgrade_job.yml
+      loop: "{{ upg_jobs | default([]) }}"
+      loop_control:
+        loop_var: job
+        label: "{{ job.issue_key }} ({{ job.oracle_sid }})"

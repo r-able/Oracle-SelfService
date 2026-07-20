@@ -1,0 +1,818 @@
+---
+# SNOW_PAT_oracle_patch_job.yml
+#
+# Included by jira_oracle_patch.yml for each patch job.
+# Loop variable: `job` -- dict with:
+#   issue_key, patch_number, target_host,
+#   oracle_sid, oracle_home, oracle_base, oracle_user
+#
+# All remote tasks use delegate_to: "{{ job.target_host }}" so they run
+# on the correct DB host while the play itself runs on localhost.
+# become / become_user switch to the oracle OS user on the remote host.
+
+# -- Per-job environment dict (built once, reused by all shell tasks) ---------
+- name: "JOB | {{ job.issue_key }} | Set Oracle environment for {{ job.target_host }}"
+  ansible.builtin.set_fact:
+    job_oracle_env:
+      ORACLE_SID: "{{ job.oracle_sid }}"
+      ORACLE_HOME: "{{ job.oracle_home }}"
+      ORACLE_BASE: "{{ job.oracle_base }}"
+      PATH: "{{ job.oracle_home }}/bin:/usr/local/bin:/usr/bin:/bin"
+      NLS_DATE_FORMAT: "YYYY-MM-DD HH24:MI:SS"
+    job_patch_dir: "{{ patch_stage_dir }}/{{ job.patch_number }}"
+    job_zip_file: "{{ patch_stage_dir }}/p{{ job.patch_number }}_210000_Linux-x86-64.zip"
+    job_opatch: "{{ job.oracle_home }}/OPatch/opatch"
+    job_outcome:
+      issue_key: "{{ job.issue_key }}"
+      sys_id: "{{ job.sys_id }}"
+      patch_number: "{{ job.patch_number }}"
+      target_host: "{{ job.target_host }}"
+      oracle_sid: "{{ job.oracle_sid }}"
+      status: "failed"
+      error: ""
+      pre_check: ""
+      post_check: ""
+
+# -- 4. Download patch from Oracle MOS ----------------------------------------
+# Oracle MOS requires a two-step wget: first authenticate to get a cookie,
+# then download the actual patch zip using that cookie.
+# The patch zip naming convention for Oracle 21c on Linux x86-64 is:
+#   p<PATCH_NUMBER>_210000_Linux-x86-64.zip
+# Adjust the filename pattern in vars/main.yml (mos_patch_filename_pattern)
+# if your patches follow a different naming convention.
+
+- name: "JOB | {{ job.issue_key }} | Create patch staging directory on {{ job.target_host }}"
+  ansible.builtin.file:
+    path: "{{ patch_stage_dir }}"
+    state: directory
+    owner: oracle
+    group: oinstall
+    mode: '0755'
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: root
+
+- name: "JOB | {{ job.issue_key }} | Download patch {{ job.patch_number }} from Oracle MOS (on controller)"
+  ansible.builtin.shell:
+    cmd: |
+      PATCH_NUM="{{ job.patch_number }}"
+      STAGE_DIR="/tmp/oracle_patches"
+      MOS_USER="{{ mos_username }}"
+      MOS_PASS="{{ mos_password }}"
+
+      mkdir -p "${STAGE_DIR}"
+
+      # Step 1 -- query Oracle ARU API to get exact filename, ARU ID, and download URL
+      echo "Querying Oracle ARU API for patch ${PATCH_NUM}..."
+      ARU_RESPONSE=$(curl --silent --location \
+           --user "${MOS_USER}:${MOS_PASS}" \
+           "https://updates.oracle.com/Orion/Services/search?bug=${PATCH_NUM}")
+
+      # Extract ARU ID from <request_id>XXXXXXXX</request_id>
+      ARU_ID=$(echo "${ARU_RESPONSE}" | grep -oP '(?<=<request_id>)[0-9]+(?=</request_id>)' | head -1)
+
+      # Extract exact Linux x86-64 filename from <name>...</name>
+      # The ARU response may contain files for multiple platforms -- filter for Linux-x86-64
+      PATCH_FILE=$(echo "${ARU_RESPONSE}" | grep -oP '(?<=<name>)p[0-9]+[^<]+Linux-x86-64\.zip(?=</name>)' | head -1)
+
+      # Extract the Linux x86-64 download URL from <download_url>
+      # Match the CDATA block that contains Linux-x86-64 in the URL
+      DOWNLOAD_URL=$(echo "${ARU_RESPONSE}" | grep -oP '(?<=\<\!\[CDATA\[)/Orion/Services/download/p[0-9]+[^]]*Linux-x86-64[^]]*(?=\]\])' | head -1)
+
+      echo "ARU ID       : ${ARU_ID}"
+      echo "Patch file   : ${PATCH_FILE}"
+      echo "Download path: ${DOWNLOAD_URL}"
+
+      if [ -z "${ARU_ID}" ] || [ -z "${PATCH_FILE}" ] || [ -z "${DOWNLOAD_URL}" ]; then
+        echo "ERROR: Could not parse ARU response. Raw response:"
+        echo "${ARU_RESPONSE}"
+        exit 1
+      fi
+
+      ZIP_FILE="${STAGE_DIR}/${PATCH_FILE}"
+
+      # Skip if already cached and valid
+      if [ -f "${ZIP_FILE}" ] && [ $(stat -c%s "${ZIP_FILE}") -gt 10240 ]; then
+        MAGIC=$(od -A n -N 4 -t x1 "${ZIP_FILE}" | tr -d ' \n')
+        if [ "${MAGIC}" = "504b0304" ]; then
+          echo "OK: patch ${PATCH_NUM} already cached at ${ZIP_FILE} ($(du -sh ${ZIP_FILE} | cut -f1))"
+          echo "PATCH_FILE=${PATCH_FILE}"
+          exit 0
+        fi
+      fi
+      rm -f "${ZIP_FILE}"
+
+      # Step 2 -- download using the exact URL from the ARU API response
+      echo "Downloading from https://updates.oracle.com${DOWNLOAD_URL} ..."
+      HTTP_CODE=$(curl --location \
+           --user "${MOS_USER}:${MOS_PASS}" \
+           --output "${ZIP_FILE}" \
+           --write-out "%{http_code}" \
+           --silent \
+           "https://updates.oracle.com${DOWNLOAD_URL}")
+
+      echo "HTTP response code: ${HTTP_CODE}"
+
+      if [ "${HTTP_CODE}" != "200" ]; then
+        echo "ERROR: MOS returned HTTP ${HTTP_CODE}."
+        head -5 "${ZIP_FILE}" 2>/dev/null || true
+        exit 1
+      fi
+
+      FILE_SIZE=$(stat -c%s "${ZIP_FILE}" 2>/dev/null || echo 0)
+      echo "Downloaded size: ${FILE_SIZE} bytes"
+
+      if [ "${FILE_SIZE}" -lt 10240 ]; then
+        echo "ERROR: File too small (${FILE_SIZE} bytes) -- not a valid patch zip."
+        cat "${ZIP_FILE}" 2>/dev/null || true
+        exit 1
+      fi
+
+      MAGIC=$(od -A n -N 4 -t x1 "${ZIP_FILE}" | tr -d ' \n')
+      if [ "${MAGIC}" != "504b0304" ]; then
+        echo "ERROR: File is not a zip archive (magic: ${MAGIC})."
+        head -3 "${ZIP_FILE}" 2>/dev/null || true
+        exit 1
+      fi
+
+      # Print the patch filename so the next task can pick it up
+      echo "PATCH_FILE=${PATCH_FILE}"
+      echo "OK: patch ${PATCH_NUM} (ARU ${ARU_ID}) downloaded successfully ($(du -sh ${ZIP_FILE} | cut -f1))"
+  delegate_to: localhost
+  become: false
+  register: job_download
+  no_log: true
+
+- name: "JOB | {{ job.issue_key }} | Extract patch filename from download output"
+  ansible.builtin.set_fact:
+    job_patch_filename: "{{ job_download.stdout | regex_search('PATCH_FILE=(.+)', '\\1') | first }}"
+    job_zip_file_local: "/tmp/oracle_patches/{{ job_download.stdout | regex_search('PATCH_FILE=(.+)', '\\1') | first }}"
+  when: job_download.rc == 0
+
+- name: "JOB | {{ job.issue_key }} | Show download result"
+  ansible.builtin.debug:
+    msg:
+    - "RC          : {{ job_download.rc }}"
+    - "Patch file  : {{ job_patch_filename | default('unknown') }}"
+    - "Local path  : {{ job_zip_file_local | default('unknown') }}"
+
+- name: "JOB | {{ job.issue_key }} | Fail if download failed"
+  ansible.builtin.fail:
+    msg: "Patch download failed for {{ job.patch_number }}. stdout: {{ job_download.stdout | default('(none)') }}"
+  when: job_download.rc != 0
+
+- name: "JOB | {{ job.issue_key }} | Copy patch zip from controller to {{ job.target_host }}"
+  ansible.builtin.copy:
+    src: "{{ job_zip_file_local }}"
+    dest: "{{ patch_stage_dir }}/{{ job_patch_filename }}"
+    mode: '0644'
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  register: job_copy
+
+- name: "JOB | {{ job.issue_key }} | Show copy status"
+  ansible.builtin.debug:
+    msg: "Patch zip copied to {{ job.target_host }}:{{ patch_stage_dir }}/{{ job_patch_filename }}"
+
+- name: "JOB | {{ job.issue_key }} | Unzip patch archive"
+  ansible.builtin.shell:
+    cmd: |
+      unzip -oq "{{ patch_stage_dir }}/{{ job_patch_filename }}" -d "{{ patch_stage_dir }}"
+      echo "OK: unzipped to {{ patch_stage_dir }}"
+      ls -la "{{ patch_stage_dir }}/{{ job.patch_number }}/" 2>/dev/null || echo "Note: patch dir may use different name -- listing {{ patch_stage_dir }}:"
+      ls -la "{{ patch_stage_dir }}/"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_unzip
+
+- name: "JOB | {{ job.issue_key }} | Fail if unzip failed"
+  ansible.builtin.fail:
+    msg: "Unzip failed for patch {{ job.patch_number }}. stderr: {{ job_unzip.stderr | default('(none)') }}"
+  when: job_unzip.rc != 0
+
+# -- 5. Pre-patch check -------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (pre-patch)"
+  ansible.builtin.shell:
+    cmd: "{{ job_opatch }} lsinventory 2>&1 | grep -A2 '{{ job.patch_number }}' || true"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_pre_inventory
+  changed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Show pre-patch inventory"
+  ansible.builtin.debug:
+    msg: "{{ job_pre_inventory.stdout_lines | default(['(patch not yet applied -- proceeding)']) }}"
+
+- name: "JOB | {{ job.issue_key }} | Flag if patch is already applied (skip patching)"
+  ansible.builtin.set_fact:
+    job_patch_already_applied: "{{ job.patch_number in (job_pre_inventory.stdout | default('')) }}"
+
+- name: "JOB | {{ job.issue_key }} | Show already-applied notice"
+  ansible.builtin.debug:
+    msg: >-
+      Patch {{ job.patch_number }} is already present in the OPatch inventory on {{ job.target_host }} -- skipping all patching steps and marking Done.
+  when: job_patch_already_applied
+
+# -- 5b. OPatch version check and auto-upgrade --------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Check current OPatch version"
+  ansible.builtin.shell:
+    cmd: "{{ job_opatch }} version 2>&1 | grep -oP '[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+' | head -1"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_opatch_version
+  changed_when: false
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show current OPatch version"
+  ansible.builtin.debug:
+    msg: "Current OPatch version: {{ job_opatch_version.stdout | trim }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Check minimum required OPatch version from patch README"
+  ansible.builtin.shell:
+    cmd: |
+      VER=$(grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "{{ job_patch_dir }}/README.html" 2>/dev/null | grep -v '^21\.' | head -1)
+      if [ -z "${VER}" ]; then
+        VER=$(grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' "{{ job_patch_dir }}/README.txt" 2>/dev/null | grep -v '^21\.' | head -1)
+      fi
+      echo "${VER:-0.0.0.0.0}"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  register: job_opatch_required
+  changed_when: false
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show required OPatch version"
+  ansible.builtin.debug:
+    msg: "Required OPatch version: {{ job_opatch_required.stdout | trim }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Download OPatch (patch 6880880) from MOS if upgrade needed"
+  ansible.builtin.shell:
+    cmd: |
+      CURRENT="{{ job_opatch_version.stdout | trim }}"
+      REQUIRED="{{ job_opatch_required.stdout | trim }}"
+      STAGE_DIR="/tmp/oracle_patches"
+      MOS_USER="{{ mos_username }}"
+      MOS_PASS="{{ mos_password }}"
+
+      # Force upgrade if we could not determine current version
+      if [ -z "${CURRENT}" ]; then
+        echo "INFO: Could not determine current OPatch version -- forcing upgrade."
+      elif [ "${REQUIRED}" != "0.0.0.0.0" ]; then
+        LOWER=$(printf "%s\n%s\n" "${CURRENT}" "${REQUIRED}" | sort -V | head -1)
+        if [ "${LOWER}" = "${REQUIRED}" ] && [ "${CURRENT}" != "${REQUIRED}" ]; then
+          echo "INFO: OPatch ${CURRENT} meets requirement ${REQUIRED} -- no upgrade needed."
+          echo "OPATCH_UPGRADE=no"
+          exit 0
+        fi
+      fi
+
+      echo "INFO: OPatch upgrade needed (current=${CURRENT}, required=${REQUIRED})"
+
+      # Query ARU for OPatch 6880880 -- no release/platform filter so the API
+      # returns all platforms; filename grep restricts to Linux-x86-64
+      ARU_RESPONSE=$(curl --silent --location \
+           --user "${MOS_USER}:${MOS_PASS}" \
+           "https://updates.oracle.com/Orion/Services/search?bug=6880880")
+
+      ARU_ID=$(echo "${ARU_RESPONSE}" | grep -oP "(?<=<request_id>)[0-9]+(?=</request_id>)" | head -1)
+      OPATCH_FILE=$(echo "${ARU_RESPONSE}" | grep -oP "(?<=<name>)p6880880[^<]+Linux-x86-64\.zip(?=</name>)" | head -1)
+      DOWNLOAD_URL=$(echo "${ARU_RESPONSE}" | grep -oP "(?<=\<\!\[CDATA\[)/Orion/Services/download/p6880880[^]]*Linux-x86-64[^]]*(?=\]\])" | head -1)
+
+      echo "ARU ID      : ${ARU_ID}"
+      echo "OPatch file : ${OPATCH_FILE}"
+      echo "Download URL: ${DOWNLOAD_URL}"
+
+      if [ -z "${ARU_ID}" ] || [ -z "${OPATCH_FILE}" ] || [ -z "${DOWNLOAD_URL}" ]; then
+        echo "ERROR: Could not find OPatch 6880880 Linux x86-64."
+        echo "${ARU_RESPONSE}" | head -30
+        exit 1
+      fi
+
+      OPATCH_ZIP="${STAGE_DIR}/${OPATCH_FILE}"
+
+      # Skip if already cached and valid
+      if [ -f "${OPATCH_ZIP}" ] && [ $(stat -c%s "${OPATCH_ZIP}") -gt 10240 ]; then
+        MAGIC=$(od -A n -N 4 -t x1 "${OPATCH_ZIP}" | tr -d " \n")
+        if [ "${MAGIC}" = "504b0304" ]; then
+          echo "OPatch zip already cached."
+          echo "OPATCH_UPGRADE=yes"
+          echo "OPATCH_FILE=${OPATCH_FILE}"
+          exit 0
+        fi
+      fi
+      rm -f "${OPATCH_ZIP}"
+
+      HTTP_CODE=$(curl --location \
+           --user "${MOS_USER}:${MOS_PASS}" \
+           --output "${OPATCH_ZIP}" \
+           --write-out "%{http_code}" \
+           --silent \
+           "https://updates.oracle.com${DOWNLOAD_URL}")
+
+      echo "HTTP code: ${HTTP_CODE}"
+      FILE_SIZE=$(stat -c%s "${OPATCH_ZIP}" 2>/dev/null || echo 0)
+      echo "File size: ${FILE_SIZE} bytes"
+
+      if [ "${HTTP_CODE}" != "200" ] || [ "${FILE_SIZE}" -lt 10240 ]; then
+        echo "ERROR: OPatch download failed."
+        head -5 "${OPATCH_ZIP}" 2>/dev/null || true
+        exit 1
+      fi
+
+      MAGIC=$(od -A n -N 4 -t x1 "${OPATCH_ZIP}" | tr -d " \n")
+      if [ "${MAGIC}" != "504b0304" ]; then
+        echo "ERROR: Downloaded file is not a valid zip."
+        exit 1
+      fi
+
+      echo "OPATCH_UPGRADE=yes"
+      echo "OPATCH_FILE=${OPATCH_FILE}"
+      echo "OK: OPatch downloaded ($(du -sh ${OPATCH_ZIP} | cut -f1))"
+  delegate_to: localhost
+  become: false
+  register: job_opatch_download
+  no_log: true
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show OPatch download result"
+  ansible.builtin.debug:
+    msg: "{{ job_opatch_download.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Extract OPatch filename from download output"
+  ansible.builtin.set_fact:
+    job_opatch_filename: "{{ job_opatch_download.stdout | regex_search('OPATCH_FILE=(.+)', '\\1') | first }}"
+    job_opatch_zip_local: "/tmp/oracle_patches/{{ job_opatch_download.stdout | regex_search('OPATCH_FILE=(.+)', '\\1') | first }}"
+  when: "'OPATCH_UPGRADE=yes' in (job_opatch_download.stdout | default(''))"
+
+- name: "JOB | {{ job.issue_key }} | Copy and install new OPatch into ORACLE_HOME"
+  when: "'OPATCH_UPGRADE=yes' in (job_opatch_download.stdout | default(''))"
+  block:
+  - name: "JOB | {{ job.issue_key }} | Copy OPatch zip to {{ job.target_host }}"
+    ansible.builtin.copy:
+      src: "{{ job_opatch_zip_local }}"
+      dest: "{{ patch_stage_dir }}/{{ job_opatch_filename }}"
+      mode: '0644'
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: "{{ job.oracle_user }}"
+
+  - name: "JOB | {{ job.issue_key }} | Install OPatch (unzip into ORACLE_HOME)"
+    ansible.builtin.shell:
+      cmd: |
+        OPATCH_ZIP="{{ patch_stage_dir }}/{{ job_opatch_filename }}"
+        # Back up existing OPatch directory
+        mv "{{ job.oracle_home }}/OPatch" "{{ job.oracle_home }}/OPatch.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        # Unzip new OPatch into ORACLE_HOME
+        unzip -oq "${OPATCH_ZIP}" -d "{{ job.oracle_home }}"
+        echo "OK: OPatch upgraded in {{ job.oracle_home }}"
+        "{{ job.oracle_home }}/OPatch/opatch" version
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: "{{ job.oracle_user }}"
+    environment: "{{ job_oracle_env }}"
+    register: job_opatch_install
+
+  - name: "JOB | {{ job.issue_key }} | Show OPatch install result"
+    ansible.builtin.debug:
+      msg: "{{ job_opatch_install.stdout_lines | default(['(no output)']) }}"
+
+# -- 6. Shutdown database and listener ----------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Stop listener on {{ job.target_host }} (if running)"
+  ansible.builtin.shell:
+    cmd: |
+      # Check if listener is running before trying to stop it
+      if {{ job.oracle_home }}/bin/lsnrctl status > /dev/null 2>&1; then
+        {{ job.oracle_home }}/bin/lsnrctl stop
+        echo "Listener stopped."
+      else
+        echo "Listener was not running -- nothing to stop."
+      fi
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_lsnr_stop
+  changed_when: "'Listener stopped' in job_lsnr_stop.stdout"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show listener stop output"
+  ansible.builtin.debug:
+    msg: "{{ job_lsnr_stop.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Shut down Oracle database {{ job.oracle_sid }}"
+  ansible.builtin.shell:
+    cmd: |
+      # Use "su - oracle" to get a full login shell that sources .bash_profile
+      # where ORACLE_SID, ORACLE_HOME and PATH are normally set.
+      # If the instance SID in .bash_profile differs from job.oracle_sid,
+      # we override it explicitly via the ORACLE_SID env var passed to su.
+
+      # Check if the database is already down
+      DB_STATUS=$(su - {{ job.oracle_user }} -c \
+        "ORACLE_SID={{ job.oracle_sid }} \
+         {{ job.oracle_home }}/bin/sqlplus -S /nolog <<'SQLEOF'
+      CONNECT / AS SYSDBA
+      SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+      SELECT status FROM v\$instance;
+      EXIT;
+      SQLEOF")
+
+      echo "DB status check: ${DB_STATUS}"
+
+      if echo "${DB_STATUS}" | grep -qi "ORA-01034\|ORA-27101\|not available\|already down"; then
+        echo "Database is already down -- skipping shutdown."
+        exit 0
+      fi
+
+      echo "Database is up -- issuing SHUTDOWN IMMEDIATE..."
+      su - {{ job.oracle_user }} -c \
+        "ORACLE_SID={{ job.oracle_sid }} \
+         {{ job.oracle_home }}/bin/sqlplus -S /nolog <<'SQLEOF'
+      CONNECT / AS SYSDBA
+      SHUTDOWN IMMEDIATE;
+      EXIT;
+      SQLEOF"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: root
+  register: job_db_shutdown
+  no_log: true
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show database shutdown output"
+  ansible.builtin.debug:
+    msg: "{{ job_db_shutdown.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Fail if database did not shut down cleanly"
+  ansible.builtin.fail:
+    msg: >-
+      Database shutdown failed for {{ job.oracle_sid }} on {{ job.target_host }}. Review the output above before proceeding.
+  when: >-
+    not job_patch_already_applied and job_db_shutdown.rc is defined and job_db_shutdown.rc != 0 and not (job_db_shutdown.stdout | default('') | regex_search('Database closed|already down|ORA-01034'))
+
+- name: "JOB | {{ job.issue_key }} | Kill any remaining oracle processes using ORACLE_HOME (CheckActiveFilesAndExecutables)"
+  ansible.builtin.shell:
+    cmd: |
+      ORACLE_BIN="{{ job.oracle_home }}/bin/oracle"
+
+      # Find all PIDs using the oracle binary from this ORACLE_HOME
+      PIDS=$(fuser "${ORACLE_BIN}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' || true)
+
+      if [ -z "${PIDS}" ]; then
+        echo "No active processes found using ${ORACLE_BIN} -- proceeding."
+        exit 0
+      fi
+
+      echo "Found active oracle processes: ${PIDS}"
+
+      # Send SIGTERM first (graceful)
+      for PID in ${PIDS}; do
+        echo "Sending SIGTERM to PID ${PID}..."
+        kill -TERM ${PID} 2>/dev/null || true
+      done
+
+      sleep 5
+
+      # Check if any are still running, send SIGKILL if needed
+      for PID in ${PIDS}; do
+        if kill -0 ${PID} 2>/dev/null; then
+          echo "PID ${PID} still running -- sending SIGKILL..."
+          kill -KILL ${PID} 2>/dev/null || true
+        fi
+      done
+
+      sleep 2
+
+      # Final check
+      REMAINING=$(fuser "${ORACLE_BIN}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' || true)
+      if [ -z "${REMAINING}" ]; then
+        echo "OK: all oracle processes stopped."
+      else
+        echo "WARNING: processes still active: ${REMAINING} -- opatch may still fail."
+      fi
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: root
+  register: job_process_cleanup
+  when: not job_patch_already_applied
+
+- name: "JOB | {{ job.issue_key }} | Show process cleanup output"
+  ansible.builtin.debug:
+    msg: "{{ job_process_cleanup.stdout_lines | default(['(skipped)']) }}"
+  when: not job_patch_already_applied
+
+# -- 7. Apply patch -----------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Ensure patch directory is readable by oracle"
+  ansible.builtin.file:
+    path: "{{ patch_stage_dir }}"
+    state: directory
+    owner: "{{ job.oracle_user }}"
+    group: "{{ job.oracle_group | default('oinstall') }}"
+    recurse: true
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: root
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Verify patch directory exists and is readable by oracle"
+  ansible.builtin.shell:
+    cmd: |
+      echo "--- ls -la {{ patch_stage_dir }} ---"
+      ls -la "{{ patch_stage_dir }}"
+      echo "--- ls -la {{ job_patch_dir }} ---"
+      ls -la "{{ job_patch_dir }}" 2>/dev/null || echo "WARNING: {{ job_patch_dir }} does not exist"
+      echo "--- whoami ---"
+      whoami
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  register: job_dir_check
+  changed_when: false
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show patch directory listing"
+  ansible.builtin.debug:
+    msg: "{{ job_dir_check.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Apply patch {{ job.patch_number }} with opatch"
+  ansible.builtin.shell:
+    cmd: >-
+      {{ job_opatch }} apply {{ job_patch_dir }} -silent -ocmrf /dev/null
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_opatch_apply
+  async: 7200 # 2 hour timeout for large patches
+  poll: 30
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show opatch apply output"
+  ansible.builtin.debug:
+    msg: "{{ job_opatch_apply.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+# -- 8. Start database and listener -------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Start Oracle database {{ job.oracle_sid }}"
+  ansible.builtin.shell:
+    cmd: |
+      su - {{ job.oracle_user }} -c \
+        "ORACLE_SID={{ job.oracle_sid }} \
+         {{ job.oracle_home }}/bin/sqlplus -S /nolog <<'SQLEOF'
+      CONNECT / AS SYSDBA
+      STARTUP;
+      EXIT;
+      SQLEOF"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: root
+  register: job_db_startup
+  no_log: true
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show database startup output"
+  ansible.builtin.debug:
+    msg: "{{ job_db_startup.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Start listener on {{ job.target_host }}"
+  ansible.builtin.shell:
+    cmd: "{{ job.oracle_home }}/bin/lsnrctl start"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_lsnr_start
+
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show listener start output"
+  ansible.builtin.debug:
+    msg: "{{ job_lsnr_start.stdout_lines | default(['(no output)']) }}"
+
+  when: not job_patch_already_applied
+# -- 9. Verify patch applied --------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (post-patch, full output)"
+  ansible.builtin.shell:
+    cmd: "{{ job_opatch }} lsinventory 2>&1"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_post_inventory
+  changed_when: false
+  ignore_errors: true
+  when: not job_patch_already_applied
+
+- name: "JOB | {{ job.issue_key }} | Show post-patch inventory (patch {{ job.patch_number }} confirmation)"
+  ansible.builtin.debug:
+    msg: "{{ job_post_inventory.stdout_lines | default(['(no output)']) }}"
+  when: not job_patch_already_applied
+
+- name: "JOB | {{ job.issue_key }} | Set outcome to DONE when patch already applied"
+  ansible.builtin.set_fact:
+    job_outcome: >-
+      {{
+        job_outcome | combine({
+          'status':     'done',
+          'error':      '',
+          'pre_check':  'Patch ' + job.patch_number + ' already present in OPatch inventory -- no action taken.',
+          'post_check': 'Patch ' + job.patch_number + ' already present in OPatch inventory -- no action taken.'
+        })
+      }}
+  when: job_patch_already_applied
+
+- name: "JOB | {{ job.issue_key }} | Determine overall job outcome"
+  ansible.builtin.set_fact:
+    job_outcome: >-
+      {{
+        job_outcome | combine({
+          'status': (
+            'done'
+            if (
+              job_opatch_apply.rc == 0 and
+              job_db_startup.rc == 0
+            )
+            else 'failed'
+          ),
+          'error': (
+            ''
+            if (job_opatch_apply.rc == 0 and job_db_startup.rc == 0)
+            else (
+              'opatch apply rc=' + (job_opatch_apply.rc | string)
+              if job_opatch_apply.rc != 0
+              else 'database startup rc=' + (job_db_startup.rc | string)
+            )
+          ),
+          'pre_check':  (job_pre_inventory.stdout  | default('')),
+          'post_check': (job_post_inventory.stdout | default(''))
+        })
+      }}
+  when: not job_patch_already_applied
+- name: "JOB | {{ job.issue_key }} | Show job outcome"
+  ansible.builtin.debug:
+    msg: >-
+      {{ job.issue_key }} | patch {{ job.patch_number }} -> {{ job.target_host }} : {{ job_outcome.status | upper }} {% if job_outcome.status == 'failed' %}| {{ job_outcome.error }}{% endif %}
+
+  when: not job_patch_already_applied
+# -- Cleanup staged files ------------------------------------------------------
+
+- name: "JOB | {{ job.issue_key }} | Remove patch zip and extracted directory"
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  loop:
+  - "{{ patch_stage_dir }}/{{ job_patch_filename }}"
+  - "{{ job_patch_dir }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  when: cleanup_dump_files | default(true) | bool
+
+# -- Write outcome for PLAY 3 -------------------------------------------------
+# Write the outcome for this job to a per-issue JSON file on the controller,
+# then merge all per-issue files into the single outcomes list at the end.
+# Using ansible.builtin.copy avoids the Python heredoc string-interpolation
+# issue where multiline opatch output containing newlines and quotes breaks
+# the Python string literal inside the heredoc.
+
+- name: "JOB | {{ job.issue_key }} | Write per-issue outcome JSON to controller"
+  ansible.builtin.copy:
+    content: "{{ outcome_entry | to_json }}"
+    dest: "/tmp/snow_patch_outcome_{{ job.issue_key }}.json"
+    mode: '0600'
+  vars:
+    outcome_entry:
+      issue_key: "{{ job.issue_key }}"
+      patch_number: "{{ job.patch_number }}"
+      target_host: "{{ job.target_host }}"
+      oracle_sid: "{{ job.oracle_sid }}"
+      status: "{{ job_outcome.status }}"
+      error: "{{ job_outcome.error }}"
+      pre_check: "{{ job_outcome.pre_check  | default('') }}"
+      post_check: "{{ job_outcome.post_check | default('') }}"
+  delegate_to: localhost
+  become: false
+
+- name: "JOB | {{ job.issue_key }} | Merge per-issue outcome into combined outcomes file"
+  ansible.builtin.shell:
+    cmd: |
+      python3 - << 'PYEOF'
+      import json, os, glob
+
+      outfile = "/tmp/snow_patch_outcomes.json"
+      outcomes = []
+      if os.path.exists(outfile):
+          with open(outfile) as f:
+              outcomes = json.load(f)
+
+      # Read all per-issue outcome files and merge
+      for fname in sorted(glob.glob("/tmp/snow_patch_outcome_*.json")):
+          with open(fname) as f:
+              entry = json.load(f)
+          # Replace existing entry for this issue_key if present
+          outcomes = [o for o in outcomes if o["issue_key"] != entry["issue_key"]]
+          outcomes.append(entry)
+
+      with open(outfile, "w") as f:
+          json.dump(outcomes, f)
+
+      print(f"Combined outcomes file updated: {len(outcomes)} issue(s)")
+      PYEOF
+  delegate_to: localhost
+  become: false
+
+# -- Write the worklog-posting Python script -----------------------------------
+
+- name: "JOB | Write work-note-posting script to controller"
+  ansible.builtin.copy:
+    dest: "/tmp/snow_patch_worklog.py"
+    mode: '0700'
+    content: |
+      import json, sys, urllib.request, urllib.error, base64
+
+      with open(sys.argv[1]) as f:
+          outcomes = json.load(f)
+
+      with open("/tmp/snow_patch_creds.json") as f:
+          creds = json.load(f)
+
+      sn_instance = creds["sn_instance"]
+      sn_username = creds["sn_username"]
+      sn_password = creds["sn_password"]
+      provisioner = creds["provisioned_by"]
+      timestamp   = creds["timestamp"]
+
+      for o in outcomes:
+          already_applied = "already present" in o.get("pre_check", "")
+
+          if already_applied:
+              comment = "\n".join([
+                  f"Automated Oracle Patch Check - {timestamp}",
+                  "",
+                  f"Patch number : {o['patch_number']}",
+                  f"Target host  : {o['target_host']}",
+                  f"Oracle SID   : {o['oracle_sid']}",
+                  f"Status       : DONE (already applied -- no action taken)",
+                  f"Performed by : {provisioner}",
+                  f"Timestamp    : {timestamp}",
+                  "",
+                  f"Patch {o['patch_number']} was already present in the OPatch inventory.",
+                  "No patching steps were executed. Database and listener were not restarted.",
+              ])
+          else:
+              comment = "\n".join([
+                  f"Automated Oracle Patch Application - {timestamp}",
+                  "",
+                  f"Patch number : {o['patch_number']}",
+                  f"Target host  : {o['target_host']}",
+                  f"Oracle SID   : {o['oracle_sid']}",
+                  f"Status       : {o['status'].upper()}",
+                  f"Error        : {o['error'] or 'None'}",
+                  f"Performed by : {provisioner}",
+                  f"Timestamp    : {timestamp}",
+                  "",
+                  "--- opatch lsinventory (post-patch) ---",
+                  o.get("post_check", "(not available)") or "(patch not listed directly -- may be part of a bundle patch)",
+                  "--- end of lsinventory ---",
+                  "",
+                  "Please verify database connectivity before resuming workloads.",
+              ])
+
+          body = json.dumps({"work_notes": comment}).encode("utf-8")
+          auth = base64.b64encode(f"{sn_username}:{sn_password}".encode()).decode()
+          url  = f"{sn_instance}/api/now/table/change_request/{o['sys_id']}"
+
+          req = urllib.request.Request(
+              url, data=body,
+              headers={"Content-Type": "application/json", "Authorization": f"Basic {auth}"},
+              method="PATCH"
+          )
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"OK: work note posted to {o['issue_key']} (HTTP {resp.status})")
+          except urllib.error.HTTPError as e:
+              print(f"ERROR: HTTP {e.code} posting work note to {o['issue_key']}: {e.read().decode()}")
+  delegate_to: localhost
+  become: false

@@ -1,0 +1,149 @@
+---
+# =============================================================================
+# COMMON_snow_intake.yml
+#
+# ServiceNow intake + shepherd, included by every SNOW_* playbook BEFORE its
+# parse step. The change_request table is shared, so each project finds its
+# work by short_description prefix: "<TAG> | <spec...>".
+#
+#   state new       -> implement   (standard changes are pre-approved;
+#                                   normal changes only once approval=approved,
+#                                   and new normal CRs get approval requested
+#                                   via state=assess)
+#   state implement -> EXECUTED    (unless approval is requested/rejected)
+#   anything else   -> ignored
+#
+# Include with:
+#   snow_tag : project tag, e.g. "REF"
+#
+# Sets facts:
+#   snow_work   : list of executable CRs ({sys_id, number, short_description,
+#                 description, state, approval})
+#   snow_cr_map : { number: sys_id } for later API calls
+#
+# Failure-tolerant; also detects PDI hibernation (HTML instead of JSON).
+# =============================================================================
+
+- name: "SNOW | {{ snow_tag }} | Pre-flight: verify instance is awake and credentials valid"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: snow_preflight
+  failed_when: false
+
+- name: "SNOW | {{ snow_tag }} | Abort with a clear message if the instance is unreachable"
+  ansible.builtin.fail:
+    msg: >-
+      ServiceNow pre-flight failed (HTTP {{ snow_preflight.status | default('n/a') }}).
+      If the response was not JSON, the PDI is likely HIBERNATING -- wake it at
+      https://developer.servicenow.com and re-run. If HTTP 401, verify
+      sn_username / sn_password in vars/main.yml.
+  when: snow_preflight.status | default(0) != 200 or snow_preflight.json is not defined
+
+- name: "SNOW | {{ snow_tag }} | Query change requests tagged '{{ snow_tag }} |'"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+        ('short_descriptionSTARTSWITH' + snow_tag + ' |^stateIN'
+         + snow_state_new + ',' + snow_state_implement
+         + '^ORDERBYsys_created_on') | urlencode
+      }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_max_results }}
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: snow_query
+  failed_when: false
+
+- name: "SNOW | {{ snow_tag }} | Collect tagged change requests"
+  ansible.builtin.set_fact:
+    snow_all: "{{ snow_query.json.result | default([]) }}"
+
+- name: "SNOW | {{ snow_tag }} | Intake summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ snow_tag }}: {{ snow_all | length }} tagged change request(s)
+      ({{ snow_all | map(attribute='number') | list | join(', ') | default('none', true) }})
+
+# --- Shepherd: request approval for new NORMAL changes ----------------------
+- name: "SNOW | {{ snow_tag }} | Request approval for new normal changes (state=assess)"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ item.sys_id }}"
+    state: assess
+  loop: "{{ snow_all }}"
+  loop_control:
+    label: "{{ item.number }}"
+  when:
+  - item.state == snow_state_new
+  - (sn_type | default('standard')) == 'normal'
+  - item.approval in ['not requested', 'not_requested', '']
+  failed_when: false
+
+# --- Shepherd: promote to implement -----------------------------------------
+# Standard changes are pre-approved and go straight to implement; normal
+# changes are promoted only after their approval has been granted.
+- name: "SNOW | {{ snow_tag }} | Promote eligible new changes to implement"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ item.sys_id }}"
+    state: implement
+  loop: "{{ snow_all }}"
+  loop_control:
+    label: "{{ item.number }}"
+  when:
+  - item.state == snow_state_new
+  - (sn_type | default('standard')) == 'standard' or item.approval == 'approved'
+  failed_when: false
+
+# --- Re-query and build the executable work list ----------------------------
+- name: "SNOW | {{ snow_tag }} | Re-query for the executable queue"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+        ('short_descriptionSTARTSWITH' + snow_tag + ' |^state=' + snow_state_implement
+         + '^ORDERBYsys_created_on') | urlencode
+      }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_max_results }}
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: snow_query2
+  failed_when: false
+
+- name: "SNOW | {{ snow_tag }} | Build executable work list (implement, not pending/rejected approval)"
+  ansible.builtin.set_fact:
+    snow_work: >-
+      {{
+        snow_query2.json.result | default([])
+        | rejectattr('approval', 'in', ['requested', 'rejected'])
+        | list
+      }}
+    snow_cr_map: >-
+      {{
+        dict(
+          (snow_query2.json.result | default([]) | map(attribute='number') | list)
+          | zip(snow_query2.json.result | default([]) | map(attribute='sys_id') | list)
+        )
+      }}
+
+- name: "SNOW | {{ snow_tag }} | Executable queue"
+  ansible.builtin.debug:
+    msg: >-
+      {{ snow_tag }}: {{ snow_work | length }} change request(s) ready to execute
+      ({{ snow_work | map(attribute='number') | list | join(', ') | default('none', true) }})

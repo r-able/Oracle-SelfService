@@ -1,0 +1,401 @@
+---
+# jira_oracle_schema_refresh.yml
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   1. Search      : find all open REF issues matching the configured JQL
+#   2. Fetch       : retrieve each issue and parse the refresh spec from the
+#                    field named by jira_ref_spec_field (vars/main.yml)
+#   3. Pre-flight  : verify expdp/impdp exist on the DB host, confirm
+#                    source schema exists in the source Oracle instance
+#   4. Export      : run expdp on the source instance as the oracle OS user
+#   5. Import      : run impdp into the target instance with REMAP_SCHEMA
+#                    and TABLE_EXISTS_ACTION=REPLACE
+#   6. Verify      : count objects in target schema to confirm import
+#   7. Worklog     : posted per job by jira_oracle_schema_refresh_job.yml
+#                    (detailed export/import output incl. tables + row counts)
+#   8. Transition  : move issue to "Done" on success, "Failed" on error
+#                    ("Failed" also opens a DBA repair follow-up task)
+#   9. Summary     : print final outcome table
+#
+# CHANGES (July 2026):
+#   * Worklogs are now posted per-job inside jira_oracle_schema_refresh_job.yml
+#     with full datapump output. The legacy PLAY 3 worklog script tasks and the
+#     credentials sidecar file have been removed.
+#   * PLAY 1 now deletes any stale /tmp/snow_refresh_outcomes.json before the
+#     run, so an aborted previous run cannot leak old outcomes into PLAY 3.
+#   * Projects/forms were re-created (July 2026): the spec moved to
+#     customfield_10746 (configurable via jira_ref_spec_field) and an
+#     Approvals step was added, so the JQL now gates on status='In Progress'
+#     (issues only reach it after approval).
+#
+# Refresh spec formats (both accepted; select-option and plain-text fields
+# are both handled):
+#   legacy: "PRO:SOURCE=>UAT:TARGET"
+#            ^^^  ^^^^^^  ^^^  ^^^^^^
+#            |    |       |    `- target schema name
+#            |    |       `- target Oracle service/SID
+#            |    `- source schema name
+#            `- source Oracle service/SID
+#   new   : "PROD:DEV"
+#            ^^^^  ^^^
+#            |     `- target Oracle service (schema = target_schema var)
+#            `- source Oracle service (schema = source_schema var);
+#            service names normalized via oracle_service_aliases (PROD->PRO)
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   # Jira
+#   jira_url          : "https://yourorg.atlassian.net"
+#   jira_user         : "ansible-svc@yourorg.com"
+#   jira_api_token    : !vault |  ...
+#   jira_jql_ref      : "project = REF AND issuetype = Task AND status = 'To Do'"
+#   jira_max_results  : 50
+#   jira_cloud        : true
+#   jira_status_done  : "Done"
+#   jira_status_failed: "Failed"
+#
+#   # Oracle DB host (SSH target)
+#   oracle_host       : "dbserver.yourorg.internal"
+#   oracle_os_user    : "oracle"
+#   oracle_base       : "/u01/app/oracle"
+#   oracle_home       : "/u01/app/oracle/product/19c/dbhome_1"
+#   datapump_dir      : "/u01/app/oracle/admin/orcl/dpdump"
+#   oracle_dba_user   : "system"
+#   oracle_dba_pass   : !vault |  ...
+#
+#   # Datapump tuning
+#   datapump_parallel    : 4
+#   datapump_compression : "ALL"
+#   cleanup_dump_files   : true
+#
+# Usage:
+#   ansible-playbook jira_oracle_schema_refresh.yml --ask-vault-pass
+
+# -- PLAY 1: Ansible controller -- fetch Jira issues --------------------------
+- name: "PLAY 1 | Fetch ServiceNow refresh changes and parse the refresh spec"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+  - name: "PRE-FLIGHT | Remove stale outcomes file from any aborted previous run"
+    ansible.builtin.file:
+      path: /tmp/snow_refresh_outcomes.json
+      state: absent
+
+  # ServiceNow intake + shepherd: finds "REF | ..." change requests, promotes
+  # eligible new ones to implement, and returns the executable queue in
+  # snow_work (see COMMON_snow_intake.yml).
+  - name: "0-1 | ServiceNow intake and shepherd for REF"
+    ansible.builtin.include_tasks: COMMON_snow_intake.yml
+    vars:
+      snow_tag: "REF"
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: >-
+        No Tasks Found -- no ServiceNow change requests tagged 'REF |' are
+        ready to execute. Nothing to process; exiting cleanly.
+    when: snow_work | length == 0
+
+  - name: "1 | End play gracefully when no work is found"
+    ansible.builtin.meta: end_play
+    when: snow_work | length == 0
+
+  # Parse the refresh spec from short_description: "REF | PROD:DEV" (new) or
+  # "REF | PRO:HR=>UAT:HR_COPY" (legacy). Same semantics as the Jira parser:
+  # service names normalized via oracle_service_aliases; schemas default to
+  # source_schema / target_schema for the new format.
+  - name: "2 | Warn and skip change requests with a missing or invalid refresh spec"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.number }} has no usable refresh spec after the tag
+        (short_description: '{{ item.short_description }}') -- skipping.
+        Expected 'REF | SOURCE:TARGET' or the legacy '=>'-style spec.
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      ref_spec: "{{ item.short_description.split('|')[1:] | join('|') | trim }}"
+    when: "':' not in ref_spec"
+
+  - name: "2 | Parse refresh spec from short_description"
+    ansible.builtin.set_fact:
+      refresh_jobs: >-
+        {{
+          refresh_jobs | default([]) + [{
+            'issue_key':      item.number,
+            'sys_id':         item.sys_id,
+            'raw_spec':       ref_spec,
+            'source_service': (oracle_service_aliases | default({})).get(ref_src_service, ref_src_service),
+            'source_schema':  ref_src_schema,
+            'target_service': (oracle_service_aliases | default({})).get(ref_tgt_service, ref_tgt_service),
+            'target_schema':  ref_tgt_schema
+          }]
+        }}
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      ref_spec: "{{ item.short_description.split('|')[1:] | join('|') | trim }}"
+      ref_legacy: "{{ '=>' in ref_spec }}"
+      ref_src_service: "{{ (ref_spec.split('=>')[0].split(':')[0] if ref_legacy | bool else ref_spec.split(':')[0]) | trim | upper }}"
+      ref_src_schema: "{{ (ref_spec.split('=>')[0].split(':')[1] if ref_legacy | bool else source_schema) | trim | upper }}"
+      ref_tgt_service: "{{ (ref_spec.split('=>')[1].split(':')[0] if ref_legacy | bool else ref_spec.split(':')[1]) | trim | upper }}"
+      ref_tgt_schema: "{{ (ref_spec.split('=>')[1].split(':')[1] if ref_legacy | bool else target_schema) | trim | upper }}"
+    when: "':' in ref_spec"
+  - name: "2 | Show parsed refresh jobs"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} -- {{ item.raw_spec }} | export {{ item.source_schema }}@{{ item.source_service }} -> import {{ item.target_schema }}@{{ item.target_service }}
+    loop: "{{ refresh_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  # Persist refresh_jobs into a temp file so PLAY 2 (running on the DB host)
+  # can access it.  PLAY 2 slurps this file back at the start of its run.
+  - name: "2 | Write refresh job list to temp file for PLAY 2"
+    ansible.builtin.copy:
+      content: "{{ refresh_jobs | to_json }}"
+      dest: "/tmp/snow_refresh_jobs.json"
+      mode: '0600'
+    no_log: true
+
+# -- PLAY 2: Oracle DB host -- run expdp/impdp per refresh job ----------------
+- name: "PLAY 2 | Run Oracle schema refresh jobs on the DB host"
+  hosts: "{{ oracle_host }}"
+  gather_facts: true
+  become: true
+  become_user: "{{ oracle_os_user }}"
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    oracle_env:
+      ORACLE_HOME: "{{ oracle_home }}"
+      ORACLE_BASE: "{{ oracle_base }}"
+      PATH: "{{ oracle_home }}/bin:/usr/local/bin:/usr/bin:/bin"
+      NLS_DATE_FORMAT: "YYYY-MM-DD HH24:MI:SS"
+
+  tasks:
+
+  # Slurp the job list written by PLAY 1 from the controller's /tmp
+  # (the controller delegates a fetch back to localhost to read it)
+  - name: "PLAY2-INIT | Read refresh job list from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/snow_refresh_jobs.json"
+    register: refresh_jobs_raw
+    delegate_to: localhost
+    become: false
+
+  - name: "PLAY2-INIT | Decode refresh job list"
+    ansible.builtin.set_fact:
+      refresh_jobs: "{{ refresh_jobs_raw.content | b64decode | from_json }}"
+
+  - name: "PRE-FLIGHT | Confirm expdp binary exists"
+    ansible.builtin.stat:
+      path: "{{ oracle_home }}/bin/expdp"
+    register: expdp_stat
+
+  - name: "PRE-FLIGHT | Fail if expdp not found"
+    ansible.builtin.fail:
+      msg: "expdp not found at {{ oracle_home }}/bin/expdp. Check oracle_home in vars/main.yml."
+    when: not expdp_stat.stat.exists
+
+  - name: "PRE-FLIGHT | Confirm impdp binary exists"
+    ansible.builtin.stat:
+      path: "{{ oracle_home }}/bin/impdp"
+    register: impdp_stat
+
+  - name: "PRE-FLIGHT | Fail if impdp not found"
+    ansible.builtin.fail:
+      msg: "impdp not found at {{ oracle_home }}/bin/impdp. Check oracle_home in vars/main.yml."
+    when: not impdp_stat.stat.exists
+
+  - name: "PRE-FLIGHT | Confirm DATA_PUMP_DIR filesystem path exists and is writable"
+    ansible.builtin.file:
+      path: "{{ datapump_dir }}"
+      state: directory
+      mode: '0750'
+
+  # -- Run each refresh job sequentially ------------------------------------
+  # Using include_tasks with loop so variables are scoped per job cleanly.
+  # NOTE: each job posts its own detailed worklog entry (export/import output
+  # with tables and row counts) from inside the included task file.
+
+  - name: "3-6 | Execute each refresh job"
+    ansible.builtin.include_tasks: SNOW_REF_oracle_schema_refresh_job.yml
+    loop: "{{ refresh_jobs }}"
+    loop_control:
+      loop_var: job
+      label: "{{ job.issue_key }} | {{ job.source_schema }}@{{ job.source_service }} => {{ job.target_schema }}@{{ job.target_service }}"
+
+# -- PLAY 3: Ansible controller -- transition issues ---------------------------
+- name: "PLAY 3 | Close change requests based on refresh outcomes"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY3-INIT | Read job outcomes from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/snow_refresh_outcomes.json"
+    register: outcomes_raw
+
+  - name: "PLAY3-INIT | Decode job outcomes"
+    ansible.builtin.set_fact:
+      refresh_outcomes: "{{ outcomes_raw.content | b64decode | from_json }}"
+
+  - name: "7 | Show outcome per issue"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} | {{ item.source_schema }}@{{ item.source_service }} => {{ item.target_schema }}@{{ item.target_service }} : {{ item.status | upper }}
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  # -- 8. Close change requests based on outcome ----------------------------
+  # Successful: implement -> review -> closed (close_code successful) with a
+  # summary in close_notes. Failed: work-note the failure, close unsuccessful,
+  # and raise a DBA repair follow-up change with the preserved logs attached.
+  # State walks are failure-tolerant; the change model may auto-skip review.
+
+  - name: "8 | Move SUCCESSFUL changes to review"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: review
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    failed_when: false
+
+  - name: "8 | Close SUCCESSFUL changes (close_code successful)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: closed
+      close_code: successful
+      close_notes: |-
+        Automated Oracle Schema Refresh COMPLETED - {{ ansible_date_time.iso8601 }}
+        Spec:   {{ item.raw_spec }}
+        Source: {{ item.source_schema }}@{{ item.source_service }}
+        Target: {{ item.target_schema }}@{{ item.target_service }}
+        Objects in target schema: {{ item.object_count | default('n/a') }}
+        Please verify the refreshed schema before resuming work.
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    register: snow_close_done
+    failed_when: false
+
+  - name: "8 | Work-note FAILED changes with the failure summary"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        work_notes: |-
+          Automated Oracle Schema Refresh FAILED - {{ ansible_date_time.iso8601 }}
+          Spec:   {{ item.raw_spec }}
+          Export: rc={{ item.export_rc | default('n/a') }}  Import: rc={{ item.import_rc | default('n/a') }}
+          Error:  {{ item.error | default('see preserved logs') }}
+          Dump and datapump log files were preserved on {{ oracle_host }} for diagnosis.
+          A DBA repair follow-up change request is being raised.
+      status_code: 200
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    failed_when: false
+
+  - name: "8 | Close FAILED changes (close_code unsuccessful)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: closed
+      close_code: unsuccessful
+      close_notes: "Automated schema refresh failed; see work notes and the DBA repair follow-up change."
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    failed_when: false
+
+  - name: "8b | Create DBA repair follow-up change for FAILED refreshes"
+    ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when:
+    - snow_followup_enabled | default(true) | bool
+    - fu_item.status == 'failed'
+    vars:
+      fu_tag: "REF"
+      fu_original_number: "{{ fu_item.issue_key }}"
+      fu_original_sys_id: "{{ fu_item.sys_id }}"
+      fu_summary: "schema refresh failed for {{ fu_item.issue_key }} ({{ fu_item.source_schema }}@{{ fu_item.source_service }} => {{ fu_item.target_schema }}@{{ fu_item.target_service }})"
+      fu_description: |-
+        Automated Oracle schema refresh FAILED and the change request has been
+        closed unsuccessful. Please investigate and repair.
+
+        Spec           : {{ fu_item.raw_spec }}
+        Source         : {{ fu_item.source_schema }}@{{ fu_item.source_service }}
+        Target         : {{ fu_item.target_schema }}@{{ fu_item.target_service }}
+        Export rc      : {{ fu_item.export_rc | default('n/a') }}
+        Import rc      : {{ fu_item.import_rc | default('n/a') }}
+        Error          : {{ fu_item.error | default('See attached log.') }}
+
+        Dump and datapump log files were preserved on {{ oracle_host }} in the
+        REFRESH directory for diagnosis (failed jobs are never cleaned up).
+      fu_attach_files: "{{ [fu_item.failure_log | default('')] | select() | list }}"
+  - name: "9 | Print final summary"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: >-
+      {{
+        [
+          '======================================================',
+          '  Jira Oracle Schema Refresh Summary',
+          '======================================================',
+          '  Run timestamp : ' + ansible_date_time.iso8601,
+          '  Issues found  : ' + (refresh_outcomes | length | string),
+          '  Succeeded     : ' + (refresh_outcomes | selectattr('status','equalto','done')   | list | length | string),
+          '  Failed        : ' + (refresh_outcomes | selectattr('status','equalto','failed') | list | length | string),
+          '  --------------------------------------------------'
+        ]
+        + (refresh_outcomes | map(attribute='issue_key') | zip(
+             refresh_outcomes | map(attribute='status')
+           ) | map('join', '   ->   ') | map('regex_replace', '^', '  ') | list)
+        + ['======================================================']
+      }}
+    loop_control:
+      label: "summary"
+
+  - name: "9 | Clean up temp files on controller"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "/tmp/snow_refresh_jobs.json"
+    - "/tmp/snow_refresh_outcomes.json"
+    loop_control:
+      label: "{{ item | basename }}"

@@ -1,0 +1,70 @@
+---
+    - name: RFRSH2025Q2 Omni-Client PROD_2_UAT | announce oracle_schema_refresh
+      hosts: localhost
+      gather_facts: true
+      vars_files:
+        - vars/main.yml
+
+      tasks:
+
+#      - name: Create a change request
+#        servicenow.itsm.change_request:
+#          instance:
+#            host: https://dev204190.service-now.com
+#            username: hyperautomation.platform
+#            password: "-5ksaV^%R1QJS$oOP*#e0:v3Kz#8fhB}!<5y70&IT$Y>^+81k6pKcR*hog%FK^nO.Q_!F0l)A,yfdOTsh?;i0?.fJ3^!x8*M<1mh"
+#          type: normal
+#          short_description: "Test from Ansible"
+#          state: new  
+
+      - name: Auto-Create "RFRSH2025Q2 Omni-Client PROD_2_UAT" Task in ServiceNow | prepare oracle_schema_refresh
+        servicenow.itsm.change_request:
+          instance:
+            host: "{{ sn_instance}}"
+            username: "{{ sn_username }}"
+            password:  "{{ sn_password }}"
+          type: normal
+          short_description: Install Oracle 26ai
+          description: Please Install Oracle 26ai on all DEV servers by 2026/09/30
+          state: new
+        register: refresh_new_cr_out
+
+      - debug:
+          msg: Ansible Starting the Quarterly RFRSH2025Q2 Omni-Client PROD_2_UAT | prepare oracle_schema_refresh
+
+      - name: Change ServiceNow Refresh Task State to In-Progress | prepare oracle_schema_refresh
+        servicenow.itsm.change_request:
+          instance:
+            host: "{{ sn_instance}}"
+            username: "{{ sn_username }}"
+            password:  "{{ sn_password }}"
+          sys_id: "{{ refresh_new_cr_out.record.sys_id }}"
+          state: in_progress
+
+      - debug:
+          msg: Ansible Verified & Opened an Oracle RFRSH2025Q2 Omni-Client PROD_2_UAT Task {{ refresh_new_cr_out.record.task_effective_number }} in ServiceNow | execute oracle_schema_refresh
+       
+      - name: Prepare Oracle Refresh Process | execute oracle_schema_refresh
+        servicenow.itsm.change_request_info:
+          instance:
+            host: "{{ sn_instance}}"
+            username: "{{ sn_username }}"
+            password:  "{{ sn_password }}"
+          sys_id: "{{ refresh_new_cr_out.record.sys_id }}"
+        register: refresh_execute_out
+
+      - debug:
+          msg: Ansible Executing RFRSH2025Q2 Omni-Client PROD_2_UAT Task {{ refresh_new_cr_out.record.task_effective_number }}
+
+      - name: Cache the Refresh Task SYS_ID for All Playbooks to Re-Use | prepare oracle_database_refresh
+        ansible.builtin.set_fact:
+          sys_id: "{{ refresh_new_cr_out.record.sys_id }}"
+          cacheable: yes
+
+      - name: Write the Refresh Task SYS_ID Variable to the Disk on CTRL+ Node Alone | prepare oracle_database_refresh
+        copy:
+          content: "{{ refresh_new_cr_out.record.sys_id }}"
+          dest: "/tmp/refresh_task_sid.txt"
+        delegate_to: localhost
+
+#    - import_playbook: itsm_oracle_refresh_actual.yml
