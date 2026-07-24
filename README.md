@@ -69,7 +69,7 @@ Name your Change Requests as follows to kick off the auto-execution:
 #   CDP | Vlad Grigorian
 #   UPG | CDB1
 #   DCR | <free title>                 (.sql scripts as attachments)
-#   DB | lnx001 | CDB1 | TSTPDB01      (provision a new database)
+#   PDB | lnx001 | CDB1 | TSTPDB01      (provision a new database)
 #####################################################################
 
 Logging tree:
