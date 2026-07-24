@@ -1,0 +1,235 @@
+---
+# =============================================================================
+# SNOW_DCR_bulk_create_test_crs.yml
+#
+# TEST-DATA GENERATOR (not part of the production suite).
+#
+# Creates a batch of DCR change requests in ServiceNow for load/bulk testing
+# the DCR resolution flow. Each change request:
+#   * is titled with the correct convention  "DCR | <ENV> | <random title>"
+#   * targets one of the non-PROD environments (UAT, SIT, STG, CER, DEV),
+#     assigned round-robin so the batch is evenly spread
+#   * is assigned to snow_assigned_to within snow_assignment_group, so the
+#     real DCR playbook will actually pick it up
+#   * is created in state 'new' (the DCR intake promotes non-PROD new -> implement)
+#   * gets ONE .sql script attached, chosen at random from the attachments dir
+#
+# All environments here are NON-PROD on purpose, so every generated CR routes
+# straight to implement and runs without approval -- ideal for a bulk test.
+#
+# Usage:
+#   ansible-playbook SNOW_DCR_bulk_create_test_crs.yml \
+#       --vault-password-file /etc/ansible/.vault_pass
+#
+#   # override how many to create (default 100):
+#   ansible-playbook SNOW_DCR_bulk_create_test_crs.yml -e bulk_count=25 ...
+#
+# NOTE: this creates real change requests in the PDI. To remove them again,
+# use SNOW_DCR_bulk_delete_test_crs.yml (a matching cleanup playbook can be
+# generated on request), or filter on the marker in the description
+# ("BULK-TEST-CR") in the ServiceNow UI and delete.
+# =============================================================================
+
+- name: "Bulk-create DCR test change requests"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    bulk_count: 100
+    bulk_attachments_dir: "/etc/ansible/attachments"
+    bulk_environments:
+      - "UAT"
+      - "SIT"
+      - "STG"
+      - "CER"
+      - "DEV"
+    # Title building blocks -- combined randomly into titles like
+    # "Yearly Run", "Script07", "Cleanup Job", etc.
+    bulk_title_words:
+      - "Script"
+      - "Yearly Run"
+      - "Monthly Load"
+      - "Cleanup Job"
+      - "Index Rebuild"
+      - "Data Fix"
+      - "Migration"
+      - "Backfill"
+      - "Reconcile"
+      - "Purge"
+      - "Refresh Job"
+      - "Patch Set"
+      - "Hotfix"
+      - "Batch Update"
+      - "Nightly Task"
+    # Marker placed in every generated CR's description so the test batch can
+    # be found and cleaned up later.
+    bulk_marker: "BULK-TEST-CR"
+
+  tasks:
+
+    - name: "PRE | Verify the attachments directory exists"
+      ansible.builtin.stat:
+        path: "{{ bulk_attachments_dir }}"
+      register: bulk_dir_stat
+
+    - name: "PRE | Fail if the attachments directory is missing"
+      ansible.builtin.fail:
+        msg: "Attachments directory {{ bulk_attachments_dir }} not found on the controller."
+      when: not (bulk_dir_stat.stat.exists | default(false))
+
+    - name: "PRE | List .sql scripts in the attachments directory"
+      ansible.builtin.find:
+        paths: "{{ bulk_attachments_dir }}"
+        patterns: "*.sql,*.SQL"
+        file_type: file
+      register: bulk_sql_find
+
+    - name: "PRE | Fail if no .sql scripts were found"
+      ansible.builtin.fail:
+        msg: "No .sql scripts found in {{ bulk_attachments_dir }}. Add scripts and re-run."
+      when: bulk_sql_find.files | length == 0
+
+    - name: "PRE | Collect the list of script paths"
+      ansible.builtin.set_fact:
+        bulk_scripts: "{{ bulk_sql_find.files | map(attribute='path') | list }}"
+
+    - name: "PRE | Pre-flight: verify the instance is awake and credentials valid"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: bulk_preflight
+      failed_when: false
+
+    - name: "PRE | Abort if the instance is unreachable"
+      ansible.builtin.fail:
+        msg: >-
+          ServiceNow pre-flight failed (HTTP {{ bulk_preflight.status | default('n/a') }}).
+          If the response was not JSON, the PDI is likely HIBERNATING -- wake it
+          at https://developer.servicenow.com and re-run.
+      when: bulk_preflight.status | default(0) != 200 or bulk_preflight.json is not defined
+
+    - name: "PRE | Show what will be created"
+      ansible.builtin.debug:
+        msg: >-
+          Creating {{ bulk_count }} DCR test change request(s) across
+          {{ bulk_environments | join(', ') }}, each with one of
+          {{ bulk_scripts | length }} script(s) attached at random.
+
+    # -------------------------------------------------------------------------
+    # Build the plan first (pure data), so the create loop is simple.
+    # Environment is round-robin (even spread); title and script are random.
+    # A per-item random seed keeps a given index stable within one run.
+    # -------------------------------------------------------------------------
+    - name: "PLAN | Build the list of change requests to create"
+      ansible.builtin.set_fact:
+        bulk_plan: >-
+          {{
+            bulk_plan | default([]) + [{
+              'idx':   item,
+              'env':   bulk_environments[ item | int % (bulk_environments | length) ],
+              'title': (
+                        bulk_title_words
+                        | random(seed=(bulk_run_id ~ '-t-' ~ item))
+                       )
+                       + ' '
+                       + ('%02d' | format(((item | int) % 99) + 1)),
+              'script': (
+                          bulk_scripts
+                          | random(seed=(bulk_run_id ~ '-s-' ~ item))
+                        )
+            }] }}
+      loop: "{{ range(1, (bulk_count | int) + 1) | list }}"
+      loop_control:
+        label: "planning {{ item }}/{{ bulk_count }}"
+      vars:
+        bulk_run_id: "{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: "PLAN | Preview the first few planned change requests"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.env }} | "{{ item.title }}" | {{ item.script | basename }}
+      loop: "{{ bulk_plan[:5] }}"
+      loop_control:
+        label: "{{ item.idx }}"
+
+    # -------------------------------------------------------------------------
+    # Create each change request, then attach its script. The module returns
+    # the new record (incl. sys_id) which we use for the attachment POST.
+    # -------------------------------------------------------------------------
+    - name: "CREATE | Create DCR change requests"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        type: "{{ sn_dcr_type_nonprod | default('standard') }}"
+        state: new
+        short_description: "DCR | {{ item.env }} | {{ item.title }}"
+        description: >-
+          {{ bulk_marker }} -- automated bulk test change request
+          ({{ item.idx }}/{{ bulk_count }}). Target environment {{ item.env }}.
+          Script: {{ item.script | basename }}. Safe to delete.
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      loop: "{{ bulk_plan }}"
+      loop_control:
+        label: "{{ item.idx }} | DCR | {{ item.env }} | {{ item.title }}"
+      register: bulk_created
+      failed_when: false
+
+    - name: "CREATE | Pair each created change with its planned script"
+      ansible.builtin.set_fact:
+        bulk_attach_plan: >-
+          {{
+            bulk_attach_plan | default([]) + [{
+              'number': item.record.number,
+              'sys_id': item.record.sys_id,
+              'script': item.item.script
+            }] }}
+      loop: "{{ bulk_created.results | default([]) }}"
+      loop_control:
+        label: "{{ item.record.number | default('(failed)') }}"
+      when:
+        - item.record is defined
+        - item.record.sys_id is defined
+
+    - name: "ATTACH | Attach one .sql script to each change request"
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+            item.sys_id }}&file_name={{ (item.script | basename) | urlencode }}
+        method: POST
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers:
+          Content-Type: "application/sql"
+        src: "{{ item.script }}"
+        status_code: 201
+      loop: "{{ bulk_attach_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.number }} <- {{ item.script | basename }}"
+      register: bulk_attached
+      failed_when: false
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    - name: "SUMMARY | Report results"
+      ansible.builtin.debug:
+        msg:
+          - "Change requests requested : {{ bulk_count }}"
+          - "Created OK                : {{ bulk_attach_plan | default([]) | length }}"
+          - "Create failures           : {{ (bulk_created.results | default([]) | selectattr('record', 'undefined') | list | length) }}"
+          - "Attachments uploaded OK   : {{ bulk_attached.results | default([]) | selectattr('status', 'equalto', 201) | list | length }}"
+          - "Attachment failures       : {{ bulk_attached.results | default([]) | rejectattr('status', 'equalto', 201) | list | length }}"
+          - "Environments spread       : {{ bulk_plan | map(attribute='env') | list | community.general.counter }}"
+          - "Marker for cleanup        : description contains '{{ bulk_marker }}'"

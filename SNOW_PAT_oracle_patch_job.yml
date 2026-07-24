@@ -33,6 +33,86 @@
       pre_check: ""
       post_check: ""
 
+# -- 0. Announce start + capture the BEFORE inventory -------------------------
+# Patching is long-running, so post a "started" work note immediately, then
+# capture the full opatch lsinventory BEFORE doing anything. That inventory
+# is both the evidence baseline AND how we detect an already-applied patch --
+# so the expensive MOS download/copy/unzip/apply steps are skipped entirely
+# when the patch is already present.
+
+- name: "JOB | {{ job.issue_key }} | Work note: patching started"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ job.sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      work_notes: >-
+        Automated Oracle patching STARTED for patch {{ job.patch_number }} on
+        {{ job.target_host }} (SID {{ job.oracle_sid }}) at {{ ansible_date_time.iso8601 }}.
+        This process can take a while; the change request will be updated with
+        the before/after OPatch inventory and the final result when it completes.
+    status_code: 200
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (BEFORE patching, full output)"
+  ansible.builtin.shell:
+    cmd: "{{ job.oracle_home }}/OPatch/opatch lsinventory 2>&1"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ job.oracle_user }}"
+  environment: "{{ job_oracle_env }}"
+  register: job_pre_inventory
+  changed_when: false
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Flag whether patch {{ job.patch_number }} is already applied"
+  ansible.builtin.set_fact:
+    job_patch_already_applied: "{{ job.patch_number in (job_pre_inventory.stdout | default('')) }}"
+
+- name: "JOB | {{ job.issue_key }} | Show already-applied decision"
+  ansible.builtin.debug:
+    msg: >-
+      Patch {{ job.patch_number }} already applied on {{ job.target_host }}?
+      {{ job_patch_already_applied }}.
+      {{ 'Skipping download/apply; will record inventory and close successful.'
+         if job_patch_already_applied
+         else 'Proceeding with download and apply.' }}
+
+- name: "JOB | {{ job.issue_key }} | Write BEFORE inventory to a file on the controller"
+  ansible.builtin.copy:
+    content: |
+      opatch lsinventory -- BEFORE patching
+      Change request : {{ job.issue_key }}
+      Host / SID     : {{ job.target_host }} / {{ job.oracle_sid }}
+      Oracle home    : {{ job.oracle_home }}
+      Target patch   : {{ job.patch_number }}
+      Captured       : {{ ansible_date_time.iso8601 }}
+      Already applied: {{ job_patch_already_applied }}
+      ======================================================================
+      {{ job_pre_inventory.stdout | default('(lsinventory produced no output)') }}
+    dest: "/tmp/snow_patch_lsinventory_before_{{ job.issue_key }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: false
+
+- name: "JOB | {{ job.issue_key }} | Upload BEFORE inventory to the change request"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+        job.sys_id }}&file_name=lsinventory_before_{{ job.patch_number }}.txt
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "text/plain"
+    src: "/tmp/snow_patch_lsinventory_before_{{ job.issue_key }}.txt"
+    status_code: 201
+  failed_when: false
+
 # -- 4. Download patch from Oracle MOS ----------------------------------------
 # Oracle MOS requires a two-step wget: first authenticate to get a cookie,
 # then download the actual patch zip using that cookie.
@@ -51,6 +131,7 @@
   delegate_to: "{{ job.target_host }}"
   become: true
   become_user: root
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Download patch {{ job.patch_number }} from Oracle MOS (on controller)"
   ansible.builtin.shell:
@@ -142,12 +223,15 @@
   become: false
   register: job_download
   no_log: true
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Extract patch filename from download output"
   ansible.builtin.set_fact:
     job_patch_filename: "{{ job_download.stdout | regex_search('PATCH_FILE=(.+)', '\\1') | first }}"
     job_zip_file_local: "/tmp/oracle_patches/{{ job_download.stdout | regex_search('PATCH_FILE=(.+)', '\\1') | first }}"
-  when: job_download.rc == 0
+  when:
+  - not job_patch_already_applied
+  - job_download.rc == 0
 
 - name: "JOB | {{ job.issue_key }} | Show download result"
   ansible.builtin.debug:
@@ -155,11 +239,14 @@
     - "RC          : {{ job_download.rc }}"
     - "Patch file  : {{ job_patch_filename | default('unknown') }}"
     - "Local path  : {{ job_zip_file_local | default('unknown') }}"
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Fail if download failed"
   ansible.builtin.fail:
     msg: "Patch download failed for {{ job.patch_number }}. stdout: {{ job_download.stdout | default('(none)') }}"
-  when: job_download.rc != 0
+  when:
+  - not job_patch_already_applied
+  - job_download.rc | default(0) != 0
 
 - name: "JOB | {{ job.issue_key }} | Copy patch zip from controller to {{ job.target_host }}"
   ansible.builtin.copy:
@@ -170,10 +257,12 @@
   become: true
   become_user: "{{ job.oracle_user }}"
   register: job_copy
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Show copy status"
   ansible.builtin.debug:
     msg: "Patch zip copied to {{ job.target_host }}:{{ patch_stage_dir }}/{{ job_patch_filename }}"
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Unzip patch archive"
   ansible.builtin.shell:
@@ -187,37 +276,14 @@
   become_user: "{{ job.oracle_user }}"
   environment: "{{ job_oracle_env }}"
   register: job_unzip
+  when: not job_patch_already_applied
 
 - name: "JOB | {{ job.issue_key }} | Fail if unzip failed"
   ansible.builtin.fail:
     msg: "Unzip failed for patch {{ job.patch_number }}. stderr: {{ job_unzip.stderr | default('(none)') }}"
-  when: job_unzip.rc != 0
-
-# -- 5. Pre-patch check -------------------------------------------------------
-
-- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (pre-patch)"
-  ansible.builtin.shell:
-    cmd: "{{ job_opatch }} lsinventory 2>&1 | grep -A2 '{{ job.patch_number }}' || true"
-  delegate_to: "{{ job.target_host }}"
-  become: true
-  become_user: "{{ job.oracle_user }}"
-  environment: "{{ job_oracle_env }}"
-  register: job_pre_inventory
-  changed_when: false
-
-- name: "JOB | {{ job.issue_key }} | Show pre-patch inventory"
-  ansible.builtin.debug:
-    msg: "{{ job_pre_inventory.stdout_lines | default(['(patch not yet applied -- proceeding)']) }}"
-
-- name: "JOB | {{ job.issue_key }} | Flag if patch is already applied (skip patching)"
-  ansible.builtin.set_fact:
-    job_patch_already_applied: "{{ job.patch_number in (job_pre_inventory.stdout | default('')) }}"
-
-- name: "JOB | {{ job.issue_key }} | Show already-applied notice"
-  ansible.builtin.debug:
-    msg: >-
-      Patch {{ job.patch_number }} is already present in the OPatch inventory on {{ job.target_host }} -- skipping all patching steps and marking Done.
-  when: job_patch_already_applied
+  when:
+  - not job_patch_already_applied
+  - job_unzip.rc | default(0) != 0
 
 # -- 5b. OPatch version check and auto-upgrade --------------------------------
 
@@ -611,32 +677,63 @@
   when: not job_patch_already_applied
 # -- 9. Verify patch applied --------------------------------------------------
 
-- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (post-patch, full output)"
+- name: "JOB | {{ job.issue_key }} | Run opatch lsinventory (AFTER patching, full output)"
   ansible.builtin.shell:
-    cmd: "{{ job_opatch }} lsinventory 2>&1"
+    cmd: "{{ job.oracle_home }}/OPatch/opatch lsinventory 2>&1"
   delegate_to: "{{ job.target_host }}"
   become: true
   become_user: "{{ job.oracle_user }}"
   environment: "{{ job_oracle_env }}"
   register: job_post_inventory
   changed_when: false
-  ignore_errors: true
-  when: not job_patch_already_applied
+  failed_when: false
 
 - name: "JOB | {{ job.issue_key }} | Show post-patch inventory (patch {{ job.patch_number }} confirmation)"
   ansible.builtin.debug:
     msg: "{{ job_post_inventory.stdout_lines | default(['(no output)']) }}"
-  when: not job_patch_already_applied
 
-- name: "JOB | {{ job.issue_key }} | Set outcome to DONE when patch already applied"
+- name: "JOB | {{ job.issue_key }} | Write AFTER inventory to a file on the controller"
+  ansible.builtin.copy:
+    content: |
+      opatch lsinventory -- AFTER patching
+      Change request : {{ job.issue_key }}
+      Host / SID     : {{ job.target_host }} / {{ job.oracle_sid }}
+      Oracle home    : {{ job.oracle_home }}
+      Target patch   : {{ job.patch_number }}
+      Captured       : {{ ansible_date_time.iso8601 }}
+      Already applied before this run: {{ job_patch_already_applied }}
+      ======================================================================
+      {{ job_post_inventory.stdout | default('(lsinventory produced no output)') }}
+    dest: "/tmp/snow_patch_lsinventory_after_{{ job.issue_key }}.txt"
+    mode: '0644'
+  delegate_to: localhost
+  become: false
+
+- name: "JOB | {{ job.issue_key }} | Upload AFTER inventory to the change request"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+        job.sys_id }}&file_name=lsinventory_after_{{ job.patch_number }}.txt
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "text/plain"
+    src: "/tmp/snow_patch_lsinventory_after_{{ job.issue_key }}.txt"
+    status_code: 201
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Set outcome to DONE when patch was already applied"
   ansible.builtin.set_fact:
     job_outcome: >-
       {{
         job_outcome | combine({
           'status':     'done',
           'error':      '',
-          'pre_check':  'Patch ' + job.patch_number + ' already present in OPatch inventory -- no action taken.',
-          'post_check': 'Patch ' + job.patch_number + ' already present in OPatch inventory -- no action taken.'
+          'pre_check':  (job_pre_inventory.stdout  | default('')),
+          'post_check': (job_post_inventory.stdout | default('')),
+          'note':       'Patch ' + job.patch_number + ' was already present in the OPatch inventory -- no patching action was taken. Before/after inventories attached as proof.'
         })
       }}
   when: job_patch_already_applied
@@ -664,16 +761,16 @@
             )
           ),
           'pre_check':  (job_pre_inventory.stdout  | default('')),
-          'post_check': (job_post_inventory.stdout | default(''))
+          'post_check': (job_post_inventory.stdout | default('')),
+          'note':       'Patch ' + job.patch_number + ' applied via opatch. Before/after inventories attached as proof.'
         })
       }}
   when: not job_patch_already_applied
+
 - name: "JOB | {{ job.issue_key }} | Show job outcome"
   ansible.builtin.debug:
     msg: >-
       {{ job.issue_key }} | patch {{ job.patch_number }} -> {{ job.target_host }} : {{ job_outcome.status | upper }} {% if job_outcome.status == 'failed' %}| {{ job_outcome.error }}{% endif %}
-
-  when: not job_patch_already_applied
 # -- Cleanup staged files ------------------------------------------------------
 
 - name: "JOB | {{ job.issue_key }} | Remove patch zip and extracted directory"
@@ -688,7 +785,9 @@
   - "{{ job_patch_dir }}"
   loop_control:
     label: "{{ item | basename }}"
-  when: cleanup_dump_files | default(true) | bool
+  when:
+  - not job_patch_already_applied
+  - cleanup_dump_files | default(true) | bool
 
 # -- Write outcome for PLAY 3 -------------------------------------------------
 # Write the outcome for this job to a per-issue JSON file on the controller,
@@ -705,11 +804,14 @@
   vars:
     outcome_entry:
       issue_key: "{{ job.issue_key }}"
+      sys_id: "{{ job.sys_id }}"
       patch_number: "{{ job.patch_number }}"
       target_host: "{{ job.target_host }}"
       oracle_sid: "{{ job.oracle_sid }}"
       status: "{{ job_outcome.status }}"
       error: "{{ job_outcome.error }}"
+      note: "{{ job_outcome.note | default('') }}"
+      already_applied: "{{ job_patch_already_applied }}"
       pre_check: "{{ job_outcome.pre_check  | default('') }}"
       post_check: "{{ job_outcome.post_check | default('') }}"
   delegate_to: localhost

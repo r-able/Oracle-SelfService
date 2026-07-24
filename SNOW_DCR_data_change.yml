@@ -57,17 +57,294 @@
   # dict, not a list. Omit it entirely -- the module returns all fields by
   # default, and Task 2 does a dedicated per-issue fetch anyway.
 
-  # ServiceNow intake + shepherd: finds "DCR | ..." change requests, promotes
-  # eligible new ones to implement, returns the executable queue in snow_work
-  # plus snow_cr_map (number -> sys_id).
-  - name: "0-1 | ServiceNow intake and shepherd for DCR"
-    ansible.builtin.include_tasks: COMMON_snow_intake.yml
-    vars:
-      snow_tag: "DCR"
+  # ==========================================================================
+  # DCR-SPECIFIC INTAKE with environment-based approval routing
+  #
+  # DCR does NOT use the shared COMMON_snow_intake.yml, because its approval
+  # path depends on the TARGET ENVIRONMENT of each change, which is unique to
+  # DCR. The short_description format is:
+  #
+  #     DCR | <ENV> | <free title>          e.g. "DCR | PROD | Q3 migration"
+  #                                              "DCR | DEV  | add index"
+  #
+  # Routing, per change request:
+  #   * ENV != PROD  -> no approval needed: promote new -> implement and run
+  #                     immediately this pass.
+  #   * ENV == PROD  -> approval required (but NOT CAB -- that is configured on
+  #                     the ServiceNow side via the change model): a new PROD
+  #                     change is moved to 'assess' to request approval and is
+  #                     NOT run this pass; it only runs on a later pass once it
+  #                     has been approved and is sitting in 'implement'.
+  #
+  # Only CRs assigned to snow_assigned_to within snow_assignment_group are
+  # considered (same ownership filter as the shared intake).
+  # ==========================================================================
+
+  - name: "0 | Pre-flight: verify instance is awake and credentials valid"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: dcr_preflight
+    failed_when: false
+
+  - name: "0 | Abort with a clear message if the instance is unreachable"
+    ansible.builtin.fail:
+      msg: >-
+        ServiceNow pre-flight failed (HTTP {{ dcr_preflight.status | default('n/a') }}). If the response was not JSON, the PDI is likely HIBERNATING -- wake it at https://developer.servicenow.com and re-run. If HTTP 401, verify sn_username / sn_password in vars/main.yml.
+    when: dcr_preflight.status | default(0) != 200 or dcr_preflight.json is not defined
+
+  - name: "0 | Query DCR-tagged change requests in new or implement"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+          ('short_descriptionSTARTSWITHDCR |^stateIN'
+           + snow_state_new + ',' + snow_state_assess + ',' + snow_state_authorize
+           + ',' + snow_state_scheduled + ',' + snow_state_implement
+           + '^assignment_group.name=' + snow_assignment_group
+           + '^assigned_to.name=' + snow_assigned_to
+           + '^ORDERBYsys_created_on') | urlencode
+        }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_dcr_max_results | default(500) }}
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: dcr_query
+    failed_when: false
+
+  - name: "0 | Collect tagged change requests and parse target environment"
+    ansible.builtin.set_fact:
+      dcr_all: >-
+        {{
+          (dcr_query.json.result | default([]))
+          | map('combine', {}) | list
+        }}
+
+  - name: "0 | Annotate each change with its environment and PROD flag"
+    ansible.builtin.set_fact:
+      dcr_annotated: >-
+        {{
+          dcr_annotated | default([]) + [
+            item | combine({
+              'env':     (item.short_description.split('|')[1] | default('') | trim | upper),
+              'is_prod': ((item.short_description.split('|')[1] | default('') | trim | upper) == 'PROD')
+            })
+          ]
+        }}
+    loop: "{{ dcr_all }}"
+    loop_control:
+      label: "{{ item.number }}"
+
+  - name: "0 | Intake summary"
+    ansible.builtin.debug:
+      msg: >-
+        DCR: {{ dcr_annotated | default([]) | length }} tagged change(s) -- {{ dcr_annotated | default([]) | map(attribute='number')
+           | zip(dcr_annotated | default([]) | map(attribute='env')) | list }}.
+        Only changes assigned to '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}' are considered.
+
+  # -- Non-PROD: promote straight to implement (no approval) ------------------
+  # Standard/pre-approved changes must walk the state lifecycle in order
+  # (new -> scheduled -> implement); ServiceNow's "Change Model: Check State
+  # Transition" business rule rejects a direct new -> implement jump. The
+  # servicenow.itsm module also requires assignment_group (and we keep
+  # assigned_to) present on these writes, so both are passed every step.
+  # Non-PROD DCRs need no approval, so we walk both steps here; a WARNING
+  # surfaces any CR the model still refuses instead of silently leaving it New.
+  - name: "0 | Promote NON-PROD new changes to scheduled (step 1 of 2)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - not item.is_prod
+    - item.state == snow_state_new
+    register: dcr_promote_sched
+    failed_when: false
+
+  - name: "0 | Promote NON-PROD changes to implement (step 2 of 2)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - not item.is_prod
+    - item.state in [snow_state_new, snow_state_scheduled]
+    register: dcr_promote_impl
+    failed_when: false
+
+  - name: "0 | WARN about any NON-PROD change that could not be advanced to implement"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.number }} ({{ item.item.env }}) could not be moved to implement: {{ item.msg | default('see ServiceNow change model / required fields') }}. It will remain in its current state and not run this pass.
+    loop: "{{ dcr_promote_impl.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.number | default('skipped') }}"
+    when:
+    - item is not skipped
+    - item.failed | default(false)
+
+  # -- PROD: request approval on new changes (move to assess), do NOT run yet -
+  - name: "0 | Request approval for PROD new changes (state=assess, no CAB)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: assess
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state == snow_state_new
+    - item.approval in ['not requested', 'not_requested', '']
+    failed_when: false
+
+  - name: "0 | Note PROD changes awaiting approval"
+    ansible.builtin.debug:
+      msg: >-
+        PROD change {{ item.number }} requires approval before it will run. It is at Assess with approval requested and will execute on a later pass once approved. CAB is not required.
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }}"
+    when:
+    - item.is_prod
+    - item.state == snow_state_assess
+    - item.approval != 'approved'
+
+  # -- PROD, once APPROVED: walk Assess -> Authorize -> Scheduled -> Implement
+  # The change model refuses each of these hops until the approval is granted,
+  # so these only fire for PROD changes sitting at Assess with approval=approved.
+  - name: "0 | APPROVED PROD: assess -> authorize"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: authorize
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state == snow_state_assess
+    - item.approval == 'approved'
+    failed_when: false
+
+  - name: "0 | APPROVED PROD: authorize -> scheduled"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state in [snow_state_assess, snow_state_authorize]
+    - item.approval == 'approved'
+    failed_when: false
+
+  - name: "0 | APPROVED PROD: scheduled -> implement"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state in [snow_state_assess, snow_state_authorize, snow_state_scheduled]
+    - item.approval == 'approved'
+    failed_when: false
+
+  # -- Re-query for the executable queue -------------------------------------
+  # A change is executable when it is in 'implement' AND (non-PROD, or PROD
+  # whose approval has been granted -- approval not in requested/rejected).
+  - name: "0 | Re-query for the executable queue"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+          ('short_descriptionSTARTSWITHDCR |^state=' + snow_state_implement
+           + '^assignment_group.name=' + snow_assignment_group
+           + '^assigned_to.name=' + snow_assigned_to
+           + '^ORDERBYsys_created_on') | urlencode
+        }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_dcr_max_results | default(500) }}
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: dcr_query2
+    failed_when: false
+
+  - name: "0 | Build executable work list and sys_id map"
+    ansible.builtin.set_fact:
+      snow_work: >-
+        {{
+          dcr_query2.json.result | default([])
+          | rejectattr('approval', 'in', ['requested', 'rejected'])
+          | list
+        }}
+      snow_cr_map: >-
+        {{
+          dict(
+            (dcr_query2.json.result | default([]) | map(attribute='number') | list)
+            | zip(dcr_query2.json.result | default([]) | map(attribute='sys_id') | list)
+          )
+        }}
+
+  - name: "0 | Executable queue"
+    ansible.builtin.debug:
+      msg: >-
+        DCR: {{ snow_work | length }} change(s) ready to execute ({{ snow_work | map(attribute='number') | list | join(', ') | default('none', true) }})
 
   - name: "1 | Abort if no work found"
     ansible.builtin.debug:
-      msg: "No ServiceNow change requests tagged 'DCR |' are ready to execute. Exiting cleanly."
+      msg: "No DCR changes are ready to execute this pass (non-PROD run immediately; PROD run once approved). Exiting cleanly."
     when: snow_work | length == 0
 
   - name: "1 | End play gracefully when queue is empty"
@@ -125,6 +402,26 @@
     loop_control:
       label: "{{ item.item.number }}"
 
+  # A change can carry two attachments with the SAME filename (different
+  # sys_ids). Because each downloads to <change>/<file_name>, duplicates would
+  # collapse onto one path and one script would be silently lost. Warn loudly
+  # so the situation is visible; the .sql files themselves still process.
+  - name: "4 | WARN about duplicate .sql filenames on a change"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.key }} has duplicate .sql attachment name(s): {{ dup_names | join(', ') }}. Only one copy of each name is executed (same-named attachments share a download path). Give each script a unique file name if all must run.
+    loop: "{{ snow_att_src | default([]) }}"
+    loop_control:
+      label: "{{ item.key }}"
+    vars:
+      sql_names: >-
+        {{ item.atts | default([]) | map(attribute='file_name')
+           | select('search', '(?i)\\.sql$') | list }}
+      dup_names: >-
+        {{ sql_names | community.general.counter | dict2items
+           | selectattr('value', 'gt', 1) | map(attribute='key') | list }}
+    when: dup_names | length > 0
+
   - name: "4 | Download .sql attachments from ServiceNow (case-insensitive)"
     ansible.builtin.get_url:
       url: "{{ item.1.download_link }}"
@@ -162,7 +459,13 @@
     # produced identical source/dest paths and caused mv to fail.
     ansible.builtin.shell:
       cmd: >-
-        f="{{ item.dest }}"; mv "$f" "${f%.*}.ssh"
+        f="{{ item.dest }}"; if [ -f "$f" ]; then
+          mv -f "$f" "${f%.*}.ssh";
+        elif [ -f "${f%.*}.ssh" ]; then
+          echo "already renamed";
+        else
+          echo "source missing: $f" >&2; exit 1;
+        fi
     loop: "{{ download_results.results }}"
     loop_control:
       label: "{{ item.item.0.key }} / {{ item.item.1.file_name }} -> {{ item.item.1.file_name | regex_replace('(?i)\\.sql$', '.ssh') }}"
@@ -307,7 +610,7 @@
           exec_stdout_tails | default({}) | combine({
             item.item.issue_key + '/' + (item.item.script_path | basename): (
               item.stdout | default('(no stdout)')
-            ).split('\n') | reject('equalto', '') | list | join('\n---\n')
+            ).splitlines() | reject('equalto', '') | list | join('\n---\n')
           })
         }}
     loop: "{{ exec_results.results | default([]) }}"
@@ -365,12 +668,12 @@
             item.item.item.issue_key + '/' + item.item.item.script_path | basename: {
               'rc': item.item.rc,
               'error_lines': (
-                (item.content | b64decode).split('\n')
+                (item.content | b64decode).splitlines()
                 | select('search', '(ORA-[0-9]+|SP2-[0-9]+|ERROR|WARN)', ignorecase=True)
                 | list
               ),
               'error_count': (
-                (item.content | b64decode).split('\n')
+                (item.content | b64decode).splitlines()
                 | select('search', '(ORA-[0-9]+|SP2-[0-9]+|ERROR|WARN)', ignorecase=True)
                 | list
                 | length
@@ -536,6 +839,27 @@
     when: item.value == 'done'
     failed_when: false
 
+  # A FAILED change must walk implement -> review -> closed exactly like a
+  # successful one. Jumping straight to closed is refused by the change model's
+  # "Check State Transition" business rule, which (with failed_when: false)
+  # silently leaves the change in Implement -- so the next cron pass picks it
+  # up again, re-runs the failing script and raises ANOTHER follow-up, forever.
+  - name: "9 | Move FAILED changes to review (required before closing)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ snow_cr_map[item.key] }}"
+      state: review
+      assignment_group: "{{ snow_assignment_group }}"
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'failed'
+    register: dcr_fail_review
+    failed_when: false
+
   - name: "9 | Close FAILED changes (close_code unsuccessful)"
     servicenow.itsm.change_request:
       instance:
@@ -546,11 +870,27 @@
       state: closed
       close_code: unsuccessful
       close_notes: "Automated DCR execution failed; see work notes, the attached .log files, and the DBA repair follow-up change."
+      assignment_group: "{{ snow_assignment_group }}"
     loop: "{{ issue_outcomes | dict2items }}"
     loop_control:
       label: "{{ item.key }}"
     when: item.value == 'failed'
+    register: dcr_fail_close
     failed_when: false
+
+  # Loud warning if a failed change could NOT be closed. An un-closed change
+  # stays in the intake queue and will be re-executed on the next pass, so this
+  # must never fail silently again.
+  - name: "9 | WARN if a FAILED change could not be closed"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could not be closed ({{ item.msg | default('unknown error') }}). It will remain in the intake queue and be RE-EXECUTED on the next pass, raising another follow-up. Close it manually in ServiceNow.
+    loop: "{{ dcr_fail_close.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - item.failed | default(false)
 
   - name: "10 | Upload execution logs as ServiceNow attachments"
     ansible.builtin.uri:

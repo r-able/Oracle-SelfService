@@ -1,0 +1,751 @@
+---
+# =============================================================================
+# SNOW_PDB_create_pluggable_database.yml
+#
+# ServiceNow -> create an Oracle Pluggable Database (PDB) inside a CDB.
+#
+# CHANGE REQUEST FORMAT
+#   short_description:  PDB | <host> | <CDB_NAME> | <NEW_PDB_TO_CREATE>
+#   e.g.                PDB | lnx001 | CDB1 | SALESPDB
+#
+#   The "PDB |" tag prefix is what the intake query matches on, exactly as the
+#   other six projects use their own tag. The three fields after it are the
+#   host, the container database and the new pluggable database name.
+#
+# Only change requests assigned to snow_assigned_to within
+# snow_assignment_group are touched; everything else is left for humans.
+#
+# BEHAVIOUR
+#   * non-approval flow: a new change is walked new -> scheduled -> implement
+#     and executed on the same pass (matching the DCR non-PROD behaviour).
+#     ServiceNow's change model refuses a direct new -> implement jump, so the
+#     scheduled step is mandatory, not cosmetic.
+#   * if the PDB already exists the creation is SKIPPED and the change is
+#     closed successful with evidence -- re-running is safe and idempotent.
+#   * v$pdbs is captured before and after and attached to the change as proof.
+#   * the PDB admin password is posted in the WORK NOTES only, never written
+#     to the attached log.
+#   * on failure the change is closed unsuccessful and a DBA repair follow-up
+#     change is raised (COMMON_snow_create_followup.yml).
+#
+# Run:
+#   ansible-playbook SNOW_PDB_create_pluggable_database.yml \
+#       --vault-password-file /etc/ansible/.vault_pass
+# =============================================================================
+
+- name: "ServiceNow -> Create Oracle pluggable database -> Close change"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    snow_tag: "PDB"
+    pdb_admin_user: "PDBADMIN"
+    pdb_log_dir: "/tmp/snow_pdb_logs"
+    # A PDB name must be a valid Oracle identifier: start with a letter, then
+    # letters/digits/underscore, 30 characters or fewer.
+    pdb_name_pattern: '^[A-Za-z][A-Za-z0-9_]{0,29}$'
+
+  tasks:
+
+    # =======================================================================
+    # 0. Intake -- find, validate and promote the change requests
+    # =======================================================================
+
+    - name: "0 | Pre-flight: verify instance is awake and credentials valid"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: pdb_preflight
+      failed_when: false
+
+    - name: "0 | Abort with a clear message if the instance is unreachable"
+      ansible.builtin.fail:
+        msg: >-
+          ServiceNow pre-flight failed (HTTP {{ pdb_preflight.status | default('n/a') }}).
+          If the response was not JSON the PDI is probably HIBERNATING -- wake it
+          at https://developer.servicenow.com and re-run. If HTTP 401, check
+          sn_username / sn_password in vars/main.yml.
+      when: pdb_preflight.status | default(0) != 200 or pdb_preflight.json is not defined
+
+    # The state list covers the whole in-flight range so a change stranded
+    # mid-walk by an earlier interrupted run is picked up again rather than
+    # becoming permanently invisible.
+    - name: "0 | Query change requests tagged '{{ snow_tag }} |'"
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+            ('short_descriptionSTARTSWITH' + snow_tag + ' |^stateIN'
+             + snow_state_new + ',' + snow_state_scheduled + ',' + snow_state_implement
+             + '^assignment_group.name=' + snow_assignment_group
+             + '^assigned_to.name=' + snow_assigned_to
+             + '^ORDERBYsys_created_on') | urlencode
+          }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_max_results }}
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: pdb_query
+      failed_when: false
+
+    - name: "0 | Collect tagged change requests"
+      ansible.builtin.set_fact:
+        pdb_all: "{{ pdb_query.json.result | default([]) }}"
+
+    - name: "0 | Intake summary"
+      ansible.builtin.debug:
+        msg: >-
+          {{ snow_tag }}: {{ pdb_all | length }} change request(s) assigned to
+          '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}'
+          ({{ pdb_all | map(attribute='number') | list | join(', ') | default('none', true) }}).
+
+    - name: "0 | Exit cleanly when there is nothing to do"
+      ansible.builtin.meta: end_play
+      when: pdb_all | length == 0
+
+    # --- Parse and validate the spec ------------------------------------
+    - name: "1 | WARN and skip change requests with an unusable spec"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.number }} has an unusable spec
+          (short_description: '{{ item.short_description }}') -- skipping.
+          Expected '{{ snow_tag }} | <host> | <CDB_NAME> | <NEW_PDB>'.
+          {% if p_host not in oracle_instance_map %}Unknown host '{{ p_host }}' (known: {{ oracle_instance_map.keys() | list | join(', ') }}). {% endif %}
+          {% if p_new is not match(pdb_name_pattern) %}'{{ p_new }}' is not a valid PDB name (letter first, then letters/digits/underscore, max 30). {% endif %}
+      loop: "{{ pdb_all }}"
+      loop_control:
+        label: "{{ item.number }}"
+      vars:
+        p_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
+        p_host: "{{ p_parts[1] | default('') }}"
+        p_cdb: "{{ p_parts[2] | default('') | upper }}"
+        p_new: "{{ p_parts[3] | default('') | upper }}"
+      when: >-
+        p_parts | length < 4
+        or p_host not in oracle_instance_map
+        or p_cdb | length == 0
+        or p_new is not match(pdb_name_pattern)
+
+    - name: "1 | Build the PDB creation job list"
+      ansible.builtin.set_fact:
+        pdb_jobs: >-
+          {{
+            pdb_jobs | default([]) + [{
+              'issue_key':   item.number,
+              'sys_id':      item.sys_id,
+              'state':       item.state,
+              'target_host': p_host,
+              'cdb_name':    p_cdb,
+              'pdb_name':    p_new,
+              'oracle_sid':  oracle_instance_map[p_host].oracle_sid,
+              'oracle_home': oracle_instance_map[p_host].oracle_home,
+              'oracle_user': oracle_instance_map[p_host].oracle_user
+            }]
+          }}
+      loop: "{{ pdb_all }}"
+      loop_control:
+        label: "{{ item.number }}"
+      vars:
+        p_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
+        p_host: "{{ p_parts[1] | default('') }}"
+        p_cdb: "{{ p_parts[2] | default('') | upper }}"
+        p_new: "{{ p_parts[3] | default('') | upper }}"
+      when:
+        - p_parts | length >= 4
+        - p_host in oracle_instance_map
+        - p_cdb | length > 0
+        - p_new is match(pdb_name_pattern)
+
+    - name: "1 | Nothing valid to process"
+      ansible.builtin.meta: end_play
+      when: pdb_jobs | default([]) | length == 0
+
+    - name: "1 | Jobs queued"
+      ansible.builtin.debug:
+        msg: "{{ item.issue_key }} -- create PDB {{ item.pdb_name }} in {{ item.cdb_name }} on {{ item.target_host }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+
+    # --- Promote new -> scheduled -> implement ---------------------------
+    # The change model refuses a direct new -> implement jump, so both hops
+    # are required. assignment_group must be a TOP-LEVEL module parameter on
+    # these writes; assigned_to is not a module parameter and goes in `other`.
+    - name: "2 | Promote new changes to scheduled (step 1 of 2)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: scheduled
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when: item.state == snow_state_new
+      failed_when: false
+
+    - name: "2 | Promote changes to implement (step 2 of 2)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: implement
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when: item.state in [snow_state_new, snow_state_scheduled]
+      register: pdb_promote
+      failed_when: false
+
+    - name: "2 | WARN about any change that could not be advanced to implement"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.item.issue_key }} could not be moved to implement:
+          {{ item.msg | default('see the ServiceNow change model') }}.
+          It will not run this pass.
+      loop: "{{ pdb_promote.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.issue_key | default('skipped') }}"
+      when:
+        - item is not skipped
+        - item.failed | default(false)
+
+    - name: "2 | Work note: PDB creation started"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: >-
+            Automated PDB creation STARTED at {{ ansible_date_time.iso8601 }}.
+            Creating pluggable database {{ item.pdb_name }} in container
+            {{ item.cdb_name }} on {{ item.target_host }}. The before/after
+            v$pdbs listings will be attached to this change when it completes.
+        status_code: 200
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      failed_when: false
+
+    # =======================================================================
+    # 3. Inspect the container database
+    # =======================================================================
+
+    - name: "3 | Capture container state, OMF setting and seed datafile path"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export ORACLE_SID={{ item.oracle_sid }}
+          export ORACLE_HOME={{ item.oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOSQL'
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 400 TRIMSPOOL ON
+          SELECT 'CDB=' || CDB FROM v$database;
+          SELECT 'DBNAME=' || name FROM v$database;
+          SELECT 'PDBEXISTS=' || COUNT(*) FROM v$pdbs WHERE UPPER(name) = UPPER('{{ item.pdb_name }}');
+          SELECT 'OMF=' || NVL(MAX(value),'NONE') FROM v$parameter WHERE name = 'db_create_file_dest';
+          SELECT 'SEEDFILE=' || MIN(name) FROM v$datafile WHERE con_id = 2;
+          EXIT;
+          EOSQL
+        executable: /bin/bash
+      delegate_to: "{{ item.target_host }}"
+      become: true
+      become_user: "{{ item.oracle_user }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }} / {{ item.cdb_name }}"
+      register: pdb_precheck
+      changed_when: false
+      failed_when: false
+
+    - name: "3 | Fold the pre-check results into each job"
+      ansible.builtin.set_fact:
+        pdb_jobs: >-
+          {{
+            pdb_jobs
+            | rejectattr('issue_key', 'equalto', item.item.issue_key)
+            | list
+            + [ item.item | combine({
+                  'precheck_rc':     item.rc,
+                  'precheck_out':    item.stdout | default(''),
+                  'is_cdb':          ('CDB=YES' in (item.stdout | default(''))),
+                  'already_exists':  (((item.stdout | default('')).splitlines() | select('match', 'PDBEXISTS=') | map('regex_replace', '^PDBEXISTS=', '') | list | first | default('0') | int) > 0),
+                  'omf_dest':        ((item.stdout | default('')).splitlines() | select('match', 'OMF=') | map('regex_replace', '^OMF=', '') | list | first | default('NONE') | trim),
+                  'seed_file':       ((item.stdout | default('')).splitlines() | select('match', 'SEEDFILE=') | map('regex_replace', '^SEEDFILE=', '') | list | first | default('') | trim)
+                }) ]
+          }}
+      loop: "{{ pdb_precheck.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.issue_key }}"
+
+    - name: "3 | Show what the pre-check found"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.issue_key }}: container is CDB? {{ item.is_cdb }} |
+          {{ item.pdb_name }} already exists? {{ item.already_exists }} |
+          OMF: {{ item.omf_dest }} |
+          {{ 'Will SKIP creation and close successful.' if item.already_exists
+             else ('Will create the PDB.' if item.is_cdb else 'NOT a container database -- will fail for DBA review.') }}
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+
+    # =======================================================================
+    # 4. Create the PDB (only where needed)
+    # =======================================================================
+
+    - name: "4 | Generate a PDB admin password for each job"
+      ansible.builtin.set_fact:
+        pdb_jobs: >-
+          {{
+            pdb_jobs
+            | rejectattr('issue_key', 'equalto', item.issue_key)
+            | list
+            + [ item | combine({
+                  'admin_password': lookup('password', '/dev/null length=16 chars=ascii_letters,digits') + 'Ab1_'
+                }) ]
+          }}
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      no_log: true
+
+    # With FILE_NAME_CONVERT the destination directory must already exist;
+    # under OMF Oracle places the files itself and this is skipped.
+    - name: "4 | Create the datafile directory when OMF is not in use"
+      ansible.builtin.file:
+        path: "{{ (item.seed_file | dirname | dirname) + '/' + item.pdb_name }}"
+        state: directory
+        owner: "{{ item.oracle_user }}"
+        mode: '0750'
+      delegate_to: "{{ item.target_host }}"
+      become: true
+      become_user: root
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when:
+        - item.is_cdb
+        - not item.already_exists
+        - item.omf_dest in ['NONE', '']
+        - item.seed_file | length > 0
+      failed_when: false
+
+    - name: "4 | Create, open and save the state of the pluggable database"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export ORACLE_SID={{ item.oracle_sid }}
+          export ORACLE_HOME={{ item.oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOSQL'
+          WHENEVER SQLERROR EXIT SQL.SQLCODE
+          SET ECHO ON FEEDBACK ON LINESIZE 400 PAGESIZE 200
+          SET SQLBLANKLINES ON
+          CREATE PLUGGABLE DATABASE "{{ item.pdb_name }}" ADMIN USER "{{ pdb_admin_user }}" IDENTIFIED BY "{{ item.admin_password }}"{{ pdb_storage_clause }};
+          ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" OPEN READ WRITE;
+          ALTER SESSION SET CONTAINER = "{{ item.pdb_name }}";
+          GRANT CONNECT, RESOURCE, CREATE SESSION TO "{{ pdb_admin_user }}";
+          ALTER SESSION SET CONTAINER = CDB$ROOT;
+          ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" SAVE STATE;
+          EXIT;
+          EOSQL
+        executable: /bin/bash
+      delegate_to: "{{ item.target_host }}"
+      become: true
+      become_user: "{{ item.oracle_user }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }} / {{ item.pdb_name }}"
+      vars:
+        # Emit FILE_NAME_CONVERT ONLY when we positively know OMF is off AND we
+        # have a real seed path. If omf_dest is empty/NONE, or seed_file is
+        # empty (a parse miss), emit NO clause -- on an OMF database Oracle
+        # names the files itself, and emitting a bogus convert pair is what
+        # produced ORA-01276 before. Fail safe toward "let Oracle decide".
+        pdb_storage_clause: >-
+          {{ (" FILE_NAME_CONVERT = ('" + (item.seed_file | dirname) + "/', '"
+              + (item.seed_file | dirname | dirname) + "/" + item.pdb_name + "/')")
+             if (item.omf_dest in ['NONE', ''] and (item.seed_file | default('') | length) > 0
+                 and (item.seed_file | dirname | dirname | length) > 1)
+             else '' }}
+      register: pdb_create
+      when:
+        - item.is_cdb
+        - not item.already_exists
+      failed_when: false
+      no_log: true          # the CREATE statement contains the admin password
+
+    - name: "4 | Show the creation outcome (no credentials)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.issue_key }} / {{ item.item.pdb_name }}:
+          {{ 'SUCCESS' if item.rc == 0 else 'FAILED (rc=' + (item.rc | string) + ')' }}
+      loop: "{{ pdb_create.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.issue_key | default('skipped') }}"
+      when: item is not skipped
+
+    # =======================================================================
+    # 5. Verify -- capture v$pdbs afterwards as evidence
+    # =======================================================================
+
+    - name: "5 | Capture v$pdbs after the operation"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export ORACLE_SID={{ item.oracle_sid }}
+          export ORACLE_HOME={{ item.oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOSQL'
+          SET HEADING ON FEEDBACK OFF PAGESIZE 200 LINESIZE 200
+          COLUMN name FORMAT A30
+          COLUMN open_mode FORMAT A12
+          COLUMN restricted FORMAT A10
+          SELECT con_id, name, open_mode, restricted FROM v$pdbs ORDER BY con_id;
+          EXIT;
+          EOSQL
+        executable: /bin/bash
+      delegate_to: "{{ item.target_host }}"
+      become: true
+      become_user: "{{ item.oracle_user }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      register: pdb_postcheck
+      changed_when: false
+      failed_when: false
+
+    - name: "5 | Determine the outcome for each change"
+      ansible.builtin.set_fact:
+        pdb_outcomes: >-
+          {{
+            pdb_outcomes | default({}) | combine({
+              item.issue_key: (
+                'done' if (
+                  item.already_exists
+                  or (
+                    item.is_cdb
+                    and ((pdb_create.results | default([])
+                          | selectattr('item.issue_key', 'defined')
+                          | selectattr('item.issue_key', 'equalto', item.issue_key)
+                          | map(attribute='rc') | list | first | default(1)) == 0)
+                  )
+                ) else 'failed'
+              )
+            })
+          }}
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+
+    - name: "5 | Per-change outcome"
+      ansible.builtin.debug:
+        msg: "{{ item.key }} -> {{ item.value | upper }}"
+      loop: "{{ pdb_outcomes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # =======================================================================
+    # 6. Evidence log -- written locally, attached to the change
+    #    The admin password is deliberately NOT included in the log.
+    # =======================================================================
+
+    - name: "6 | Ensure the log directory exists"
+      ansible.builtin.file:
+        path: "{{ pdb_log_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: "6 | Set the run timestamp"
+      ansible.builtin.set_fact:
+        pdb_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+
+    - name: "6 | Write the evidence log for each change"
+      ansible.builtin.copy:
+        dest: "{{ pdb_log_dir }}/PDB_{{ item.issue_key }}_{{ pdb_run_ts }}.log"
+        mode: '0640'
+        content: |
+          Automated Oracle Pluggable Database creation -- evidence log
+          ======================================================================
+          Change request   : {{ item.issue_key }}
+          Host             : {{ item.target_host }}
+          Container (CDB)  : {{ item.cdb_name }}  (ORACLE_SID {{ item.oracle_sid }})
+          New PDB          : {{ item.pdb_name }}
+          Oracle home      : {{ item.oracle_home }}
+          Executed by      : {{ sn_username }} (Ansible automation)
+          Timestamp        : {{ ansible_date_time.iso8601 }}
+          Outcome          : {{ pdb_outcomes[item.issue_key] | upper }}
+          Already existed  : {{ item.already_exists }}
+          Storage          : {{ 'OMF (' + item.omf_dest + ')' if item.omf_dest not in ['NONE',''] else 'FILE_NAME_CONVERT from ' + (item.seed_file | dirname) }}
+          ======================================================================
+          -- Container pre-check --------------------------------------------
+          {{ item.precheck_out | trim }}
+
+          -- Creation output -------------------------------------------------
+          {% for r in pdb_create.results | default([]) if (r.item.issue_key | default('')) == item.issue_key %}
+          rc={{ r.rc }}
+          {{ (r.stdout | default('(no output)')) | trim }}
+          {% if r.rc != 0 %}
+          stderr:
+          {{ (r.stderr | default('(none)')) | trim }}
+          {% endif %}
+          {% else %}
+          (creation skipped -- {{ 'the PDB already existed' if item.already_exists else 'the container check failed' }})
+          {% endfor %}
+
+          -- v$pdbs after the operation --------------------------------------
+          {% for r in pdb_postcheck.results | default([]) if (r.item.issue_key | default('')) == item.issue_key %}
+          {{ (r.stdout | default('(no output)')) | trim }}
+          {% endfor %}
+          ======================================================================
+          NOTE: the PDB admin password is intentionally omitted from this log.
+          It is posted in the work notes on the change request.
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+
+    - name: "6 | Attach the evidence log to the change request"
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+            item.sys_id }}&file_name=PDB_{{ item.issue_key }}_{{ item.pdb_name }}.log
+        method: POST
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers:
+          Content-Type: "text/plain"
+        src: "{{ pdb_log_dir }}/PDB_{{ item.issue_key }}_{{ pdb_run_ts }}.log"
+        status_code: 201
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      register: pdb_log_attach
+      failed_when: false
+
+    - name: "6 | WARN if the evidence log could not be attached"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not attach the evidence log to {{ item.item.issue_key }}
+          (HTTP {{ item.status | default('n/a') }}). The PDB operation itself was
+          unaffected.
+      loop: "{{ pdb_log_attach.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.issue_key | default('skipped') }}"
+      when:
+        - item is not skipped
+        - (item.status | default(0)) != 201
+
+    # =======================================================================
+    # 7. Work notes -- the admin password goes here, and only here
+    # =======================================================================
+
+    - name: "7 | Post the result work note"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: |
+            Automated Oracle PDB creation -- {{ ansible_date_time.iso8601 }}
+            Overall result : {{ pdb_outcomes[item.issue_key] | upper }}
+            Host           : {{ item.target_host }}
+            Container      : {{ item.cdb_name }}
+            Pluggable DB   : {{ item.pdb_name }}
+            {% if item.already_exists %}
+            The pluggable database {{ item.pdb_name }} already existed in
+            {{ item.cdb_name }}; no creation was attempted and nothing was
+            changed. The current v$pdbs listing is attached as proof.
+            {% elif pdb_outcomes[item.issue_key] == 'done' %}
+            The pluggable database was created, opened READ WRITE and its state
+            saved so it re-opens automatically when the container restarts.
+
+            PDB admin user     : {{ pdb_admin_user }}
+            Temporary password : {{ item.admin_password }}
+
+            Please change this password immediately after first use and do not
+            share this work note outside the team.
+            {% else %}
+            The creation FAILED. See the attached evidence log
+            (PDB_{{ item.issue_key }}_{{ item.pdb_name }}.log) for the full
+            SQL*Plus output. A DBA repair follow-up change is being raised.
+            {% endif %}
+            Executed by : {{ sn_username }} (Ansible automation)
+        status_code: 200
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      failed_when: false
+      no_log: true          # the work note body carries the admin password
+
+    - name: "7 | Confirm the work notes were posted"
+      ansible.builtin.debug:
+        msg: "Result work note posted for {{ pdb_jobs | length }} change request(s)."
+
+    # =======================================================================
+    # 8. Close the change requests
+    #    BOTH paths walk implement -> review -> closed. Jumping straight to
+    #    closed is refused by the change model, which would leave the change in
+    #    the intake queue to be re-executed on the next pass.
+    # =======================================================================
+
+    - name: "8 | Move changes to review"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: review
+        assignment_group: "{{ snow_assignment_group }}"
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      failed_when: false
+
+    - name: "8 | Close SUCCESSFUL changes (close_code successful)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: closed
+        close_code: successful
+        assignment_group: "{{ snow_assignment_group }}"
+        close_notes: |-
+          Automated Oracle PDB creation COMPLETED - {{ ansible_date_time.iso8601 }}
+          Host          : {{ item.target_host }}
+          Container     : {{ item.cdb_name }}
+          Pluggable DB  : {{ item.pdb_name }}
+          {% if item.already_exists %}
+          The pluggable database already existed; no action was taken and
+          nothing was changed.
+          {% else %}
+          The pluggable database was created, opened READ WRITE and its state
+          saved. The admin credentials are in the work notes on this change.
+          {% endif %}
+          The v$pdbs evidence is attached as PDB_{{ item.issue_key }}_{{ item.pdb_name }}.log.
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when: pdb_outcomes[item.issue_key] == 'done'
+      register: pdb_close_ok
+      failed_when: false
+
+    - name: "8 | Close FAILED changes (close_code unsuccessful)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: closed
+        close_code: unsuccessful
+        assignment_group: "{{ snow_assignment_group }}"
+        close_notes: |-
+          Automated Oracle PDB creation FAILED - {{ ansible_date_time.iso8601 }}
+          Host          : {{ item.target_host }}
+          Container     : {{ item.cdb_name }}
+          Pluggable DB  : {{ item.pdb_name }}
+          {% if not item.is_cdb %}
+          {{ item.cdb_name }} does not report CDB=YES, so a pluggable database
+          cannot be created in it. Manual DBA review required.
+          {% endif %}
+          See the work notes, the attached evidence log and the DBA repair
+          follow-up change.
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when: pdb_outcomes[item.issue_key] == 'failed'
+      register: pdb_close_fail
+      failed_when: false
+
+    - name: "8 | WARN if a change could not be closed"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.item.issue_key }} could not be closed
+          ({{ item.msg | default('unknown error') }}). It stays in the intake
+          queue and WILL be re-processed on the next pass -- close it manually
+          in ServiceNow.
+      loop: "{{ (pdb_close_ok.results | default([])) + (pdb_close_fail.results | default([])) }}"
+      loop_control:
+        label: "{{ item.item.issue_key | default('skipped') }}"
+      when:
+        - item is not skipped
+        - item.failed | default(false)
+
+    # =======================================================================
+    # 9. DBA repair follow-up for failures
+    # =======================================================================
+
+    - name: "9 | Create a DBA repair follow-up change for FAILED changes"
+      ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+      loop: "{{ pdb_jobs }}"
+      loop_control:
+        loop_var: fu_item
+        label: "{{ fu_item.issue_key }}"
+      when:
+        - snow_followup_enabled | default(true) | bool
+        - pdb_outcomes[fu_item.issue_key] == 'failed'
+      vars:
+        fu_tag: "{{ snow_tag }}"
+        fu_original_number: "{{ fu_item.issue_key }}"
+        fu_original_sys_id: "{{ fu_item.sys_id }}"
+        fu_summary: "could not create PDB {{ fu_item.pdb_name }} in {{ fu_item.cdb_name }} on {{ fu_item.target_host }}"
+        fu_description: |-
+          Automated Oracle pluggable database creation FAILED and the change
+          request has been closed unsuccessful. Please investigate and repair.
+
+          Host            : {{ fu_item.target_host }}
+          Container (CDB) : {{ fu_item.cdb_name }} (ORACLE_SID {{ fu_item.oracle_sid }})
+          New PDB         : {{ fu_item.pdb_name }}
+          Container is CDB: {{ fu_item.is_cdb }}
+          PDB pre-existed : {{ fu_item.already_exists }}
+
+          The full SQL*Plus output and the v$pdbs listing are in the attached
+          evidence log.
+        fu_attach_files:
+          - "{{ pdb_log_dir }}/PDB_{{ fu_item.issue_key }}_{{ pdb_run_ts }}.log"
+
+    # =======================================================================
+    # 10. Summary
+    # =======================================================================
+
+    - name: "10 | Final summary"
+      ansible.builtin.debug:
+        msg:
+          - "======================================================"
+          - "  ServiceNow PDB Creation Summary"
+          - "======================================================"
+          - "  Run timestamp   : {{ ansible_date_time.iso8601 }}"
+          - "  Changes found   : {{ pdb_jobs | length }}"
+          - "  Created         : {{ pdb_jobs | rejectattr('already_exists') | selectattr('issue_key', 'in', pdb_outcomes | dict2items | selectattr('value', 'equalto', 'done') | map(attribute='key') | list) | list | length }}"
+          - "  Already existed : {{ pdb_jobs | selectattr('already_exists') | list | length }}"
+          - "  Failed          : {{ pdb_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length }}"
+          - "  Evidence logs   : {{ pdb_log_dir }}"
+          - "======================================================"

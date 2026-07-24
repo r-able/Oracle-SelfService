@@ -76,6 +76,11 @@
   - vars/main.yml
 
   tasks:
+  - name: "0 | Remove stale per-issue and combined outcome files from any prior run"
+    ansible.builtin.shell:
+      cmd: "rm -f /tmp/snow_patch_outcomes.json /tmp/snow_patch_outcome_*.json"
+    changed_when: false
+
   # ServiceNow intake + shepherd: finds "PAT | ..." change requests, promotes
   # eligible new ones to implement, returns the executable queue in snow_work.
   - name: "0-1 | ServiceNow intake and shepherd for PAT"
@@ -247,7 +252,7 @@
         host: "{{ sn_instance }}"
         username: "{{ sn_username }}"
         password: "{{ sn_password }}"
-      sys_id: "{{ item.sys_id }}"
+      sys_id: "{{ snow_cr_map[item.issue_key] | default(item.sys_id | default('')) }}"
       state: review
     loop: "{{ patch_outcomes }}"
     loop_control:
@@ -261,13 +266,15 @@
         host: "{{ sn_instance }}"
         username: "{{ sn_username }}"
         password: "{{ sn_password }}"
-      sys_id: "{{ item.sys_id }}"
+      sys_id: "{{ snow_cr_map[item.issue_key] | default(item.sys_id | default('')) }}"
       state: closed
       close_code: successful
       close_notes: |-
         Automated Oracle Patching COMPLETED - {{ ansible_date_time.iso8601 }}
         Patch {{ item.patch_number }} on {{ item.target_host }} (SID {{ item.oracle_sid }}).
-        Full lsinventory evidence is in the work notes.
+        {{ item.note | default('') }}
+        Before/after OPatch lsinventory are attached to this change
+        (lsinventory_before_{{ item.patch_number }}.txt / lsinventory_after_{{ item.patch_number }}.txt).
         Please verify database connectivity before resuming workloads.
     loop: "{{ patch_outcomes }}"
     loop_control:
@@ -277,7 +284,7 @@
 
   - name: "11 | Work-note FAILED changes with the failure summary"
     ansible.builtin.uri:
-      url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ snow_cr_map[item.issue_key] | default(item.sys_id | default('')) }}"
       method: PATCH
       user: "{{ sn_username }}"
       password: "{{ sn_password }}"
@@ -302,7 +309,7 @@
         host: "{{ sn_instance }}"
         username: "{{ sn_username }}"
         password: "{{ sn_password }}"
-      sys_id: "{{ item.sys_id }}"
+      sys_id: "{{ snow_cr_map[item.issue_key] | default(item.sys_id | default('')) }}"
       state: closed
       close_code: unsuccessful
       close_notes: "Automated patching failed; see work notes and the DBA repair follow-up change."
@@ -361,7 +368,7 @@
     vars:
       fu_tag: "PAT"
       fu_original_number: "{{ fu_item.issue_key }}"
-      fu_original_sys_id: "{{ fu_item.sys_id }}"
+      fu_original_sys_id: "{{ snow_cr_map[fu_item.issue_key] | default(fu_item.sys_id | default('')) }}"
       fu_summary: "Oracle patch {{ fu_item.patch_number }} failed on {{ fu_item.target_host }} ({{ fu_item.issue_key }})"
       fu_description: |-
         Automated Oracle patching FAILED and the change request has been

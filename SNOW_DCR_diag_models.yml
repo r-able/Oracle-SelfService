@@ -1,0 +1,173 @@
+---
+# Which state walk does each change model actually allow?
+#
+# ServiceNow's out-of-box state models differ by change type:
+#   standard : New -> Scheduled -> Implement -> Review -> Closed
+#              (pre-approved; no assess/authorize)
+#   normal   : New -> Assess -> Authorize -> Scheduled -> Implement -> ...
+#              (from New the only legal forward move is Assess)
+#
+# This creates ONE change of each type and walks the model-appropriate path,
+# reporting every step and the final state. Uses only documented module
+# parameters (assignment_group top-level; no assigned_to).
+#
+# Run:  ansible-playbook SNOW_DCR_diag_models.yml 2>&1 | grep '"msg"'
+# Delete after use. Creates 2 test CRs marked BULK-TEST-CR.
+- name: "Compare standard vs normal state walks"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  # =====================================================================
+  # PATH A -- STANDARD change: New -> Scheduled -> Implement
+  # This is the path non-PROD DCRs need (no approval at all).
+  # =====================================================================
+  - name: "A | Create STANDARD change"
+    servicenow.itsm.change_request:
+      instance: &inst
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      type: standard
+      state: new
+      short_description: "DCR | DEV | standard walk proof"
+      description: "BULK-TEST-CR standard walk proof. Safe to delete."
+      assignment_group: "{{ snow_assignment_group }}"
+    register: a_create
+
+  - name: "A | created"
+    ansible.builtin.debug:
+      msg: "A/standard: created {{ a_create.record.number }} state={{ a_create.record.state }}"
+
+  - name: "A | new -> scheduled"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ a_create.record.sys_id }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+    register: a_sched
+    ignore_errors: true
+
+  - name: "A | scheduled result"
+    ansible.builtin.debug:
+      msg: "A/standard new->scheduled: {{ 'OK' if not (a_sched.failed | default(false)) else ('REJECTED: ' + (a_sched.msg | default('?'))) }}"
+
+  - name: "A | scheduled -> implement"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ a_create.record.sys_id }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+    register: a_impl
+    ignore_errors: true
+
+  - name: "A | implement result"
+    ansible.builtin.debug:
+      msg: "A/standard scheduled->implement: {{ 'OK' if not (a_impl.failed | default(false)) else ('REJECTED: ' + (a_impl.msg | default('?'))) }}"
+
+  - name: "A | re-read"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ a_create.record.sys_id }}?sysparm_fields=number,type,state,approval"
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: a_final
+
+  - name: "A | FINAL"
+    ansible.builtin.debug:
+      msg: "A/standard FINAL {{ a_final.json.result.number }} state={{ a_final.json.result.state }} approval={{ a_final.json.result.approval }}"
+
+  # =====================================================================
+  # PATH B -- NORMAL change: New -> Assess -> Authorize -> Scheduled -> Implement
+  # This is the path PROD DCRs need (approval requested at Assess).
+  # =====================================================================
+  - name: "B | Create NORMAL change"
+    servicenow.itsm.change_request:
+      instance: *inst
+      type: normal
+      state: new
+      short_description: "DCR | PROD | normal walk proof"
+      description: "BULK-TEST-CR normal walk proof. Safe to delete."
+      assignment_group: "{{ snow_assignment_group }}"
+    register: b_create
+
+  - name: "B | created"
+    ansible.builtin.debug:
+      msg: "B/normal: created {{ b_create.record.number }} state={{ b_create.record.state }}"
+
+  - name: "B | new -> assess"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ b_create.record.sys_id }}"
+      state: assess
+      assignment_group: "{{ snow_assignment_group }}"
+    register: b_assess
+    ignore_errors: true
+
+  - name: "B | assess result"
+    ansible.builtin.debug:
+      msg: "B/normal new->assess: {{ 'OK' if not (b_assess.failed | default(false)) else ('REJECTED: ' + (b_assess.msg | default('?'))) }}"
+
+  - name: "B | assess -> authorize"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ b_create.record.sys_id }}"
+      state: authorize
+      assignment_group: "{{ snow_assignment_group }}"
+    register: b_auth
+    ignore_errors: true
+
+  - name: "B | authorize result"
+    ansible.builtin.debug:
+      msg: "B/normal assess->authorize: {{ 'OK' if not (b_auth.failed | default(false)) else ('REJECTED: ' + (b_auth.msg | default('?'))) }}"
+
+  - name: "B | authorize -> scheduled"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ b_create.record.sys_id }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+    register: b_sched
+    ignore_errors: true
+
+  - name: "B | scheduled result"
+    ansible.builtin.debug:
+      msg: "B/normal authorize->scheduled: {{ 'OK' if not (b_sched.failed | default(false)) else ('REJECTED: ' + (b_sched.msg | default('?'))) }}"
+
+  - name: "B | scheduled -> implement"
+    servicenow.itsm.change_request:
+      instance: *inst
+      sys_id: "{{ b_create.record.sys_id }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+    register: b_impl
+    ignore_errors: true
+
+  - name: "B | implement result"
+    ansible.builtin.debug:
+      msg: "B/normal scheduled->implement: {{ 'OK' if not (b_impl.failed | default(false)) else ('REJECTED: ' + (b_impl.msg | default('?'))) }}"
+
+  - name: "B | re-read"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ b_create.record.sys_id }}?sysparm_fields=number,type,state,approval"
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: b_final
+
+  - name: "B | FINAL"
+    ansible.builtin.debug:
+      msg: "B/normal FINAL {{ b_final.json.result.number }} state={{ b_final.json.result.state }} approval={{ b_final.json.result.approval }}"
+
+  - name: "LEGEND"
+    ansible.builtin.debug:
+      msg: "states: -5=new -4=assess -3=authorize -2=scheduled -1=implement 0=review 3=closed"

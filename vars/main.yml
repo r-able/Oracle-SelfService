@@ -8,6 +8,23 @@ sn_password: <REDACTED>
 sn_severity: 2
 sn_priority: 2
 sn_type: standard
+# DCR change types, chosen to match ServiceNow's out-of-box state models
+# (both paths proven against the PDI on 2026-07-23):
+#
+#   standard : New -> Scheduled -> Implement -> Review -> Closed
+#              Pre-approved, no assess/authorize stage. Used for NON-PROD
+#              DCRs, which need no approval and run on the same pass.
+#
+#   normal   : New -> Assess -> Authorize -> Scheduled -> Implement -> ...
+#              From New the only legal forward move is Assess, which sets
+#              approval=requested and holds there until someone approves.
+#              Used for PROD DCRs (approval required; CAB is a separate
+#              change-model setting configured in ServiceNow, not here).
+#
+# A direct new->implement jump is refused by the "Change Model: Check State
+# Transition" business rule on BOTH types -- the states must be walked.
+sn_dcr_type_nonprod: standard
+sn_dcr_type_prod: normal
 template_name: refresh
 ##### ServiceNow conversion settings ################################
 # The change_request table is shared; each project finds its work by
@@ -19,11 +36,19 @@ template_name: refresh
 #   CDP | Vlad Grigorian
 #   UPG | CDB1
 #   DCR | <free title>                 (.sql scripts as attachments)
+#   PDB | lnx001 | CDB1 | TSTPDB01     (provision a new database)
 sn_max_results: 50
+# Automation ownership filter: the SNOW playbooks only act on change requests
+# assigned to snow_assigned_to within snow_assignment_group. Every other CR --
+# including same-tagged ones assigned to a person or another group -- is
+# ignored and left for humans to handle (see COMMON_snow_intake.yml).
+snow_assignment_group: "Database Atlanta"
+snow_assigned_to: "Hyperautomation Platform"
 # Raw state codes of the change_request table (reads via the table API use
 # these; writes go through servicenow.itsm.change_request friendly names)
 snow_state_new: "-5"
 snow_state_assess: "-4"
+snow_state_authorize: "-3"
 snow_state_scheduled: "-2"
 snow_state_implement: "-1"
 snow_state_review: "0"

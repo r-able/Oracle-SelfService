@@ -1,0 +1,134 @@
+---
+# =============================================================================
+# SNOW_cleanup_followup_crs.yml
+#
+# Deletes DBA repair follow-up change requests -- intended for clearing the
+# duplicates produced before the "failed changes never closed" bug was fixed.
+#
+# SAFETY: this playbook is DRY-RUN by default. It lists what it would delete
+# and stops. Nothing is removed until you pass confirm_delete=true.
+#
+#   # 1. see what would go (safe, read-only):
+#   ansible-playbook SNOW_cleanup_followup_crs.yml
+#
+#   # 2. restrict to one project tag if you want (default: all tags):
+#   ansible-playbook SNOW_cleanup_followup_crs.yml -e fu_cleanup_tag=DCR
+#
+#   # 3. actually delete:
+#   ansible-playbook SNOW_cleanup_followup_crs.yml -e confirm_delete=true
+#
+#   # keep the N most recent and delete the rest (default 0 = delete all):
+#   ansible-playbook SNOW_cleanup_followup_crs.yml -e confirm_delete=true -e keep_newest=20
+#
+# Only change requests whose short_description contains
+# "DBA repair required:" are ever considered, so ordinary DCR/REF/PAT/... work
+# and the bulk test changes themselves are never touched.
+# =============================================================================
+
+- name: "Clean up DBA repair follow-up change requests"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    confirm_delete: false        # must be true before anything is deleted
+    fu_cleanup_tag: ""           # optional: REF / DCR / CAU / CDP / PAT / UPG
+    keep_newest: 0               # keep this many newest, delete the remainder
+    fu_cleanup_limit: 2000
+
+  tasks:
+
+    - name: "PRE | Pre-flight: verify instance is awake and credentials valid"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: cl_preflight
+      failed_when: false
+
+    - name: "PRE | Abort if the instance is unreachable"
+      ansible.builtin.fail:
+        msg: >-
+          ServiceNow pre-flight failed (HTTP {{ cl_preflight.status | default('n/a') }}).
+          If the response was not JSON the PDI is probably hibernating -- wake it
+          at https://developer.servicenow.com and re-run.
+      when: cl_preflight.status | default(0) != 200 or cl_preflight.json is not defined
+
+    # The marker is the short_description text every follow-up carries.
+    - name: "1 | Find DBA repair follow-up change requests"
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+            (('short_descriptionSTARTSWITH' + fu_cleanup_tag + ' | DBA repair required:')
+             if (fu_cleanup_tag | length) > 0
+             else 'short_descriptionLIKEDBA repair required:')
+            | urlencode
+          }}&sysparm_fields=sys_id,number,short_description,state,sys_created_on&sysparm_limit={{ fu_cleanup_limit }}
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: cl_query
+
+    - name: "1 | Build the candidate list (newest first)"
+      ansible.builtin.set_fact:
+        cl_all: "{{ cl_query.json.result | default([]) | sort(attribute='sys_created_on', reverse=True) | list }}"
+
+    - name: "1 | Select which ones to delete"
+      ansible.builtin.set_fact:
+        cl_targets: "{{ cl_all[(keep_newest | int):] }}"
+
+    - name: "1 | Report what was found"
+      ansible.builtin.debug:
+        msg:
+          - "Follow-up change requests found : {{ cl_all | length }}"
+          - "Being kept (newest)             : {{ keep_newest }}"
+          - "Selected for deletion           : {{ cl_targets | length }}"
+          - "Tag filter                      : {{ fu_cleanup_tag | default('(all)', true) }}"
+          - "Mode                            : {{ 'DELETE' if (confirm_delete | bool) else 'DRY RUN -- nothing will be removed' }}"
+
+    - name: "1 | Show the first 15 selected"
+      ansible.builtin.debug:
+        msg: "{{ item.number }}  {{ item.short_description | truncate(70) }}  (created {{ item.sys_created_on }})"
+      loop: "{{ cl_targets[:15] }}"
+      loop_control:
+        label: "{{ item.number }}"
+
+    - name: "1 | Stop here unless deletion was explicitly confirmed"
+      ansible.builtin.debug:
+        msg: >-
+          DRY RUN complete. Re-run with -e confirm_delete=true to delete the
+          {{ cl_targets | length }} change request(s) listed above.
+      when: not (confirm_delete | bool)
+
+    - name: "1 | End play after the dry run"
+      ansible.builtin.meta: end_play
+      when: not (confirm_delete | bool)
+
+    - name: "2 | Delete the selected follow-up change requests"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ item.sys_id }}"
+        state: absent
+      loop: "{{ cl_targets }}"
+      loop_control:
+        label: "{{ item.number }}"
+      register: cl_deleted
+      failed_when: false
+
+    - name: "2 | Deletion summary"
+      ansible.builtin.debug:
+        msg:
+          - "Requested for deletion : {{ cl_targets | length }}"
+          - "Deleted successfully   : {{ cl_deleted.results | default([]) | rejectattr('failed', 'defined') | list | length }}"
+          - "Failed                 : {{ cl_deleted.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | list | length }}"

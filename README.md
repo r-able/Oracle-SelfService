@@ -25,24 +25,52 @@ Installation:
 4) Change the following files to match your environment: ./hosts, ./inventory, ./ansible.cfg, ./vars/main.yml, all ./*.sh shell scripts.
 5) Create the cron entries so the LINUX control node will be able to poll your JIRA cloud for new work, and execute it.
 The following is an example of the crontab file.
-# DCR Migration Data Change Request polling JIRA for new tasks every 5 minutes
-*/1 * * * * /etc/ansible/DCR_jira_cron_wrapper.sh >> /tmp/cron.DCR.log 2>&1
+############################JIRA############################################
+# Data Change Request (DCR) polling JIRA for new tasks every 5 minutes
+#*/1 * * * * /etc/ansible/DCR_jira_cron_wrapper.sh >> /tmp/cron.JIRA.DCR.log 2>&1
 # CAU Create New Database User polling JIRA every 5 minutes
-*/1 * * * * /etc/ansible/CAU_jira_cron_wrapper.sh >> /tmp/cron.CAU.log 2>&1
+#*/1 * * * * /etc/ansible/CAU_jira_cron_wrapper.sh >> /tmp/cron.JIRA.CAU.log 2>&1
 # CDP Reset Own Oracle Password polling JIRA every 5 minutes
-*/1 * * * * /etc/ansible/CDP_jira_cron_wrapper.sh >> /tmp/cron.CDP.log 2>&1
+#*/1 * * * * /etc/ansible/CDP_jira_cron_wrapper.sh >> /tmp/cron.JIRA.CDP.log 2>&1
 # REF Refresh Oracle Databases polling JIRA every 5 minutes
-*/1 * * * * /etc/ansible/REF_jira_cron_wrapper.sh >> /tmp/cron.REF.log 2>&1
-# PAT Patch Oracle Database polling JIRA every midnight
-0 * * * * /etc/ansible/PAT_jira_cron_wrapper.sh >> /tmp/cron.PAT.log 2>&1
+#*/1 * * * * /etc/ansible/REF_jira_cron_wrapper.sh >> /tmp/cron.JIRA.REF.log 2>&1
+# PAT Patch Oracle Database polling JIRA every hour
+#0 * * * * /etc/ansible/PAT_jira_cron_wrapper.sh >> /tmp/cron.JIRA.PAT.log 2>&1
 # UPG Upgrade Oracle the Requested Oracle Databases polling JIRA every midnight
-0 0 * * * /etc/ansible/UPG_jira_cron_wrapper.sh  >> /tmp/cron.UPG.log 2>&1
+#0 0 * * * /etc/ansible/UPG_jira_cron_wrapper.sh  >> /tmp/cron.JIRA.UPG.log 2>&1
+###########################END OF JIRA######################################
+###########################SNOW#############################################
+0 * * * * /etc/ansible/UPG_snow_cron_wrapper.sh >> /tmp/cron.SNOW.UPG.log 2>&1
+#*/1 * * * * /etc/ansible/UPG_snow_cron_wrapper.sh >> /tmp/cron.SNOW.UPG.log 2>&1
+*/1 * * * * /etc/ansible/REF_snow_cron_wrapper.sh >> /tmp/cron.SNOW.REF.log 2>&1
+0 * * * * /etc/ansible/PAT_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PAT.log 2>&1
+#*/1 * * * * /etc/ansible/PAT_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PAT.log 2>&1
+*/1 * * * * /etc/ansible/DCR_snow_cron_wrapper.sh >> /tmp/cron.SNOW.DCR.log 2>&1
+*/1 * * * * /etc/ansible/CDP_snow_cron_wrapper.sh >> /tmp/cron.SNOW.CDP.log 2>&1
+*/1 * * * * /etc/ansible/CAU_snow_cron_wrapper.sh >> /tmp/cron.SNOW.CAU.log 2>&1
+*/1 * * * * /etc/ansible/PDB_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PDB.log 2>&1
+###########################END OF SNOW######################################
 6) After testing, it is recommended to encrypt the credentials/variables file ./vars/main.yml with Ansible vault. In such cases the cron entries will have to be changed.
 For example, the unencrypted DCR cron entry
 # DCR Migration Data Change Request polling JIRA for new tasks every 5 minutes
 */1 * * * * /etc/ansible/DCR_jira_cron_wrapper.sh >> /tmp/cron.DCR.log 2>&1
 should be change to as follows (if you are inclined to store the Vault password on disk):
 */1 * * * * ansible-playbook jira_oracle_password_reset.yml --vault-password-file /etc/ansible/.vault_pass >> /tmp/cron.DCR.log 2>&1
+
+ServiceNow implementation:
+Name your Change Requests as follows to kick off the auto-execution:
+##### ServiceNow conversion settings ################################
+# The change_request table is shared; each project finds its work by
+# short_description prefix "<TAG> | <spec...>" (see COMMON_snow_intake.yml).
+# Spec formats after the tag:
+#   REF | PROD:DEV                     (or legacy PRO:HR=>UAT:HR_COPY)
+#   PAT | lnx001:CDB1 | 234234234      (target | patch number)
+#   CAU | Vlad Grigorian | PROD,DEV,SIT
+#   CDP | Vlad Grigorian
+#   UPG | CDB1
+#   DCR | <free title>                 (.sql scripts as attachments)
+#   DB | lnx001 | CDB1 | TSTPDB01      (provision a new database)
+#####################################################################
 
 Logging tree:
 

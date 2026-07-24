@@ -1,0 +1,74 @@
+---
+# Diagnostic: find one New DCR CR and try to advance it, showing the REAL
+# ServiceNow error (no failed_when mask). Tells us exactly what the change
+# model wants. Delete after use.
+- name: "Diagnose DCR promote rejection"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+  tasks:
+    - name: "Find one New DCR change"
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+            ('short_descriptionSTARTSWITHDCR |^state=' + snow_state_new
+             + '^assignment_group.name=' + snow_assignment_group
+             + '^assigned_to.name=' + snow_assigned_to) | urlencode
+          }}&sysparm_fields=sys_id,number,state,type,short_description&sysparm_limit=1
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: diag_q
+
+    - name: "Show the candidate"
+      ansible.builtin.debug:
+        var: diag_q.json.result
+
+    - name: "Abort if none found"
+      ansible.builtin.meta: end_play
+      when: diag_q.json.result | default([]) | length == 0
+
+    - name: "Set target"
+      ansible.builtin.set_fact:
+        diag_cr: "{{ diag_q.json.result[0] }}"
+
+    # Try scheduled first (no mask) -- capture the error if it rejects
+    - name: "Try new -> scheduled (with assignment_group)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ diag_cr.sys_id }}"
+        state: scheduled
+        other:
+          assignment_group: "{{ snow_assignment_group }}"
+          assigned_to: "{{ snow_assigned_to }}"
+      register: diag_sched
+      ignore_errors: true
+
+    - name: "scheduled result"
+      ansible.builtin.debug:
+        msg: "{{ 'OK -> scheduled' if not (diag_sched.failed | default(false)) else ('REJECTED: ' + (diag_sched.msg | default('?'))) }}"
+
+    - name: "Try scheduled -> implement (with assignment_group)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ diag_cr.sys_id }}"
+        state: implement
+        other:
+          assignment_group: "{{ snow_assignment_group }}"
+          assigned_to: "{{ snow_assigned_to }}"
+      register: diag_impl
+      ignore_errors: true
+
+    - name: "implement result"
+      ansible.builtin.debug:
+        msg: "{{ 'OK -> implement' if not (diag_impl.failed | default(false)) else ('REJECTED: ' + (diag_impl.msg | default('?'))) }}"

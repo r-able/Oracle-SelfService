@@ -1,0 +1,77 @@
+---
+# Proof test: create ONE normal-type DCR change request and walk it through
+# new -> scheduled -> implement, showing the real result at each step. If this
+# works, normal changes are the answer and the bulk generator + DCR playbook
+# (both now using sn_dcr_type=normal) will work for all 100. Delete after use.
+- name: "Prove normal-change state progression for DCR"
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/main.yml
+  tasks:
+    - name: "Create a NORMAL test change"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        type: "{{ sn_dcr_type | default('normal') }}"
+        state: new
+        short_description: "DCR | DEV | NORMAL type proof test"
+        description: "BULK-TEST-CR normal-type proof. Safe to delete."
+        assignment_group: "{{ snow_assignment_group }}"
+        assigned_to: "{{ snow_assigned_to }}"
+      register: diag_create
+
+    - name: "Created"
+      ansible.builtin.debug:
+        msg: "Created {{ diag_create.record.number }} ({{ diag_create.record.sys_id }}) type={{ diag_create.record.type }} state={{ diag_create.record.state }}"
+
+    - name: "new -> scheduled"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ diag_create.record.sys_id }}"
+        state: scheduled
+        assignment_group: "{{ snow_assignment_group }}"
+        assigned_to: "{{ snow_assigned_to }}"
+      register: diag_sched
+      ignore_errors: true
+
+    - name: "scheduled result"
+      ansible.builtin.debug:
+        msg: "{{ 'OK -> scheduled' if not (diag_sched.failed | default(false)) else ('REJECTED: ' + (diag_sched.msg | default('?'))) }}"
+
+    - name: "scheduled -> implement"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ diag_create.record.sys_id }}"
+        state: implement
+        assignment_group: "{{ snow_assignment_group }}"
+        assigned_to: "{{ snow_assigned_to }}"
+      register: diag_impl
+      ignore_errors: true
+
+    - name: "implement result"
+      ansible.builtin.debug:
+        msg: "{{ 'OK -> implement' if not (diag_impl.failed | default(false)) else ('REJECTED: ' + (diag_impl.msg | default('?'))) }}"
+
+    - name: "FINAL: re-read the change to confirm its state"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/change_request/{{ diag_create.record.sys_id }}?sysparm_fields=number,type,state"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: diag_final
+
+    - name: "Final state"
+      ansible.builtin.debug:
+        msg: "{{ diag_final.json.result.number }} is now type={{ diag_final.json.result.type }} state={{ diag_final.json.result.state }} (implement = -1)"

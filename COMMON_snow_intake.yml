@@ -6,6 +6,9 @@
 # parse step. The change_request table is shared, so each project finds its
 # work by short_description prefix: "<TAG> | <spec...>".
 #
+# Only change requests assigned to snow_assigned_to within the
+# snow_assignment_group are considered; everything else is left for humans.
+#
 #   state new       -> implement   (standard changes are pre-approved;
 #                                   normal changes only once approval=approved,
 #                                   and new normal CRs get approval requested
@@ -51,6 +54,8 @@
       {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
         ('short_descriptionSTARTSWITH' + snow_tag + ' |^stateIN'
          + snow_state_new + ',' + snow_state_implement
+         + '^assignment_group.name=' + snow_assignment_group
+         + '^assigned_to.name=' + snow_assigned_to
          + '^ORDERBYsys_created_on') | urlencode
       }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_max_results }}
     method: GET
@@ -69,8 +74,10 @@
 - name: "SNOW | {{ snow_tag }} | Intake summary"
   ansible.builtin.debug:
     msg: >-
-      {{ snow_tag }}: {{ snow_all | length }} tagged change request(s)
-      ({{ snow_all | map(attribute='number') | list | join(', ') | default('none', true) }})
+      {{ snow_tag }}: {{ snow_all | length }} change request(s) assigned to
+      '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}'
+      ({{ snow_all | map(attribute='number') | list | join(', ') | default('none', true) }}).
+      CRs assigned to anyone else are ignored and left for humans.
 
 # --- Shepherd: request approval for new NORMAL changes ----------------------
 - name: "SNOW | {{ snow_tag }} | Request approval for new normal changes (state=assess)"
@@ -115,6 +122,8 @@
     url: >-
       {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
         ('short_descriptionSTARTSWITH' + snow_tag + ' |^state=' + snow_state_implement
+         + '^assignment_group.name=' + snow_assignment_group
+         + '^assigned_to.name=' + snow_assigned_to
          + '^ORDERBYsys_created_on') | urlencode
       }}&sysparm_fields=sys_id,number,short_description,description,state,approval&sysparm_limit={{ sn_max_results }}
     method: GET

@@ -20,6 +20,36 @@
 # Every task is failure-tolerant.
 # =============================================================================
 
+# Idempotency guard: never raise a second follow-up for the same original
+# change. The description of every follow-up carries the marker line
+# "Original failed change : <number>", so one query tells us whether a
+# follow-up already exists. Without this, any situation that causes the
+# original change to be processed twice (for example a close that the change
+# model refuses, leaving it in the intake queue) would raise a fresh follow-up
+# on every pass.
+- name: "FUP | {{ fu_original_number }} | Check whether a follow-up already exists"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+        ('descriptionLIKEOriginal failed change : ' + fu_original_number) | urlencode
+      }}&sysparm_fields=number&sysparm_limit=1
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: fu_existing
+  failed_when: false
+
+- name: "FUP | {{ fu_original_number }} | Skip creation when a follow-up is already open"
+  ansible.builtin.debug:
+    msg: >-
+      A DBA repair follow-up already exists for {{ fu_original_number }}
+      ({{ fu_existing.json.result[0].number | default('unknown') }}) --
+      not creating another one.
+  when: (fu_existing.json.result | default([]) | length) > 0
+
 - name: "FUP | {{ fu_original_number }} | Check which failure log files exist"
   ansible.builtin.stat:
     path: "{{ item }}"
@@ -27,6 +57,7 @@
   loop_control:
     label: "{{ item | basename }}"
   register: fu_attach_stat
+  when: (fu_existing.json.result | default([]) | length) == 0
 
 - name: "FUP | {{ fu_original_number }} | Create DBA repair follow-up change request"
   servicenow.itsm.change_request:
@@ -37,12 +68,20 @@
     type: "{{ sn_type }}"
     state: new
     short_description: "{{ fu_tag }} | DBA repair required: {{ fu_summary }}"
+    # Route the repair to the DBA group for a HUMAN to handle: same assignment
+    # group as the automation, but deliberately NOT assigned to the automation
+    # user. The intake filter requires assigned_to == snow_assigned_to, so
+    # leaving assigned_to empty guarantees the automation will never pick its
+    # own follow-up back up and try to execute it as a request.
+    other:
+      assignment_group: "{{ snow_assignment_group }}"
+      assigned_to: ""
     description: |
       {{ fu_description }}
 
       ----
       Original failed change : {{ fu_original_number }}
-      Assigned team          : Database Administrators
+      Assigned team          : {{ snow_assignment_group }} (Database Administrators) -- human action required
       Raised automatically by Ansible at {{ '%Y-%m-%dT%H:%M:%S' | strftime }}.
 
       The failure logs are attached to this change request. See also the work
@@ -54,6 +93,7 @@
         | map(attribute='item') | map('community.general.dict_kv', 'path') | list
       }}
   register: fu_create_result
+  when: (fu_existing.json.result | default([]) | length) == 0
   failed_when: false
 
 - name: "FUP | {{ fu_original_number }} | Record follow-up number"
@@ -65,7 +105,9 @@
     msg: >-
       WARNING: could not create DBA follow-up change request for
       {{ fu_original_number }}: {{ fu_create_result.msg | default('unknown error') }}
-  when: fu_created_number | length == 0
+  when:
+  - (fu_existing.json.result | default([]) | length) == 0
+  - fu_created_number | length == 0
 
 - name: "FUP | {{ fu_original_number }} | Work-note the original change with the follow-up reference"
   ansible.builtin.uri:

@@ -97,9 +97,7 @@
   - name: "2 | WARN and skip changes with a missing user name or databases"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.number }} is missing the user name or database list
-        (short_description: '{{ item.short_description }}') -- skipping.
-        Expected 'CAU | Full Name | DB1,DB2'.
+        WARNING: {{ item.number }} is missing the user name or database list (short_description: '{{ item.short_description }}') -- skipping. Expected 'CAU | Full Name | DB1,DB2'.
     loop: "{{ snow_work }}"
     loop_control:
       label: "{{ item.number }}"
@@ -181,13 +179,7 @@
           issues_to_process | default([])
           | rejectattr('issue_key', 'equalto', item.item.issue_key)
           | list
-          + [{
-              'issue_key':    item.item.issue_key,
-              'oracle_user':  item.item.oracle_user,
-              'display_name': item.item.display_name,
-              'target_dbs':   item.item.target_dbs,
-              'new_password': item.stdout
-            }]
+          + [ item.item | combine({ 'new_password': item.stdout }) ]
         }}
     loop: "{{ generated_passwords.results | default([]) }}"
     loop_control:
@@ -297,6 +289,85 @@
     loop: "{{ oracle_create_results.results | default([]) }}"
     loop_control:
       label: "{{ item.item.0.issue_key }} / {{ item.item.1 }}"
+
+  # -- 4c. Write a per-change execution log and attach it to the change ------
+  # The log records the per-database outcome (rc, stdout, stderr) so the change
+  # request carries durable evidence of what the automation actually did.
+  # The temporary password is deliberately NOT written to the log -- it goes in
+  # the work note only.
+
+  - name: "4c | Set log run timestamp"
+    ansible.builtin.set_fact:
+      cau_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+
+  - name: "4c | Ensure the CAU log directory exists on the controller"
+    ansible.builtin.file:
+      path: "{{ cau_log_dir | default('/tmp/snow_cau_logs') }}"
+      state: directory
+      mode: '0750'
+
+  - name: "4c | Write the execution log for each change"
+    ansible.builtin.copy:
+      dest: "{{ cau_log_dir | default('/tmp/snow_cau_logs') }}/CAU_{{ item.issue_key }}_{{ cau_run_ts }}.log"
+      mode: '0640'
+      content: |
+        Automated Oracle User Provisioning -- execution log
+        ======================================================================
+        Change request  : {{ item.issue_key }}
+        Full name       : {{ item.display_name }}
+        Oracle username : {{ item.oracle_user }}
+        Databases       : {{ item.target_dbs | join(', ') }}
+        Executed by     : {{ sn_username }} (Ansible automation)
+        Timestamp       : {{ ansible_date_time.iso8601 }}
+        ======================================================================
+        {% for r in oracle_create_results.results | default([]) if r.item.0.issue_key == item.issue_key %}
+        --- {{ r.item.1 }} : {{ 'SUCCESS' if r.rc == 0 else 'FAILED' }} (rc={{ r.rc }}) ---
+        stdout:
+        {{ r.stdout | default('(none)') | trim }}
+        {% if r.rc != 0 %}
+        stderr:
+        {{ r.stderr | default('(none)') | trim }}
+        {% endif %}
+
+        {% endfor %}
+        ======================================================================
+        NOTE: the temporary password is intentionally omitted from this log.
+        It is posted in the work notes on the change request.
+    loop: "{{ issues_to_process | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.target_dbs | length > 0
+
+  - name: "4c | Upload the execution log to the change request"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+          item.sys_id }}&file_name=CAU_{{ item.issue_key }}_execution.log
+      method: POST
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      headers:
+        Content-Type: "text/plain"
+      src: "{{ cau_log_dir | default('/tmp/snow_cau_logs') }}/CAU_{{ item.issue_key }}_{{ cau_run_ts }}.log"
+      status_code: 201
+    loop: "{{ issues_to_process | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.target_dbs | length > 0
+    register: cau_log_upload
+    failed_when: false
+
+  - name: "4c | WARN if an execution log could not be attached"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: could not attach the execution log to {{ item.item.issue_key }} (HTTP {{ item.status | default('n/a') }}). The provisioning itself was unaffected.
+    loop: "{{ cau_log_upload.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - (item.status | default(0)) != 201
 
   # -- 5. Post worklog entry summarising all database outcomes ---------------
   # One worklog entry per issue, listing every database attempted with its
@@ -412,16 +483,21 @@
       mode: '0700'
     register: worklog_script_file
 
-  - name: "5b | Execute the worklog-posting script against the payload file"
+  - name: "5b | Execute the work-note-posting script against the payload file"
     ansible.builtin.command:
       cmd: "python3 {{ worklog_script_file.dest }} {{ worklog_payload_file.dest }}"
     register: worklog_post_result
-    no_log: true
-    ignore_errors: true
+    failed_when: false
 
-  - name: "5c | Show worklog posting outcome (sanitised)"
+  - name: "5c | Show work-note posting outcome (status lines only, no credentials)"
     ansible.builtin.debug:
       msg: "{{ worklog_post_result.stdout_lines | default(['(no output)']) }}"
+
+  - name: "5c | WARN if the work-note script failed"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: the work-note posting script exited rc={{ worklog_post_result.rc | default('?') }}. The result summary was NOT posted to the change request(s). stderr: {{ worklog_post_result.stderr | default('(none)') | trim }}
+    when: (worklog_post_result.rc | default(0)) != 0
 
   - name: "5d | Clean up temp payload and script files"
     ansible.builtin.file:
@@ -498,7 +574,18 @@
       close_code: successful
       close_notes: |-
         Automated Oracle user provisioning COMPLETED - {{ ansible_date_time.iso8601 }}
-        The user's credentials are in the work notes on this change.
+        {% for i in issues_to_process | default([]) if i.issue_key == item.key %}
+        User            : {{ i.display_name }}
+        Oracle username : {{ i.oracle_user }}
+        Databases       : {{ i.target_dbs | join(', ') }}
+        Privileges      : CONNECT, DBA
+        Per-database results:
+        {% for r in oracle_create_results.results | default([]) if r.item.0.issue_key == item.key %}
+          - {{ r.item.1 }}: {{ 'SUCCESS' if r.rc == 0 else 'FAILED (rc=' + (r.rc | string) + ')' }}
+        {% endfor %}
+        {% endfor %}
+        The temporary password is in the work notes on this change.
+        The full execution log is attached as CAU_{{ item.key }}_execution.log.
         Please log in and change the temporary password immediately.
     loop: "{{ issue_outcomes | dict2items }}"
     loop_control:
@@ -536,7 +623,18 @@
       sys_id: "{{ snow_cr_map[item.key] }}"
       state: closed
       close_code: unsuccessful
-      close_notes: "Automated user provisioning failed; see work notes and the DBA repair follow-up change."
+      close_notes: |-
+        Automated Oracle user provisioning FAILED - {{ ansible_date_time.iso8601 }}
+        {% for i in issues_to_process | default([]) if i.issue_key == item.key %}
+        User            : {{ i.display_name }}
+        Oracle username : {{ i.oracle_user }}
+        Per-database results:
+        {% for r in oracle_create_results.results | default([]) if r.item.0.issue_key == item.key %}
+          - {{ r.item.1 }}: {{ 'SUCCESS' if r.rc == 0 else 'FAILED (rc=' + (r.rc | string) + ')' }}
+        {% endfor %}
+        {% endfor %}
+        The full execution log is attached as CAU_{{ item.key }}_execution.log.
+        See the work notes and the DBA repair follow-up change for details.
     loop: "{{ issue_outcomes | dict2items }}"
     loop_control:
       label: "{{ item.key }}"
