@@ -1,0 +1,505 @@
+---
+# PRF_snow_performance_analysis_job.yml - included per CR by
+# PRF_snow_performance_analysis.yml
+
+- name: "JOB | {{ job.issue_key }} | Unknown host - skip this CR"
+  ansible.builtin.meta: end_host
+  when: job.target_host not in oracle_instance_map
+
+- name: "JOB | {{ job.issue_key }} | Resolve Oracle home/user from oracle_instance_map"
+  ansible.builtin.set_fact:
+    prf_oracle_home: "{{ oracle_instance_map[job.target_host].oracle_home }}"
+    prf_oracle_user: "{{ oracle_instance_map[job.target_host].oracle_user }}"
+
+- name: "JOB | {{ job.issue_key }} | Set per-job facts"
+  ansible.builtin.set_fact:
+    prf_work_dir: "/tmp/snow_prf_run/{{ job.oracle_sid }}_{{ job.issue_key }}"
+    prf_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    prf_success: true
+    prf_fail_reason: ""
+    prf_top_sql: []
+
+- name: "JOB | {{ job.issue_key }} | Work note: analysis started"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ job.sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      work_notes: >-
+        PRF: AWR performance analysis started for {{ job.oracle_sid }} on
+        {{ job.target_host }}, issue period {{ job.start_dt }} -> {{ job.end_dt }}.
+    status_code: 200
+  failed_when: false
+
+# -----------------------------------------------------------------
+# Working directory - same lesson learned from DDP: the leaf directory
+# must be world-writable (0777) for oracle to create files in it, and the
+# base directory must exist too, since every ancestor needs traversal
+# permission.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Ensure base working directory exists"
+  ansible.builtin.file:
+    path: "/tmp/snow_prf_run"
+    state: directory
+    mode: '0755'
+  delegate_to: "{{ job.target_host }}"
+
+- name: "JOB | {{ job.issue_key }} | Ensure per-job working directory exists and is writable"
+  ansible.builtin.file:
+    path: "{{ prf_work_dir }}"
+    state: directory
+    mode: '0777'
+  delegate_to: "{{ job.target_host }}"
+
+# -----------------------------------------------------------------
+# 0. Resolve the user-given start/end date-time into the bracketing AWR
+#    snapshot IDs. Non-technical end users specify WHEN the issue
+#    happened, not raw snapshot IDs - this is the "behind the scenes"
+#    lookup that spares them from ever needing to know DBA_HIST_SNAPSHOT
+#    exists. begin_snap = last snapshot AT OR BEFORE the start time;
+#    end_snap = first snapshot AT OR AFTER the end time, so the resolved
+#    range fully brackets the requested period.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Write snapshot-resolution SQL"
+  ansible.builtin.copy:
+    dest: "{{ prf_work_dir }}/resolve_snapshots.sql"
+    mode: '0644'
+    content: |
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+      WHENEVER SQLERROR EXIT SQL.SQLCODE
+      SELECT 'BEGIN_SNAP=' || NVL(TO_CHAR(MAX(snap_id)), 'NONE')
+      FROM dba_hist_snapshot
+      WHERE end_interval_time <= TO_DATE('{{ job.start_dt }}', 'YYYY-MM-DD HH24:MI:SS')
+        AND dbid = (SELECT dbid FROM v$database);
+      SELECT 'END_SNAP=' || NVL(TO_CHAR(MIN(snap_id)), 'NONE')
+      FROM dba_hist_snapshot
+      WHERE end_interval_time >= TO_DATE('{{ job.end_dt }}', 'YYYY-MM-DD HH24:MI:SS')
+        AND dbid = (SELECT dbid FROM v$database);
+      EXIT;
+  delegate_to: "{{ job.target_host }}"
+
+- name: "JOB | {{ job.issue_key }} | Write snapshot-resolution wrapper (explicit ORACLE_SID export)"
+  ansible.builtin.copy:
+    dest: "{{ prf_work_dir }}/run_resolve_snapshots.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      export ORACLE_SID={{ job.oracle_sid }}
+      export ORACLE_HOME={{ prf_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/resolve_snapshots.sql
+  delegate_to: "{{ job.target_host }}"
+
+- name: "JOB | {{ job.issue_key }} | Resolve snapshot IDs as oracle"
+  ansible.builtin.command: "bash {{ prf_work_dir }}/run_resolve_snapshots.sh"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ prf_oracle_user }}"
+  register: prf_resolve_exec
+  failed_when: false
+  changed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Parse resolved snapshot IDs"
+  ansible.builtin.set_fact:
+    prf_begin_snap: >-
+      {{ (prf_resolve_exec.stdout_lines | default([]) | select('match', '^BEGIN_SNAP=') | list | first | default('BEGIN_SNAP=NONE')) | regex_replace('^BEGIN_SNAP=', '') }}
+    prf_end_snap: >-
+      {{ (prf_resolve_exec.stdout_lines | default([]) | select('match', '^END_SNAP=') | list | first | default('END_SNAP=NONE')) | regex_replace('^END_SNAP=', '') }}
+
+- name: "JOB | {{ job.issue_key }} | Fail cleanly if no bracketing snapshots were found"
+  ansible.builtin.set_fact:
+    prf_success: false
+    prf_fail_reason: >-
+      Could not find AWR snapshots covering {{ job.start_dt }} -> {{ job.end_dt }}
+      for {{ job.oracle_sid }} on {{ job.target_host }} (rc={{ prf_resolve_exec.rc }},
+      begin_snap={{ prf_begin_snap }}, end_snap={{ prf_end_snap }}). This usually means
+      the requested time period is outside the AWR retention window, or no snapshots
+      exist yet for that period. Raw output:
+      {{ (prf_resolve_exec.stdout | default('')) | truncate(1000) }}
+      {{ (prf_resolve_exec.stderr | default('')) | truncate(500) }}
+  when: >-
+    prf_resolve_exec.rc != 0
+    or prf_begin_snap == 'NONE'
+    or prf_end_snap == 'NONE'
+    or prf_begin_snap | length == 0
+    or prf_end_snap | length == 0
+
+- name: "JOB | {{ job.issue_key }} | Show resolved snapshot range"
+  ansible.builtin.debug:
+    msg: "{{ job.start_dt }} -> {{ job.end_dt }} resolved to snapshots {{ prf_begin_snap }} -> {{ prf_end_snap }}"
+  when: prf_success
+
+# -----------------------------------------------------------------
+# 1. AWR text report - human-readable evidence, attached as-is. DBID and
+#    instance_number are looked up dynamically rather than assumed.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Write AWR report SQL"
+  ansible.builtin.copy:
+    dest: "{{ prf_work_dir }}/awr_report.sql"
+    mode: '0644'
+    content: |
+      SET PAGESIZE 0
+      SET LINESIZE 200
+      SET LONG 1000000
+      SET LONGCHUNKSIZE 1000000
+      SET TRIMSPOOL ON
+      SET FEEDBACK OFF
+      SET ECHO OFF
+      SPOOL {{ prf_work_dir }}/awr_report.log
+      WHENEVER SQLERROR EXIT SQL.SQLCODE
+      SELECT output
+      FROM TABLE(
+        DBMS_WORKLOAD_REPOSITORY.awr_report_text(
+          (SELECT dbid FROM v$database),
+          (SELECT instance_number FROM v$instance),
+          {{ prf_begin_snap }},
+          {{ prf_end_snap }}
+        )
+      );
+      SPOOL OFF
+      EXIT;
+  delegate_to: "{{ job.target_host }}"
+  when: prf_success
+
+# -----------------------------------------------------------------
+# 2. Top-5 CPU SQL_IDs - queried directly from DBA_HIST_SQLSTAT rather
+#    than parsed out of the AWR report text (far more reliable). Output
+#    is a plain "SQL_ID|CPU_SECONDS" line per row for easy parsing.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Write top-5 CPU SQL_ID query"
+  ansible.builtin.copy:
+    dest: "{{ prf_work_dir }}/top5.sql"
+    mode: '0644'
+    content: |
+      SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+      WHENEVER SQLERROR EXIT SQL.SQLCODE
+      SELECT sql_id || '|' || ROUND(total_cpu / 1000000, 2)
+      FROM (
+        SELECT sql_id, SUM(cpu_time_delta) AS total_cpu
+        FROM dba_hist_sqlstat
+        WHERE snap_id BETWEEN {{ prf_begin_snap }} AND {{ prf_end_snap }}
+        GROUP BY sql_id
+        ORDER BY total_cpu DESC
+      )
+      WHERE ROWNUM <= 5;
+      EXIT;
+  when: prf_success
+
+- name: "JOB | {{ job.issue_key }} | Write execution wrapper (explicit ORACLE_SID export)"
+  ansible.builtin.copy:
+    dest: "{{ prf_work_dir }}/run_awr_and_top5.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      export ORACLE_SID={{ job.oracle_sid }}
+      export ORACLE_HOME={{ prf_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/awr_report.sql
+      "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/top5.sql
+  delegate_to: "{{ job.target_host }}"
+  when: prf_success
+
+- name: "JOB | {{ job.issue_key }} | Run AWR report + top-5 query as oracle"
+  ansible.builtin.command: "bash {{ prf_work_dir }}/run_awr_and_top5.sh"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ prf_oracle_user }}"
+  register: prf_top5_exec
+  failed_when: false
+  changed_when: true
+  when: prf_success
+
+- name: "JOB | {{ job.issue_key }} | Parse top-5 SQL_IDs from output"
+  ansible.builtin.set_fact:
+    prf_top_sql:
+      "{{ (prf_top5_exec.stdout_lines | default([]))
+          | select('match', '^[A-Za-z0-9_$]+\\|[0-9.]+$')
+          | map('regex_replace', '^([A-Za-z0-9_$]+)\\|([0-9.]+)$', '{\"sql_id\": \"\\1\", \"cpu_secs\": \\2}')
+          | map('from_json')
+          | list }}"
+  when: prf_success
+
+- name: "JOB | {{ job.issue_key }} | Determine whether top-5 extraction succeeded"
+  ansible.builtin.set_fact:
+    prf_success: false
+    prf_fail_reason: >-
+      Could not extract any SQL_IDs from DBA_HIST_SQLSTAT for the resolved
+      snapshot range. rc={{ prf_top5_exec.rc | default('n/a') }}. Check that
+      BEGIN_SNAP ({{ prf_begin_snap | default('n/a') }}) and END_SNAP
+      ({{ prf_end_snap | default('n/a') }}) are valid, that AWR snapshots
+      exist for that range, and that the Tuning and Diagnostics Pack is
+      licensed on this database. Raw output:
+      {{ (prf_top5_exec.stdout | default('')) | truncate(1500) }}
+      {{ (prf_top5_exec.stderr | default('')) | truncate(500) }}
+  when: prf_success and (prf_top5_exec.rc | default(1) != 0 or prf_top_sql | default([]) | length == 0)
+
+- name: "JOB | {{ job.issue_key }} | Show top SQL_IDs found"
+  ansible.builtin.debug:
+    msg: "{{ item.sql_id }}: {{ item.cpu_secs }}s CPU"
+  loop: "{{ prf_top_sql }}"
+  loop_control:
+    label: "{{ item.sql_id }}"
+  when: prf_success
+
+# -----------------------------------------------------------------
+# 3. SQL Tuning Advisor per SQL_ID - execute_tuning_task only PRODUCES
+#    ADVICE. It never applies an index or SQL Profile itself.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Write and run SQL Tuning Advisor for each SQL_ID"
+  when: prf_success
+  block:
+
+    - name: "JOB | {{ job.issue_key }} | Write tuning advisor script for {{ item.sql_id }}"
+      ansible.builtin.copy:
+        dest: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.sql"
+        mode: '0644'
+        content: |
+          SET PAGESIZE 0
+          SET LINESIZE 200
+          SET LONG 1000000
+          SET LONGCHUNKSIZE 1000000
+          SET TRIMSPOOL ON
+          SET FEEDBACK OFF
+          SET ECHO OFF
+          SPOOL {{ prf_work_dir }}/tune_{{ item.sql_id }}.log
+          -- Drop any stale task from a previous run of this same CR; ignore
+          -- the error if it does not exist yet.
+          BEGIN
+            DBMS_SQLTUNE.drop_tuning_task(task_name => 'PRF_{{ item.sql_id }}_{{ job.issue_key }}');
+          EXCEPTION WHEN OTHERS THEN NULL;
+          END;
+          /
+          DECLARE
+            l_task VARCHAR2(100);
+          BEGIN
+            l_task := DBMS_SQLTUNE.create_tuning_task(
+              sql_id     => '{{ item.sql_id }}',
+              task_name  => 'PRF_{{ item.sql_id }}_{{ job.issue_key }}',
+              time_limit => 300);
+            DBMS_SQLTUNE.execute_tuning_task(task_name => l_task);
+          END;
+          /
+          SELECT DBMS_SQLTUNE.report_tuning_task('PRF_{{ item.sql_id }}_{{ job.issue_key }}')
+          FROM dual;
+          SPOOL OFF
+          EXIT;
+      delegate_to: "{{ job.target_host }}"
+      loop: "{{ prf_top_sql }}"
+      loop_control:
+        label: "{{ item.sql_id }}"
+
+    - name: "JOB | {{ job.issue_key }} | Execute tuning advisor for {{ item.sql_id }}"
+      ansible.builtin.command: >-
+        bash -c "export ORACLE_SID={{ job.oracle_sid }};
+        export ORACLE_HOME={{ prf_oracle_home }};
+        export PATH=$ORACLE_HOME/bin:$PATH;
+        \"$ORACLE_HOME/bin/sqlplus\" -S / AS SYSDBA @{{ prf_work_dir }}/tune_{{ item.sql_id }}.sql"
+      delegate_to: "{{ job.target_host }}"
+      become: true
+      become_user: "{{ prf_oracle_user }}"
+      loop: "{{ prf_top_sql }}"
+      loop_control:
+        label: "{{ item.sql_id }}"
+      register: prf_tune_exec
+      failed_when: false
+      changed_when: true
+
+    - name: "JOB | {{ job.issue_key }} | Read each tuning advisor report"
+      ansible.builtin.slurp:
+        src: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.log"
+      delegate_to: "{{ job.target_host }}"
+      loop: "{{ prf_top_sql }}"
+      loop_control:
+        label: "{{ item.sql_id }}"
+      register: prf_tune_logs
+      ignore_errors: true
+
+    - name: "JOB | {{ job.issue_key }} | Build a one-line recommendation summary per SQL_ID"
+      ansible.builtin.set_fact:
+        prf_recommendations: >-
+          {{ prf_recommendations | default([]) + [ {
+               'sql_id':     prf_top_sql[idx].sql_id,
+               'cpu_secs':   prf_top_sql[idx].cpu_secs,
+               'report_text': (prf_tune_logs.results[idx].content | default('') | b64decode),
+               'flag': (
+                 'SQL Profile suggested'
+                 if 'ACCEPT_SQL_PROFILE' in (prf_tune_logs.results[idx].content | default('') | b64decode).upper()
+                 or 'SQL PROFILE' in (prf_tune_logs.results[idx].content | default('') | b64decode).upper()
+                 else ('New index suggested'
+                       if 'CREATE INDEX' in (prf_tune_logs.results[idx].content | default('') | b64decode).upper()
+                       else 'No significant recommendation found')
+               )
+             } ] }}
+      loop: "{{ prf_top_sql }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.sql_id }}"
+
+- name: "JOB | {{ job.issue_key }} | Determine outcome when tuning step was skipped"
+  ansible.builtin.set_fact:
+    prf_recommendations: []
+  when: not prf_success
+
+# -----------------------------------------------------------------
+# 4. Attach evidence (AWR report + every tuning report) to the analysis CR
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Attach AWR report to the change request"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+        job.sys_id }}&file_name=PRF_{{ job.issue_key }}_awr_report.log
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "text/plain"
+    src: "{{ prf_work_dir }}/awr_report.log"
+    remote_src: true
+    status_code: 201
+  delegate_to: "{{ job.target_host }}"
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Attach each tuning report to the change request"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+        job.sys_id }}&file_name=PRF_{{ job.issue_key }}_tune_{{ item.sql_id }}.log
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "text/plain"
+    src: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.log"
+    remote_src: true
+    status_code: 201
+  delegate_to: "{{ job.target_host }}"
+  loop: "{{ prf_top_sql }}"
+  loop_control:
+    label: "{{ item.sql_id }}"
+  when: prf_success
+  failed_when: false
+
+# -----------------------------------------------------------------
+# 5. Work note + close the analysis CR
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Post analysis summary work note"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ job.sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      work_notes: |-
+        PRF analysis {{ 'COMPLETE' if prf_success else 'FAILED' }} for {{ job.oracle_sid }} on {{ job.target_host }}.
+        {% if prf_success %}
+        Top CPU-consuming SQL for issue period {{ job.start_dt }} -> {{ job.end_dt }}
+        (AWR snapshots {{ prf_begin_snap }} -> {{ prf_end_snap }}):
+        {% for r in prf_recommendations %}
+        - SQL_ID {{ r.sql_id }} - {{ r.cpu_secs }}s CPU - {{ r.flag }}
+        {% endfor %}
+
+        Full AWR report and per-SQL_ID tuning advisor reports are attached.
+        A separate follow-up change is being opened for the DBA team to
+        review these recommendations and implement any fix, subject to
+        your normal approval process. Ansible has NOT modified the
+        database - execute_tuning_task only produces advice.
+        {% else %}
+        {{ prf_fail_reason }}
+        {% endif %}
+    status_code: 200
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Walk Implement -> Review"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ job.sys_id }}"
+    state: review
+    assignment_group: "{{ snow_assignment_group }}"
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Close successful"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ job.sys_id }}"
+    state: closed
+    close_code: successful
+    close_notes: >-
+      PRF analysis completed for {{ job.oracle_sid }} on {{ job.target_host }}
+      (issue period {{ job.start_dt }} -> {{ job.end_dt }}). See work notes
+      and attached AWR/tuning reports. A follow-up change has been opened
+      for the DBA team to review and implement any recommended fix.
+  when: prf_success
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Close unsuccessful"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ job.sys_id }}"
+    state: closed
+    close_code: unsuccessful
+    close_notes: "PRF analysis failed - see work notes and the DBA repair follow-up change."
+  when: not prf_success
+  failed_when: false
+
+# -----------------------------------------------------------------
+# 6. Follow-up change - ALWAYS opened when the analysis found at least one
+#    SQL_ID, whether the run overall succeeded or a step partially failed.
+#    On genuine total failure (prf_success false), this is a repair
+#    request instead of an implementation request.
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Open follow-up change for the DBA team to implement fixes"
+  ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+  when: prf_success and prf_recommendations | length > 0
+  vars:
+    fu_tag: "PRF"
+    fu_original_number: "{{ job.issue_key }}"
+    fu_original_sys_id: "{{ job.sys_id }}"
+    fu_summary: "implement performance recommendations for {{ job.oracle_sid }} on {{ job.target_host }}"
+    fu_description: |-
+      AWR performance analysis for {{ job.oracle_sid }} on {{ job.target_host }}
+      (issue period {{ job.start_dt }} -> {{ job.end_dt }}) identified the
+      following SQL Tuning Advisor recommendations. Please review each and
+      implement the appropriate fix (creating an index or accepting a SQL
+      Profile) through your normal change/approval process. Ansible has NOT
+      applied any of these changes.
+
+      {% for r in prf_recommendations %}
+      SQL_ID {{ r.sql_id }} - {{ r.cpu_secs }}s CPU - {{ r.flag }}
+      {% endfor %}
+
+      Full tuning advisor output for each SQL_ID is attached to this change.
+      See also the original analysis change {{ job.issue_key }} for the AWR
+      report and full automation history.
+
+- name: "JOB | {{ job.issue_key }} | Open DBA repair follow-up on total analysis failure"
+  ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+  when: not prf_success
+  vars:
+    fu_tag: "PRF"
+    fu_original_number: "{{ job.issue_key }}"
+    fu_original_sys_id: "{{ job.sys_id }}"
+    fu_summary: "PRF analysis failed for {{ job.oracle_sid }} on {{ job.target_host }}"
+    fu_description: "{{ prf_fail_reason }}"
+
+- name: "JOB | {{ job.issue_key }} | Clean up temp files"
+  ansible.builtin.file:
+    path: "{{ prf_work_dir }}"
+    state: absent
+  delegate_to: "{{ job.target_host }}"
+  failed_when: false

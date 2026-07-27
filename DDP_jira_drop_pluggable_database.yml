@@ -1,0 +1,126 @@
+---
+# drop_pluggable_database.yml
+#
+# "DDP" — Drop Pluggable Database.
+# Mirror image of the CDP (create pluggable database) playbook, following the
+# same Jira-driven workflow as DCR/CDP/CAU/PAT/REF/UPG:
+#
+#   shepherd intake -> JQL search (status=In Progress) -> parse target PDB
+#   -> safety checks -> CLOSE + DROP INCLUDING DATAFILES -> parse result
+#   -> transition Done/Failed -> upload logs -> on Failed, open DBA follow-up
+#
+# Differences from CDP worth flagging explicitly, since "drop" is destructive
+# and irreversible where "create" is not:
+#   1. A double-confirmation gate: the shepherd "In Progress" gate (human
+#      approval in Jira) is NOT treated as sufficient on its own. The issue
+#      must also contain a literal confirmation string
+#      (ddp_confirm_string, default "CONFIRM DROP <PDB_NAME>") either in a
+#      dedicated custom field or the issue description. Playbook aborts and
+#      transitions to Failed (with a DBA follow-up) if it's missing or the
+#      PDB name inside it doesn't match the target field.
+#   2. PDB$SEED and any PDB in the protected list (ddp_protected_pdbs) are
+#      hard-blocked regardless of what Jira says.
+#   3. A pre-drop metadata snapshot (DBA_PDBS, tablespace list, datafile
+#      list) is captured and attached to the issue before the drop runs, so
+#      there's a record of what existed.
+#   4. Unlike CDP, this does NOT loop over all six environment PDBs — it
+#      targets exactly the one PDB named in the ticket.
+#
+# NOTE: field ID below (ddp_target_field) is a placeholder assumption
+# following the CAU/PAT pattern of a select-type custom field. Confirm the
+# real field ID in the re-created DDP project and update
+# vars/main.yml accordingly — same self-diagnosing WARNING pattern as
+# CAU/PAT is included so a mismatch is obvious on first run rather than
+# failing silently.
+
+- name: Drop Pluggable Database (DDP) — Jira-driven PDB decommission
+  hosts: HPsuperdome
+  connection: local
+  gather_facts: false
+
+  vars:
+    # --- Jira ---
+    jira_url: "{{ jira_url }}"                     # from /etc/ansible/vars/main.yml
+    jira_user: "{{ jira_user }}"
+    jira_api_token: "{{ jira_api_token }}"
+    jira_cloud: true
+    jira_project_key: "DDP"
+    jira_jql: "project = {{ jira_project_key }} AND status = 'In Progress'"
+    jira_status_done: "Done"
+    jira_status_failed: "Failed"
+
+    # Parameterized custom fields (CAU/PAT pattern) — confirm real IDs
+    ddp_target_field: "customfield_10750"          # select: target PDB, e.g. "PRO", "DEV"
+    ddp_confirm_field: "customfield_10751"          # text: must contain "CONFIRM DROP <PDB>"
+
+    # --- Oracle ---
+    oracle_sid: "CDB1"                              # uppercase per lnx001 convention
+    oracle_home: "/u01/app/oracle/product/21.0.0/dbhome_1"
+    oracle_host: "lnx001"
+    dcr_connect_credentials: "{{ dcr_connect_credentials }}"  # reuse DCR's stored EZConnect creds
+
+    # --- Safety ---
+    ddp_protected_pdbs:
+      - "PDB$SEED"
+      - "PRO"          # production — require a manual override var to ever touch
+    ddp_allow_protected_override: false   # set -e ddp_allow_protected_override=true to bypass PRO block
+
+    work_dir: "/tmp/ddp_run"
+
+  tasks:
+
+    # ---------------------------------------------------------------
+    # 0. Pre-flight — expired-token guard (same fix as DCR/CDP/etc.)
+    # ---------------------------------------------------------------
+    - name: Pre-flight — verify Jira API token is valid
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/myself"
+        method: GET
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        status_code: 200
+      register: jira_myself_check
+
+    - name: Shepherd DDP intake queue before searching for work
+      ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+      vars:
+        shepherd_project_key: "{{ jira_project_key }}"
+
+    # ---------------------------------------------------------------
+    # 1. Search for approved drop requests
+    # ---------------------------------------------------------------
+    - name: Search Jira for DDP issues ready to execute
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/search"
+        method: GET
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          jql: "{{ jira_jql }}"
+          fields:
+            - "summary"
+            - "{{ ddp_target_field }}"
+            - "{{ ddp_confirm_field }}"
+        status_code: 200
+      register: ddp_search_results
+
+    - name: Build list of drop requests
+      ansible.builtin.set_fact:
+        ddp_issues: "{{ ddp_search_results.json.issues | default([]) }}"
+
+    - name: No DDP work found — end run
+      ansible.builtin.meta: end_play
+      when: ddp_issues | length == 0
+
+    # ---------------------------------------------------------------
+    # 2. Per-issue processing
+    # ---------------------------------------------------------------
+    - name: Process each drop request
+      ansible.builtin.include_tasks: ddp_process_issue.yml
+      loop: "{{ ddp_issues }}"
+      loop_control:
+        loop_var: ddp_issue
+        label: "{{ ddp_issue.key }}"

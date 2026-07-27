@@ -1,0 +1,111 @@
+---
+# DDP_drop_pluggable_database.yml
+#
+# ServiceNow-driven Drop Pluggable Database (DDP) - decommissions an Oracle
+# PDB from a change request, using servicenow.itsm.change_request.
+#
+# Modeled on SNOW_PDB_create_pluggable_database.yml (the closest sibling -
+# single play, localhost-driven, DB work delegated to the target host as
+# the oracle user, so job data stays in memory for the whole run and never
+# hits the PAT-style JSON sys_id-drop bug) and on every fix already proven
+# against the PDI:
+#   - assignment_group is TOP-LEVEL on every change_request write;
+#     assigned_to only goes in other: (assigned_to is not a supported
+#     top-level module param)
+#   - reads use raw state codes via the table API; writes use the
+#     servicenow.itsm friendly state names
+#   - failed changes walk implement -> review -> closed (unsuccessful) on
+#     BOTH the block path and the execution-failure path, same as success -
+#     never jump straight to closed, or the Change Model state-transition
+#     rule 403s it and it silently re-enters the queue every cron pass
+#   - .splitlines() only, never .split('\n'), inside >- folded scalars
+#   - follow-up creation goes through COMMON_snow_create_followup.yml,
+#     which has its own idempotency guard (won't double-create a follow-up
+#     for the same source CR)
+#   - ownership filter: only act on CRs assigned to snow_assigned_to
+#     within snow_assignment_group; everything else is left for a human
+#
+# Spec format (short_description), same "TAG | fields" convention as PDB:
+#   DDP | <host> | <CDB_NAME> | <PDB_TO_DROP>
+#
+# Unlike PDB create, a drop is irreversible, so this ALWAYS uses the
+# "normal" change type and walks New -> Assess and holds for approval,
+# same as DCR's PROD path - there is no "standard, no-approval" lane for
+# DDP regardless of environment. It does not use COMMON_snow_intake.yml
+# (that helper shepherds new -> implement for standard changes); DDP has
+# its own intake block below for the same reason DCR does.
+#
+# Additional guardrails beyond a straight "opposite of create":
+#   1. Description must contain the literal line "CONFIRM DROP <PDB_NAME>"
+#      matching the target PDB from the spec, checked independently of
+#      ServiceNow approval. Missing/mismatched -> blocked, closed
+#      unsuccessful, DBA follow-up, nothing touches the database.
+#   2. Protected PDB list (ddp_protected_pdbs) is hard-blocked regardless
+#      of approval or confirmation text, unless -e ddp_allow_protected_override=true.
+#   3. Pre-drop snapshot (DBA_PDBS / tablespaces / datafiles) is captured
+#      and attached to the CR before anything destructive runs.
+#   4. Acts on exactly one PDB per CR - never loops across environments
+#      the way CDP/PDB-create can.
+
+- name: Drop Pluggable Database (DDP) - ServiceNow-driven PDB decommission
+  hosts: localhost
+  gather_facts: true
+
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    snow_project_tag: "DDP"
+    snow_assignment_group: "Database Atlanta"
+    snow_assigned_to: "Hyperautomation Platform"
+
+    sn_ddp_type: "normal"
+    snow_state_new: "-5"
+    snow_state_assess: "-4"
+    snow_state_authorize: "-3"
+    snow_state_scheduled: "-2"
+    snow_state_implement: "-1"
+    snow_state_review: "0"
+    snow_state_closed: "3"
+
+    ddp_protected_pdbs:
+      - "PDB$SEED"
+      - "PRO"
+    ddp_allow_protected_override: false
+
+    ddp_work_dir: "/tmp/snow_ddp_run"
+
+  tasks:
+
+    # -----------------------------------------------------------------
+    # 1. Query for candidate CRs: our tag prefix, in the in-flight range,
+    #    owned by us. Widened state range per the DCR "stranded CR"
+    #    lesson - a CR can be sitting at assess or scheduled from a prior
+    #    partial run, not just new/implement.
+    # -----------------------------------------------------------------
+    - name: Query ServiceNow for DDP change requests
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sysparm_query: >-
+          short_descriptionSTARTSWITH{{ snow_project_tag }}
+          ^stateIN{{ snow_state_new }},{{ snow_state_assess }},{{ snow_state_authorize }},{{ snow_state_scheduled }},{{ snow_state_implement }}
+          ^assignment_group.name={{ snow_assignment_group }}
+          ^assigned_to.name={{ snow_assigned_to }}
+      register: ddp_cr_query
+
+    - name: No DDP change requests found - end run
+      ansible.builtin.meta: end_play
+      when: ddp_cr_query.records | default([]) | length == 0
+
+    # -----------------------------------------------------------------
+    # 2. Per-CR processing
+    # -----------------------------------------------------------------
+    - name: Process each DDP change request
+      ansible.builtin.include_tasks: DDP_process_change.yml
+      loop: "{{ ddp_cr_query.records }}"
+      loop_control:
+        loop_var: ddp_cr
+        label: "{{ ddp_cr.number }}"

@@ -1,0 +1,211 @@
+---
+# ddp_process_issue.yml — included per Jira issue by drop_pluggable_database.yml
+
+- name: Extract target PDB name from issue field
+  ansible.builtin.set_fact:
+    ddp_target_pdb: "{{ ddp_issue.fields[ddp_target_field].value | default('') | upper }}"
+    ddp_confirm_text: "{{ ddp_issue.fields[ddp_confirm_field] | default('') }}"
+
+- name: WARNING — target field empty or unrecognized, dump populated fields
+  ansible.builtin.debug:
+    msg: >
+      DDP target field ({{ ddp_target_field }}) was empty or missing on
+      {{ ddp_issue.key }}. Populated custom fields on this issue:
+      {{ ddp_issue.fields | dict2items | selectattr('value', 'defined') | map(attribute='key') | list }}
+  when: ddp_target_pdb == ''
+
+# -----------------------------------------------------------------
+# Guardrail 1 — normalize PROD -> PRO alias (CAU/REF convention)
+# -----------------------------------------------------------------
+- name: Normalize PROD alias to PRO key
+  ansible.builtin.set_fact:
+    ddp_target_pdb: "PRO"
+  when: ddp_target_pdb == 'PROD'
+
+# -----------------------------------------------------------------
+# Guardrail 2 — protected PDB block
+# -----------------------------------------------------------------
+- name: Block drop of a protected PDB unless explicitly overridden
+  ansible.builtin.set_fact:
+    ddp_blocked: true
+    ddp_block_reason: "{{ ddp_target_pdb }} is on the protected list (ddp_protected_pdbs)"
+  when: >
+    ddp_target_pdb in ddp_protected_pdbs and
+    not (ddp_allow_protected_override | bool)
+
+# -----------------------------------------------------------------
+# Guardrail 3 — double-confirmation string must match target PDB
+# -----------------------------------------------------------------
+- name: Block drop if confirmation string is missing or mismatched
+  ansible.builtin.set_fact:
+    ddp_blocked: true
+    ddp_block_reason: >-
+      confirmation field must read exactly 'CONFIRM DROP {{ ddp_target_pdb }}'
+      (got: '{{ ddp_confirm_text }}')
+  when: >
+    ddp_blocked is not defined and
+    ddp_confirm_text != ('CONFIRM DROP ' ~ ddp_target_pdb)
+
+- name: Handle blocked issue — comment, transition to Failed, open DBA follow-up
+  when: ddp_blocked | default(false)
+  block:
+    - name: Post block reason as a comment
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/issue/{{ ddp_issue.key }}/comment"
+        method: POST
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          body: "DDP aborted — {{ ddp_block_reason }}"
+        status_code: 201
+
+    - name: Transition blocked issue to Failed (case-insensitive, uri-based)
+      ansible.builtin.include_tasks: COMMON_jira_transition_issue.yml
+      vars:
+        transition_issue_key: "{{ ddp_issue.key }}"
+        transition_target_status: "{{ jira_status_failed }}"
+
+    - name: Open DBA follow-up task for blocked drop
+      ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+      vars:
+        followup_source_project: "{{ jira_project_key }}"
+        followup_reason: "DDP blocked: {{ ddp_block_reason }}"
+        followup_source_issue: "{{ ddp_issue.key }}"
+
+    - name: Skip remaining tasks for this issue
+      ansible.builtin.meta: end_host  # effectively "continue" within include_tasks scope
+      when: false  # placeholder — real control flow handled by block/rescue below
+
+# -----------------------------------------------------------------
+# Proceed only if not blocked
+# -----------------------------------------------------------------
+- name: Drop and cleanup block
+  when: not (ddp_blocked | default(false))
+  block:
+
+    - name: Ensure working directory exists
+      ansible.builtin.file:
+        path: "{{ work_dir }}/{{ ddp_issue.key }}"
+        state: directory
+        mode: '0750'
+
+    # -----------------------------------------------------------------
+    # Pre-drop snapshot — captured and attached before anything destructive
+    # -----------------------------------------------------------------
+    - name: Write pre-drop snapshot SQL
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/{{ ddp_issue.key }}/snapshot.sql"
+        mode: '0640'
+        content: |
+          SET PAGESIZE 200
+          SET LINESIZE 200
+          SPOOL {{ work_dir }}/{{ ddp_issue.key }}/snapshot.log
+          SELECT pdb_name, status, open_mode FROM dba_pdbs WHERE pdb_name = '{{ ddp_target_pdb }}';
+          SELECT tablespace_name FROM cdb_tablespaces WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ ddp_target_pdb }}');
+          SELECT file_name FROM cdb_data_files WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ ddp_target_pdb }}');
+          SPOOL OFF
+          EXIT;
+
+    - name: Write drop SQL — close then drop including datafiles
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/{{ ddp_issue.key }}/drop.sql"
+        mode: '0640'
+        content: |
+          SET PAGESIZE 200
+          SET LINESIZE 200
+          SPOOL {{ work_dir }}/{{ ddp_issue.key }}/drop.log
+          WHENEVER SQLERROR EXIT SQL.SQLCODE
+          ALTER PLUGGABLE DATABASE {{ ddp_target_pdb }} CLOSE IMMEDIATE;
+          DROP PLUGGABLE DATABASE {{ ddp_target_pdb }} INCLUDING DATAFILES;
+          SPOOL OFF
+          EXIT;
+
+    # -----------------------------------------------------------------
+    # Temp shell script wrapper — same fix as DCR for sudo stripping
+    # ORACLE_SID / OS-auth env vars under become_user: oracle
+    # -----------------------------------------------------------------
+    - name: Write execution wrapper script
+      ansible.builtin.copy:
+        dest: "{{ work_dir }}/{{ ddp_issue.key }}/run.sh"
+        mode: '0750'
+        content: |
+          #!/bin/bash
+          export ORACLE_SID={{ oracle_sid }}
+          export ORACLE_HOME={{ oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ work_dir }}/{{ ddp_issue.key }}/snapshot.sql
+          "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ work_dir }}/{{ ddp_issue.key }}/drop.sql
+
+    - name: Execute snapshot + drop as oracle user
+      ansible.builtin.command: "bash {{ work_dir }}/{{ ddp_issue.key }}/run.sh"
+      become: true
+      become_user: oracle
+      register: ddp_exec
+      failed_when: false
+      changed_when: true
+
+    - name: Read drop log for success/failure parsing
+      ansible.builtin.slurp:
+        src: "{{ work_dir }}/{{ ddp_issue.key }}/drop.log"
+      register: ddp_drop_log
+      ignore_errors: true
+
+    - name: Determine outcome
+      ansible.builtin.set_fact:
+        ddp_success: "{{ ddp_exec.rc == 0 and 'ORA-' not in (ddp_drop_log.content | default('') | b64decode) }}"
+
+    # -----------------------------------------------------------------
+    # Attach logs, comment, transition
+    # -----------------------------------------------------------------
+    - name: Attach snapshot and drop logs to Jira issue
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/issue/{{ ddp_issue.key }}/attachments"
+        method: POST
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        headers:
+          X-Atlassian-Token: "no-check"
+        src: "{{ item }}"
+        status_code: 200
+      loop:
+        - "{{ work_dir }}/{{ ddp_issue.key }}/snapshot.log"
+        - "{{ work_dir }}/{{ ddp_issue.key }}/drop.log"
+      ignore_errors: true
+
+    - name: Post worklog summary
+      ansible.builtin.uri:
+        url: "{{ jira_url }}/rest/api/2/issue/{{ ddp_issue.key }}/worklog"
+        method: POST
+        user: "{{ jira_user }}"
+        password: "{{ jira_api_token }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          comment: "DDP drop of {{ ddp_target_pdb }}: {{ 'SUCCESS' if ddp_success else 'FAILED' }}"
+          timeSpentSeconds: 60
+        status_code: 201
+
+    - name: Transition to Done (case-insensitive, uri-based)
+      ansible.builtin.include_tasks: COMMON_jira_transition_issue.yml
+      vars:
+        transition_issue_key: "{{ ddp_issue.key }}"
+        transition_target_status: "{{ jira_status_done }}"
+      when: ddp_success | bool
+
+    - name: Transition to Failed (case-insensitive, uri-based)
+      ansible.builtin.include_tasks: COMMON_jira_transition_issue.yml
+      vars:
+        transition_issue_key: "{{ ddp_issue.key }}"
+        transition_target_status: "{{ jira_status_failed }}"
+      when: not (ddp_success | bool)
+
+    - name: Open DBA follow-up task on failed drop
+      ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+      vars:
+        followup_source_project: "{{ jira_project_key }}"
+        followup_reason: "DDP drop of {{ ddp_target_pdb }} failed — see attached drop.log"
+        followup_source_issue: "{{ ddp_issue.key }}"
+      when: not (ddp_success | bool)

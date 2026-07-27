@@ -1,0 +1,125 @@
+---
+# =============================================================================
+# PRF_snow_performance_analysis.yml
+#
+# ServiceNow-driven Oracle AWR performance analysis + SQL Tuning Advisor.
+#
+# CHANGE REQUEST FORMAT
+#   short_description:  PRF | <host> | <ORACLE_SID> | <START_DATETIME> | <END_DATETIME>
+#   e.g.                PRF | lnx001 | CDB1 | 2026-02-21 21:02:00 | 2026-02-21 23:15:00
+#
+#   Non-technical end users specify WHEN the performance issue happened, not
+#   AWR snapshot IDs - SNOW_PRF_performance_analysis_job.yml resolves the
+#   actual bracketing snapshot IDs from DBA_HIST_SNAPSHOT itself.
+#
+# FLOW
+#   1. ServiceNow intake + shepherd (COMMON_snow_intake.yml) - standard
+#      change, no approval required. This stage is READ-ONLY analysis only:
+#      an AWR report plus a SQL Tuning Advisor "execute_tuning_task" run,
+#      which only produces ADVICE - it never applies anything to the
+#      database.
+#   2. Resolve the given start/end date-time into the bracketing AWR
+#      snapshot IDs (DBA_HIST_SNAPSHOT).
+#   3. Generate the AWR text report for that snapshot range.
+#   4. Query DBA_HIST_SQLSTAT directly (not by parsing the AWR report text -
+#      too fragile) for the top 5 SQL_IDs by total CPU time in that range.
+#   5. Run DBMS_SQLTUNE against each of the (up to) 5 SQL_IDs and capture
+#      the tuning advisor's recommendation report for each.
+#   6. Attach the AWR report and every tuning report as evidence, and close
+#      the analysis change successful with a one-line-per-SQL_ID summary in
+#      the work notes.
+#   7. Open a SEPARATE follow-up change (COMMON_snow_create_followup.yml)
+#      for the DBA team to review and implement the suggested fixes
+#      (index / SQL Profile) - unassigned, so it requires a human to pick
+#      up and walk it through your normal approval process. Ansible never
+#      applies a tuning recommendation itself.
+# =============================================================================
+
+- name: ServiceNow-driven Oracle AWR performance analysis
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+
+    - name: "PRE | ServiceNow intake and shepherd for PRF"
+      ansible.builtin.include_tasks: COMMON_snow_intake.yml
+      vars:
+        snow_tag: "PRF"
+
+    - name: "PRE | Nothing to do?"
+      ansible.builtin.debug:
+        msg: "No ServiceNow change requests tagged 'PRF |' are ready to execute. Exiting."
+      when: snow_work | length == 0
+
+    - name: "PRE | End play when queue is empty"
+      ansible.builtin.meta: end_play
+      when: snow_work | length == 0
+
+    # Parse "PRF | <host> | <SID> | <start_datetime> | <end_datetime>" from
+    # short_description. split('|') -> [0]=tag [1]=host [2]=SID
+    # [3]=start_datetime [4]=end_datetime. Date-times are expected in
+    # "YYYY-MM-DD HH:MM:SS" format (ServiceNow's Date/Time variable's
+    # native serialization - verify this matches on first live submission).
+    - name: "PRE | Build job list from change requests"
+      ansible.builtin.set_fact:
+        prf_jobs: >-
+          {{ prf_jobs | default([]) + [ {
+               'issue_key':   item.number,
+               'sys_id':      item.sys_id,
+               'target_host': (item.short_description.split('|')[1] | default('') | trim),
+               'oracle_sid':  (item.short_description.split('|')[2] | default('') | trim | upper),
+               'start_dt':    (item.short_description.split('|')[3] | default('') | trim),
+               'end_dt':      (item.short_description.split('|')[4] | default('') | trim)
+             } ] }}
+      loop: "{{ snow_work }}"
+      loop_control:
+        label: "{{ item.number }}"
+
+    - name: "PRE | WARN about change requests with an unusable spec"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ item.issue_key }} has an unusable spec - expected
+          'PRF | <host> | <ORACLE_SID> | <START_DATETIME> | <END_DATETIME>'
+          with date-times like '2026-02-21 21:02:00'. Got
+          host='{{ item.target_host }}' sid='{{ item.oracle_sid }}'
+          start_dt='{{ item.start_dt }}' end_dt='{{ item.end_dt }}'.
+          Skipping - stays in the intake queue for manual review.
+      loop: "{{ prf_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+      when: >-
+        item.target_host | length == 0
+        or item.oracle_sid | length == 0
+        or item.start_dt is not match('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$')
+        or item.end_dt is not match('^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$')
+
+    - name: "PRE | Keep only jobs with a usable spec"
+      ansible.builtin.set_fact:
+        prf_jobs: >-
+          {{ prf_jobs
+             | selectattr('target_host', 'ne', '') | list
+             | selectattr('oracle_sid', 'ne', '') | list
+             | selectattr('start_dt', 'match', '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$') | list
+             | selectattr('end_dt', 'match', '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$') | list }}
+
+    - name: "PRE | Nothing valid to process"
+      ansible.builtin.meta: end_play
+      when: prf_jobs | length == 0
+
+    - name: "PRE | Jobs queued"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.issue_key }} -- analyze {{ item.oracle_sid }} on
+          {{ item.target_host }}, period {{ item.start_dt }} -> {{ item.end_dt }}
+      loop: "{{ prf_jobs }}"
+      loop_control:
+        label: "{{ item.issue_key }}"
+
+    - name: "JOB | Dispatch performance analysis per issue"
+      ansible.builtin.include_tasks: SNOW_PRF_performance_analysis_job.yml
+      loop: "{{ prf_jobs }}"
+      loop_control:
+        loop_var: job
+        label: "{{ job.issue_key }} ({{ job.oracle_sid }})"

@@ -1,0 +1,434 @@
+---
+# DDP_process_change.yml - included per CR by DDP_drop_pluggable_database.yml
+
+- name: Parse DDP spec from short_description ("DDP | host | CDB | PDB")
+  ansible.builtin.set_fact:
+    ddp_spec_parts: "{{ ddp_cr.short_description.split('|') | map('trim') | list }}"
+
+- name: Extract spec fields
+  ansible.builtin.set_fact:
+    ddp_host: "{{ ddp_spec_parts[1] | default('') }}"
+    ddp_cdb: "{{ ddp_spec_parts[2] | default('') | upper }}"
+    ddp_target_pdb: "{{ ddp_spec_parts[3] | default('') | upper }}"
+
+- name: Malformed spec - skip this CR
+  ansible.builtin.meta: end_host
+  when: ddp_spec_parts | length < 4
+
+- name: Unknown host - skip this CR
+  ansible.builtin.meta: end_host
+  when: ddp_host not in oracle_instance_map
+
+# Resolve the authoritative Oracle home/SID/OS-user from oracle_instance_map
+# (the same source of truth SNOW_PDB_create_pluggable_database.yml uses)
+# rather than a guessed/hardcoded path - a wrong ORACLE_HOME silently makes
+# sqlplus fail to launch, which is exactly what happened on the first live
+# run (drop.log was never created because sqlplus never started).
+- name: Resolve Oracle home/SID/user from oracle_instance_map
+  ansible.builtin.set_fact:
+    ddp_oracle_home: "{{ oracle_instance_map[ddp_host].oracle_home }}"
+    ddp_oracle_sid: "{{ oracle_instance_map[ddp_host].oracle_sid }}"
+    ddp_oracle_user: "{{ oracle_instance_map[ddp_host].oracle_user }}"
+
+# -----------------------------------------------------------------
+# Intake / approval walk. Drop always requires approval, so this is a
+# "normal" change walked New -> Assess (hold) -> Authorize -> Scheduled
+# -> Implement, same shape as DCR's PROD path. Never jumps straight to
+# Implement regardless of environment.
+# -----------------------------------------------------------------
+- name: Set ready-to-execute flag default
+  ansible.builtin.set_fact:
+    ddp_ready: false
+
+- name: New change - promote to Assess and hold for approval
+  when: ddp_cr.state == 'new'
+  block:
+    - name: Set change type to normal
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        type: "{{ sn_ddp_type }}"
+        state: assess
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+
+    - name: Post work note - awaiting approval
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          work_notes: "DDP: drop request for {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} moved to Assess - awaiting approval before anything is touched."
+
+- name: Change is pending approval or mid-walk - advance if approved
+  when: ddp_cr.state in ['assess', 'authorize', 'scheduled']
+  block:
+    - name: Re-check approval status
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+      register: ddp_recheck
+
+    - name: Not yet approved - leave in place
+      ansible.builtin.meta: end_host
+      when: ddp_recheck.records[0].approval | default('') != 'approved'
+
+    - name: Walk Assess -> Authorize
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        state: authorize
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      when: ddp_cr.state == 'assess'
+
+    - name: Walk Authorize -> Scheduled
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        state: scheduled
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      when: ddp_cr.state in ['assess', 'authorize']
+
+    - name: Walk Scheduled -> Implement
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        state: implement
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+
+    - name: Mark ready to execute this pass
+      ansible.builtin.set_fact:
+        ddp_ready: true
+
+- name: Already at Implement - ready to execute
+  ansible.builtin.set_fact:
+    ddp_ready: true
+  when: ddp_cr.state == 'implement'
+
+- name: Not ready this pass - stop here
+  ansible.builtin.meta: end_host
+  when: not ddp_ready
+
+# -----------------------------------------------------------------
+# Guardrail 1 - confirmation text, independent of ServiceNow approval
+# ddp_cr already carries description and sys_id from the original
+# query (confirmed via diagnostic dump) - no need to re-fetch, which
+# is what introduced the .record vs .records[0] mismatch bug.
+# -----------------------------------------------------------------
+- name: Check for required confirmation line
+  ansible.builtin.set_fact:
+    ddp_blocked: "{{ ('CONFIRM DROP ' ~ ddp_target_pdb) not in (ddp_cr.description | default('')) }}"
+    ddp_block_reason: "description is missing the line 'CONFIRM DROP {{ ddp_target_pdb }}'"
+
+# -----------------------------------------------------------------
+# Guardrail 2 - protected PDB list
+# -----------------------------------------------------------------
+- name: Escalate block reason if target is protected
+  ansible.builtin.set_fact:
+    ddp_blocked: true
+    ddp_block_reason: "{{ ddp_target_pdb }} is on the protected list (ddp_protected_pdbs)"
+  when: >
+    ddp_target_pdb in ddp_protected_pdbs and
+    not (ddp_allow_protected_override | bool)
+
+- name: Handle blocked drop - close unsuccessful with follow-up
+  when: ddp_blocked | bool
+  block:
+    - name: Work note - blocked
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          work_notes: "DDP BLOCKED: {{ ddp_block_reason }}. No database action taken."
+
+    - name: Walk Implement -> Review (blocked)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        state: review
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+
+    - name: Walk Review -> Closed unsuccessful (blocked)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ ddp_cr.number }}"
+        state: closed
+        close_code: "unsuccessful"
+        close_notes: "DDP blocked: {{ ddp_block_reason }}"
+        assignment_group: "{{ snow_assignment_group }}"
+        other:
+          assigned_to: "{{ snow_assigned_to }}"
+      register: ddp_blocked_close
+      failed_when: false
+
+    - name: WARN if blocked CR could not be closed
+      ansible.builtin.debug:
+        msg: "WARNING: {{ ddp_cr.number }} could not be closed after a block - it will re-enter the queue next pass."
+      when: ddp_blocked_close is failed
+
+    - name: Open DBA follow-up for blocked drop
+      ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+      vars:
+        fu_tag: "{{ snow_project_tag }}"
+        fu_original_number: "{{ ddp_cr.number }}"
+        fu_original_sys_id: "{{ ddp_cr.sys_id }}"
+        fu_summary: "DDP drop of {{ ddp_target_pdb }} blocked"
+        fu_description: "{{ ddp_block_reason }}"
+
+    - name: Stop processing this CR
+      ansible.builtin.meta: end_host
+
+# -----------------------------------------------------------------
+# Execution - pre-drop snapshot, then close + drop including datafiles
+# -----------------------------------------------------------------
+# Traversal (execute) permission is required on EVERY ancestor directory
+# for oracle to reach the files below, not just the leaf directory. The
+# parent ddp_work_dir gets auto-created by the file module the first time
+# this runs and would otherwise inherit a restrictive default - set its
+# mode explicitly rather than relying on state: directory alone.
+- name: Ensure base working directory exists and is world-traversable
+  ansible.builtin.file:
+    path: "{{ ddp_work_dir }}"
+    state: directory
+    mode: '0755'
+  delegate_to: "{{ ddp_host }}"
+
+- name: Ensure remote working directory exists
+  ansible.builtin.file:
+    path: "{{ ddp_work_dir }}/{{ ddp_cr.number }}"
+    state: directory
+    mode: '0777'
+  delegate_to: "{{ ddp_host }}"
+
+- name: Write pre-drop snapshot SQL
+  ansible.builtin.copy:
+    dest: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/snapshot.sql"
+    mode: '0644'
+    content: |
+      SET PAGESIZE 200
+      SET LINESIZE 200
+      SPOOL {{ ddp_work_dir }}/{{ ddp_cr.number }}/snapshot.log
+      SELECT pdb_name, status FROM dba_pdbs WHERE pdb_name = '{{ ddp_target_pdb }}';
+      SELECT name, open_mode, restricted FROM v$pdbs WHERE name = '{{ ddp_target_pdb }}';
+      SELECT tablespace_name FROM cdb_tablespaces WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ ddp_target_pdb }}');
+      SELECT file_name FROM cdb_data_files WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ ddp_target_pdb }}');
+      SPOOL OFF
+      EXIT;
+  delegate_to: "{{ ddp_host }}"
+
+- name: Write drop SQL - close then drop including datafiles
+  ansible.builtin.copy:
+    dest: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/drop.sql"
+    mode: '0644'
+    content: |
+      SET PAGESIZE 200
+      SET LINESIZE 200
+      SPOOL {{ ddp_work_dir }}/{{ ddp_cr.number }}/drop.log
+      WHENEVER SQLERROR EXIT SQL.SQLCODE
+      ALTER PLUGGABLE DATABASE {{ ddp_target_pdb }} CLOSE IMMEDIATE;
+      DROP PLUGGABLE DATABASE {{ ddp_target_pdb }} INCLUDING DATAFILES;
+      SPOOL OFF
+      EXIT;
+  delegate_to: "{{ ddp_host }}"
+
+- name: Write execution wrapper (explicit ORACLE_SID export - sudo strips env)
+  ansible.builtin.copy:
+    dest: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/run.sh"
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      export ORACLE_SID={{ ddp_oracle_sid }}
+      export ORACLE_HOME={{ ddp_oracle_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ ddp_work_dir }}/{{ ddp_cr.number }}/snapshot.sql
+      "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ ddp_work_dir }}/{{ ddp_cr.number }}/drop.sql
+  delegate_to: "{{ ddp_host }}"
+
+- name: Post work note - drop starting
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ ddp_cr.number }}"
+    assignment_group: "{{ snow_assignment_group }}"
+    other:
+      work_notes: "DDP: starting drop of {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }}."
+
+- name: Execute snapshot + drop as oracle user
+  ansible.builtin.command: "bash {{ ddp_work_dir }}/{{ ddp_cr.number }}/run.sh"
+  delegate_to: "{{ ddp_host }}"
+  become: true
+  become_user: "{{ ddp_oracle_user }}"
+  register: ddp_exec
+  failed_when: false
+  changed_when: true
+
+- name: Read drop log
+  ansible.builtin.slurp:
+    src: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/drop.log"
+  register: ddp_drop_log
+  delegate_to: "{{ ddp_host }}"
+  ignore_errors: true
+
+- name: Determine outcome (splitlines only - never split('\n') inside a folded scalar)
+  ansible.builtin.set_fact:
+    ddp_drop_log_text: "{{ ddp_drop_log.content | default('') | b64decode }}"
+    ddp_success: "{{ ddp_exec.rc == 0 }}"
+
+- name: Refine outcome by scanning log lines for ORA- errors
+  ansible.builtin.set_fact:
+    ddp_error_lines: "{{ ddp_drop_log_text.splitlines() | select('search', 'ORA-') | list }}"
+
+- name: Downgrade to failure if any ORA- error line is present
+  ansible.builtin.set_fact:
+    ddp_success: false
+  when: ddp_error_lines | length > 0
+
+- name: Attach snapshot and drop logs to the change request
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+        ddp_cr.sys_id }}&file_name={{ item }}
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers:
+      Content-Type: "text/plain"
+    src: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/{{ item }}"
+    remote_src: true
+    status_code: 201
+  delegate_to: "{{ ddp_host }}"
+  loop:
+    - "snapshot.log"
+    - "drop.log"
+  loop_control:
+    label: "{{ item }}"
+  ignore_errors: true
+  register: ddp_attach
+
+- name: WARN if any log failed to attach
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not attach {{ item.item }} to {{ ddp_cr.number }}
+      (HTTP {{ item.status | default('n/a') }}: {{ item.msg | default('unknown error') }}).
+  loop: "{{ ddp_attach.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('unknown') }}"
+  when:
+    - item is not skipped
+    - item.failed | default(false) or (item.status | default(0)) != 201
+
+- name: Post work note - outcome summary
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ ddp_cr.number }}"
+    assignment_group: "{{ snow_assignment_group }}"
+    other:
+      work_notes: "DDP drop of {{ ddp_target_pdb }}: {{ 'SUCCESS' if ddp_success else 'FAILED' }}. {{ (ddp_error_lines | join(' | '))[:900] if not ddp_success else '' }}"
+
+# Both success and failure walk Implement -> Review -> Closed - never jump
+# straight to closed, per the DCR "stranded implement CR" lesson.
+- name: Walk Implement -> Review
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ ddp_cr.number }}"
+    state: review
+    assignment_group: "{{ snow_assignment_group }}"
+    other:
+      assigned_to: "{{ snow_assigned_to }}"
+
+- name: Walk Review -> Closed successful
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ ddp_cr.number }}"
+    state: closed
+    close_code: "successful"
+    close_notes: "DDP: {{ ddp_target_pdb }} dropped successfully from {{ ddp_cdb }}@{{ ddp_host }}."
+    assignment_group: "{{ snow_assignment_group }}"
+    other:
+      assigned_to: "{{ snow_assigned_to }}"
+  register: ddp_close_ok
+  failed_when: false
+  when: ddp_success | bool
+
+- name: Walk Review -> Closed unsuccessful
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ ddp_cr.number }}"
+    state: closed
+    close_code: "unsuccessful"
+    close_notes: "DDP: drop of {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} failed - see attached drop.log."
+    assignment_group: "{{ snow_assignment_group }}"
+    other:
+      assigned_to: "{{ snow_assigned_to }}"
+  register: ddp_close_fail
+  failed_when: false
+  when: not (ddp_success | bool)
+
+- name: WARN if this CR could not be closed
+  ansible.builtin.debug:
+    msg: "WARNING: {{ ddp_cr.number }} could not be closed - it will re-enter the queue next pass and may re-run."
+  when: (ddp_success | bool and ddp_close_ok is failed) or (not (ddp_success | bool) and ddp_close_fail is failed)
+
+- name: Open DBA follow-up on failed drop
+  ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+  vars:
+    fu_tag: "{{ snow_project_tag }}"
+    fu_original_number: "{{ ddp_cr.number }}"
+    fu_original_sys_id: "{{ ddp_cr.sys_id }}"
+    fu_summary: "DDP drop of {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} failed"
+    fu_description: >-
+      Drop attempt failed.
+      {{ (ddp_error_lines | join(' | '))[:900] if ddp_error_lines | default([]) | length > 0 else 'See attached drop.log on ' ~ ddp_cr.number ~ ' for details.' }}
+  when: not (ddp_success | bool)

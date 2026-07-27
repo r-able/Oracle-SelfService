@@ -40,8 +40,8 @@ The following is an example of the crontab file.
 #0 0 * * * /etc/ansible/UPG_jira_cron_wrapper.sh  >> /tmp/cron.JIRA.UPG.log 2>&1
 ###########################END OF JIRA######################################
 ###########################SNOW#############################################
-0 * * * * /etc/ansible/UPG_snow_cron_wrapper.sh >> /tmp/cron.SNOW.UPG.log 2>&1
 #*/1 * * * * /etc/ansible/UPG_snow_cron_wrapper.sh >> /tmp/cron.SNOW.UPG.log 2>&1
+0 * * * * /etc/ansible/UPG_snow_cron_wrapper.sh >> /tmp/cron.SNOW.UPG.log 2>&1
 */1 * * * * /etc/ansible/REF_snow_cron_wrapper.sh >> /tmp/cron.SNOW.REF.log 2>&1
 0 * * * * /etc/ansible/PAT_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PAT.log 2>&1
 #*/1 * * * * /etc/ansible/PAT_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PAT.log 2>&1
@@ -49,6 +49,8 @@ The following is an example of the crontab file.
 */1 * * * * /etc/ansible/CDP_snow_cron_wrapper.sh >> /tmp/cron.SNOW.CDP.log 2>&1
 */1 * * * * /etc/ansible/CAU_snow_cron_wrapper.sh >> /tmp/cron.SNOW.CAU.log 2>&1
 */1 * * * * /etc/ansible/PDB_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PDB.log 2>&1
+*/1 * * * * /etc/ansible/DDP_snow_cron_wrapper.sh >> /tmp/cron.SNOW.DDP.log 2>&1
+*/5 * * * * /etc/ansible/PRF_snow_cron_wrapper.sh >> /tmp/cron.SNOW.PRF.log 2>&1
 ###########################END OF SNOW######################################
 6) After testing, it is recommended to encrypt the credentials/variables file ./vars/main.yml with Ansible vault. In such cases the cron entries will have to be changed.
 For example, the unencrypted DCR cron entry
@@ -70,6 +72,8 @@ Name your Change Requests as follows to kick off the auto-execution:
 #   UPG | CDB1
 #   DCR | <free title>                 (.sql scripts as attachments)
 #   PDB | lnx001 | CDB1 | TSTPDB01      (provision a new database)
+#   PDB | lnx001 | CDB1 | TSTPDB01      (provision a new database)
+#   DDP | lnx001 | CDB1 | TSTPDB01      (drop a database: double SNOW confirmation, needs a literal CONFIRM DROP <PDB_NAME>, pre-drop snapshot, single-target, not a loop over all six — CDP provisions across all six PDBs; dropping shouldn't ever be a batch operation, so DDP only ever acts on the one PDB named in the ticket.)
 #####################################################################
 
 Logging tree:
