@@ -53,7 +53,7 @@ set -euo pipefail
 # -- Configuration -------------------------------------------------------------
 
 PLAYBOOK_DIR="/etc/ansible"
-PLAYBOOK="SNOW_PRF_performance_analysis_job.yml"
+PLAYBOOK="SNOW_PRF_performance_analysis.yml"
 VAULT_PASS_FILE="/etc/ansible/.vault_pass"     # file containing the vault password
 
 BASE_DIR="${HOME}/snow_prf"                  # user-owned; survives reboots

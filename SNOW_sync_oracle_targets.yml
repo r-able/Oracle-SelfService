@@ -2,148 +2,256 @@
 # =============================================================================
 # SNOW_sync_oracle_targets.yml
 #
-# Syncs oracle_instance_map (the existing global vars/main.yml dict, keyed by
-# host, with oracle_sid/oracle_home/oracle_user per entry - already the
-# authoritative source every other SNOW playbook uses) into the ServiceNow
-# custom table u_u_oracle_target, so record producer Reference-type fields
-# (e.g. PRF's "Database" field) can only ever show real, currently-known
-# host:SID combinations - no more free-text entry errors like "CDB1" with no
-# host, or "UAT" typed where a host was expected.
+# Syncs the ACTUAL PLUGGABLE DATABASES (PDBs) on each host in
+# oracle_instance_map into the ServiceNow custom table u_u_oracle_target, so
+# record producer Reference-type fields (PRF's "Database" field) show a
+# dropdown of real, currently-known host:PDB combinations for performance
+# analysis - not the container database (CDB) itself.
 #
-# This is a ONE-WAY sync: Ansible inventory -> ServiceNow. Nothing in
-# ServiceNow ever writes back to oracle_instance_map. Run this on a schedule
-# (cron wrapper provided separately) so the table stays current as hosts are
-# added/changed, with no manual double-entry required.
+# WHY PDBs AND NOT THE CDB: AWR performance issues need to be analyzed at
+# the level users actually think about their environment - the individual
+# PDB (DEV, UAT, SIT, STG, PRO, CER, etc.) - not the shared CDB root
+# (CDB1) that hosts all of them. Each host is queried live via v$pdbs
+# rather than relying on a static list, so this stays correct as PDBs are
+# added/dropped.
 #
-# u_u_oracle_target fields (create via System Definition > Tables first):
+# IMPORTANT FOLLOW-UP NOT YET DONE: syncing PDB names into this table alone
+# does not make PRF connect to the right container. PRF_snow_performance_
+# analysis_job.yml currently does `export ORACLE_SID={{ job.oracle_sid }}`
+# to connect directly, which only works for a CDB SID - connecting to a
+# specific PDB requires connecting to the CDB instance and then either
+# `ALTER SESSION SET CONTAINER = <pdb>` or filtering AWR queries by CON_ID.
+# That playbook-side fix is a separate, not-yet-made change.
+#
+# u_u_oracle_target fields (already created):
 #   u_host        - hostname, e.g. lnx001
-#   u_oracle_sid  - Oracle SID, e.g. CDB1
-#   u_label       - display value, "host:SID", e.g. "lnx001:CDB1"
-#                   (marked as the table's Display field)
+#   u_oracle_sid  - PDB name, e.g. DEV, UAT, SIT, STG, PRO, CER, ORCLPDB
+#                   (NOTE: semantically a PDB name now, not the CDB SID)
+#   u_label       - display value, "host:PDB", e.g. "lnx001:DEV"
 #
-# IDEMPOTENT: matches existing rows by u_host + u_oracle_sid; updates u_label
-# if it has drifted, inserts new rows for anything not yet present. Does NOT
-# delete rows for hosts removed from oracle_instance_map (stale entries are
-# left in place rather than silently destroyed - review and remove manually
-# if a host is retired).
+# EXCLUDED: PDB$SEED is always excluded - it is a read-only template PDB,
+# never a valid analysis target. ORCLPDB is currently INCLUDED (not
+# filtered out) - tell me if that should be excluded too.
+#
+# IDEMPOTENT: matches existing rows by u_host + u_oracle_sid; updates
+# u_label if it has drifted, inserts new rows for anything not yet
+# present. Does NOT delete rows for PDBs no longer found (a dropped PDB's
+# row is left in place rather than silently destroyed - review and remove
+# manually if a PDB is retired).
 # =============================================================================
 
-- name: Sync oracle_instance_map into ServiceNow u_u_oracle_target
+- name: Sync PDBs into ServiceNow u_u_oracle_target
   hosts: localhost
   gather_facts: false
   vars_files:
-  - vars/main.yml
+    - vars/main.yml
 
   tasks:
 
-  - name: Pre-flight - verify instance is awake and credentials valid
-    ansible.builtin.uri:
-      url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
-      method: GET
-      user: "{{ sn_username }}"
-      password: "{{ sn_password }}"
-      force_basic_auth: true
-      return_content: true
-      status_code: 200
-    register: sync_preflight
-    failed_when: false
+    - name: Pre-flight - verify instance is awake and credentials valid
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: sync_preflight
+      failed_when: false
 
-  - name: Abort with a clear message if the instance is unreachable
-    ansible.builtin.fail:
-      msg: >-
-        ServiceNow pre-flight failed (HTTP {{ sync_preflight.status | default('n/a') }}). If the response was not JSON the PDI is probably HIBERNATING -- wake it at https://developer.servicenow.com and re-run.
-    when: sync_preflight.status | default(0) != 200 or sync_preflight.json is not defined
+    - name: Abort with a clear message if the instance is unreachable
+      ansible.builtin.fail:
+        msg: >-
+          ServiceNow pre-flight failed (HTTP {{ sync_preflight.status | default('n/a') }}).
+          If the response was not JSON the PDI is probably HIBERNATING -- wake it
+          at https://developer.servicenow.com and re-run.
+      when: sync_preflight.status | default(0) != 200 or sync_preflight.json is not defined
 
-  - name: Build the list of targets from oracle_instance_map
-    ansible.builtin.set_fact:
-      sync_targets: >-
-        {{ sync_targets | default([]) + [ {
-             'host': item,
-             'sid': oracle_instance_map[item].oracle_sid,
-             'label': item ~ ':' ~ oracle_instance_map[item].oracle_sid
-           } ] }}
-    loop: "{{ oracle_instance_map.keys() | list }}"
-    loop_control:
-      label: "{{ item }}"
+    # -----------------------------------------------------------------
+    # Discover the real PDBs on each host in oracle_instance_map via
+    # v$pdbs, rather than assuming a static list.
+    # -----------------------------------------------------------------
+    - name: "Ensure temp working dir exists on each host"
+      ansible.builtin.file:
+        path: "/tmp/snow_sync_oracle_targets"
+        state: directory
+        mode: '0777'
+      delegate_to: "{{ item }}"
+      loop: "{{ oracle_instance_map.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
 
-  - name: Show targets to sync
-    ansible.builtin.debug:
-      msg: "{{ sync_targets | map(attribute='label') | list }}"
+    - name: "Write PDB discovery SQL for each host"
+      ansible.builtin.copy:
+        dest: "/tmp/snow_sync_oracle_targets/list_pdbs.sql"
+        mode: '0644'
+        content: |
+          SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+          WHENEVER SQLERROR EXIT SQL.SQLCODE
+          SELECT name FROM v$pdbs
+          WHERE name != 'PDB$SEED'
+            AND open_mode = 'READ WRITE'
+          ORDER BY name;
+          EXIT;
+      delegate_to: "{{ item }}"
+      loop: "{{ oracle_instance_map.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
 
-  - name: Check whether each target already exists in u_u_oracle_target
-    ansible.builtin.uri:
-      url: >-
-        {{ sn_instance }}/api/now/table/u_u_oracle_target?sysparm_query={{
-          ('u_host=' + item.host + '^u_oracle_sid=' + item.sid) | urlencode
-        }}&sysparm_fields=sys_id,u_label&sysparm_limit=1
-      method: GET
-      user: "{{ sn_username }}"
-      password: "{{ sn_password }}"
-      force_basic_auth: true
-      return_content: true
-      status_code: 200
-    loop: "{{ sync_targets }}"
-    loop_control:
-      label: "{{ item.label }}"
-    register: sync_lookup
+    - name: "Write execution wrapper for each host"
+      ansible.builtin.copy:
+        dest: "/tmp/snow_sync_oracle_targets/run_list_pdbs.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          export ORACLE_SID={{ oracle_instance_map[item].oracle_sid }}
+          export ORACLE_HOME={{ oracle_instance_map[item].oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @/tmp/snow_sync_oracle_targets/list_pdbs.sql
+      delegate_to: "{{ item }}"
+      loop: "{{ oracle_instance_map.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
 
-  - name: Build create/update work list
-    ansible.builtin.set_fact:
-      sync_jobs: >-
-        {{ sync_jobs | default([]) + [ item.item | combine({
-             'existing_sys_id': (item.json.result | default([]) | first | default({})).sys_id | default(''),
-             'existing_label':  (item.json.result | default([]) | first | default({})).u_label | default('')
-           }) ] }}
-    loop: "{{ sync_lookup.results }}"
-    loop_control:
-      label: "{{ item.item.label }}"
+    - name: "Run PDB discovery on each host as oracle"
+      ansible.builtin.command: "bash /tmp/snow_sync_oracle_targets/run_list_pdbs.sh"
+      delegate_to: "{{ item }}"
+      become: true
+      become_user: "{{ oracle_instance_map[item].oracle_user }}"
+      loop: "{{ oracle_instance_map.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: sync_pdb_exec
+      failed_when: false
+      changed_when: false
 
-  - name: Create new targets that don't exist yet
-    ansible.builtin.uri:
-      url: "{{ sn_instance }}/api/now/table/u_u_oracle_target"
-      method: POST
-      user: "{{ sn_username }}"
-      password: "{{ sn_password }}"
-      force_basic_auth: true
-      body_format: json
-      body:
-        u_host: "{{ item.host }}"
-        u_oracle_sid: "{{ item.sid }}"
-        u_label: "{{ item.label }}"
-      status_code: 201
-    loop: "{{ sync_jobs }}"
-    loop_control:
-      label: "{{ item.label }}"
-    when: item.existing_sys_id | length == 0
-    register: sync_created
-    failed_when: false
+    - name: "Clean discovered PDB names (drop any blank/invalid lines)"
+      ansible.builtin.set_fact:
+        sync_pdb_clean: >-
+          {{ sync_pdb_clean | default([]) + [ {
+               'item': item.item,
+               'stdout_lines': item.stdout_lines | default([]) | select('match', '^[A-Za-z0-9_$]+$') | list
+             } ] }}
+      loop: "{{ sync_pdb_exec.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
-  - name: Update targets whose label has drifted
-    ansible.builtin.uri:
-      url: "{{ sn_instance }}/api/now/table/u_u_oracle_target/{{ item.existing_sys_id }}"
-      method: PATCH
-      user: "{{ sn_username }}"
-      password: "{{ sn_password }}"
-      force_basic_auth: true
-      body_format: json
-      body:
-        u_label: "{{ item.label }}"
-      status_code: 200
-    loop: "{{ sync_jobs }}"
-    loop_control:
-      label: "{{ item.label }}"
-    when:
-    - item.existing_sys_id | length > 0
-    - item.existing_label != item.label
-    failed_when: false
+    - name: "Build sync_targets from discovered PDBs (one row per host:PDB)"
+      ansible.builtin.set_fact:
+        sync_targets: >-
+          {{ sync_targets | default([]) + [ {
+               'host': item.0.item,
+               'sid': item.1,
+               'label': item.0.item ~ ':' ~ item.1
+             } ] }}
+      loop: "{{ sync_pdb_clean | subelements('stdout_lines', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.item }}:{{ item.1 }}"
 
-  - name: Final summary
-    ansible.builtin.debug:
-      msg:
-      - "======================================================"
-      - "  u_u_oracle_target sync summary"
-      - "======================================================"
-      - "  Targets in oracle_instance_map : {{ sync_targets | length }}"
-      - "  Created                        : {{ sync_jobs | selectattr('existing_sys_id', 'equalto', '') | list | length }}"
-      - "  Already existed                : {{ sync_jobs | rejectattr('existing_sys_id', 'equalto', '') | list | length }}"
-      - "======================================================"
+    - name: "WARN about any host where PDB discovery failed"
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: could not list PDBs on {{ item.item }} (rc={{ item.rc }}). That host
+          contributes ZERO targets this run - existing rows for it are left untouched.
+          stderr: {{ item.stderr | default('') | truncate(300) }}
+      loop: "{{ sync_pdb_exec.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
+
+    - name: Show targets to sync
+      ansible.builtin.debug:
+        msg: "{{ sync_targets | default([]) | map(attribute='label') | list }}"
+
+    - name: Nothing to sync
+      ansible.builtin.meta: end_play
+      when: sync_targets | default([]) | length == 0
+
+    - name: Check whether each target already exists in u_u_oracle_target
+      ansible.builtin.uri:
+        url: >-
+          {{ sn_instance }}/api/now/table/u_u_oracle_target?sysparm_query={{
+            ('u_host=' + item.host + '^u_oracle_sid=' + item.sid) | urlencode
+          }}&sysparm_fields=sys_id,u_label&sysparm_limit=1
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      loop: "{{ sync_targets }}"
+      loop_control:
+        label: "{{ item.label }}"
+      register: sync_lookup
+
+    - name: Build create/update work list
+      ansible.builtin.set_fact:
+        sync_jobs: >-
+          {{ sync_jobs | default([]) + [ item.item | combine({
+               'existing_sys_id': (item.json.result | default([]) | first | default({})).sys_id | default(''),
+               'existing_label':  (item.json.result | default([]) | first | default({})).u_label | default('')
+             }) ] }}
+      loop: "{{ sync_lookup.results }}"
+      loop_control:
+        label: "{{ item.item.label }}"
+
+    - name: Create new targets that don't exist yet
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/u_u_oracle_target"
+        method: POST
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          u_host: "{{ item.host }}"
+          u_oracle_sid: "{{ item.sid }}"
+          u_label: "{{ item.label }}"
+        status_code: 201
+      loop: "{{ sync_jobs }}"
+      loop_control:
+        label: "{{ item.label }}"
+      when: item.existing_sys_id | length == 0
+      register: sync_created
+      failed_when: false
+
+    - name: Update targets whose label has drifted
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/u_u_oracle_target/{{ item.existing_sys_id }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          u_label: "{{ item.label }}"
+        status_code: 200
+      loop: "{{ sync_jobs }}"
+      loop_control:
+        label: "{{ item.label }}"
+      when:
+        - item.existing_sys_id | length > 0
+        - item.existing_label != item.label
+      failed_when: false
+
+    - name: Clean up temp files on each host
+      ansible.builtin.file:
+        path: "/tmp/snow_sync_oracle_targets"
+        state: absent
+      delegate_to: "{{ item }}"
+      loop: "{{ oracle_instance_map.keys() | list }}"
+      loop_control:
+        label: "{{ item }}"
+      failed_when: false
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          - "======================================================"
+          - "  u_u_oracle_target sync summary (PDB-level)"
+          - "======================================================"
+          - "  PDB targets discovered         : {{ sync_targets | length }}"
+          - "  Created                        : {{ sync_jobs | selectattr('existing_sys_id', 'equalto', '') | list | length }}"
+          - "  Already existed                : {{ sync_jobs | rejectattr('existing_sys_id', 'equalto', '') | list | length }}"
+          - "======================================================"

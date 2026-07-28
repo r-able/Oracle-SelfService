@@ -169,6 +169,13 @@
 #    than parsed out of the AWR report text (far more reliable). Output
 #    is a plain "SQL_ID|CPU_SECONDS" line per row for easy parsing.
 # -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Re-ensure working directory exists (defensive - a directory that existed one task earlier disappearing before the next write was observed in testing; cause not fully understood, this is a cheap guard against it recurring)"
+  ansible.builtin.file:
+    path: "{{ prf_work_dir }}"
+    state: directory
+    mode: '0777'
+  delegate_to: "{{ job.target_host }}"
+
 - name: "JOB | {{ job.issue_key }} | Write top-5 CPU SQL_ID query"
   ansible.builtin.copy:
     dest: "{{ prf_work_dir }}/top5.sql"
@@ -186,6 +193,7 @@
       )
       WHERE ROWNUM <= 5;
       EXIT;
+  delegate_to: "{{ job.target_host }}"
   when: prf_success
 
 - name: "JOB | {{ job.issue_key }} | Write execution wrapper (explicit ORACLE_SID export)"
@@ -251,6 +259,13 @@
 - name: "JOB | {{ job.issue_key }} | Write and run SQL Tuning Advisor for each SQL_ID"
   when: prf_success
   block:
+
+    - name: "JOB | {{ job.issue_key }} | Re-ensure working directory exists (defensive, same guard as before top5.sql)"
+      ansible.builtin.file:
+        path: "{{ prf_work_dir }}"
+        state: directory
+        mode: '0777'
+      delegate_to: "{{ job.target_host }}"
 
     - name: "JOB | {{ job.issue_key }} | Write tuning advisor script for {{ item.sql_id }}"
       ansible.builtin.copy:
