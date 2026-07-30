@@ -148,60 +148,15 @@
            | zip(dcr_annotated | default([]) | map(attribute='env')) | list }}.
         Only changes assigned to '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}' are considered.
 
-  # -- ALL environments now require MANAGEMENT approval (removed the old
-  #    non-PROD no-approval bypass) -------------------------------------------
-
-  # -- PROD: request approval on new changes (move to assess), do NOT run yet -
-  - name: "0 | Request approval for new changes (state=assess)"
-    servicenow.itsm.change_request:
-      instance:
-        host: "{{ sn_instance }}"
-        username: "{{ sn_username }}"
-        password: "{{ sn_password }}"
-      sys_id: "{{ item.sys_id }}"
-      state: assess
-    loop: "{{ dcr_annotated | default([]) }}"
-    loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
-    when:
-    - item.state == snow_state_new
-    - item.approval in ['not requested', 'not_requested', '']
-    failed_when: false
-
-  - name: "0 | Note changes awaiting approval"
-    ansible.builtin.debug:
-      msg: >-
-        Change {{ item.number }} ({{ item.env }}) requires management approval before it will run. It is at Assess with approval requested and will execute on a later pass once approved.
-    loop: "{{ dcr_annotated | default([]) }}"
-    loop_control:
-      label: "{{ item.number }}"
-    when:
-    - item.state == snow_state_assess
-    - item.approval != 'approved'
-
-  # -- Once APPROVED: walk Assess -> Authorize -> Scheduled -> Implement
-  # The change model refuses each of these hops until the approval is granted,
-  # so these only fire once approval=approved.
-  - name: "0 | APPROVED: assess -> authorize"
-    servicenow.itsm.change_request:
-      instance:
-        host: "{{ sn_instance }}"
-        username: "{{ sn_username }}"
-        password: "{{ sn_password }}"
-      sys_id: "{{ item.sys_id }}"
-      state: authorize
-      assignment_group: "{{ snow_assignment_group }}"
-      other:
-        assigned_to: "{{ snow_assigned_to }}"
-    loop: "{{ dcr_annotated | default([]) }}"
-    loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
-    when:
-    - item.state == snow_state_assess
-    - item.approval == 'approved'
-    failed_when: false
-
-  - name: "0 | APPROVED: authorize -> scheduled"
+  # -- Non-PROD: promote straight to implement (no approval) ------------------
+  # Standard/pre-approved changes must walk the state lifecycle in order
+  # (new -> scheduled -> implement); ServiceNow's "Change Model: Check State
+  # Transition" business rule rejects a direct new -> implement jump. The
+  # servicenow.itsm module also requires assignment_group (and we keep
+  # assigned_to) present on these writes, so both are passed every step.
+  # Non-PROD DCRs need no approval, so we walk both steps here; a WARNING
+  # surfaces any CR the model still refuses instead of silently leaving it New.
+  - name: "0 | Promote NON-PROD new changes to scheduled (step 1 of 2)"
     servicenow.itsm.change_request:
       instance:
         host: "{{ sn_instance }}"
@@ -216,11 +171,12 @@
     loop_control:
       label: "{{ item.number }} ({{ item.env }})"
     when:
-    - item.state in [snow_state_assess, snow_state_authorize]
-    - item.approval == 'approved'
+    - not item.is_prod
+    - item.state == snow_state_new
+    register: dcr_promote_sched
     failed_when: false
 
-  - name: "0 | APPROVED: scheduled -> implement"
+  - name: "0 | Promote NON-PROD changes to implement (step 2 of 2)"
     servicenow.itsm.change_request:
       instance:
         host: "{{ sn_instance }}"
@@ -235,13 +191,118 @@
     loop_control:
       label: "{{ item.number }} ({{ item.env }})"
     when:
+    - not item.is_prod
+    - item.state in [snow_state_new, snow_state_scheduled]
+    register: dcr_promote_impl
+    failed_when: false
+
+  - name: "0 | WARN about any NON-PROD change that could not be advanced to implement"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.number }} ({{ item.item.env }}) could not be moved to implement: {{ item.msg | default('see ServiceNow change model / required fields') }}. It will remain in its current state and not run this pass.
+    loop: "{{ dcr_promote_impl.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.number | default('skipped') }}"
+    when:
+    - item is not skipped
+    - item.failed | default(false)
+
+  # -- PROD: request approval on new changes (move to assess), do NOT run yet -
+  - name: "0 | Request approval for PROD new changes (state=assess, no CAB)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: assess
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state == snow_state_new
+    - item.approval in ['not requested', 'not_requested', '']
+    failed_when: false
+
+  - name: "0 | Note PROD changes awaiting approval"
+    ansible.builtin.debug:
+      msg: >-
+        PROD change {{ item.number }} requires approval before it will run. It is at Assess with approval requested and will execute on a later pass once approved. CAB is not required.
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }}"
+    when:
+    - item.is_prod
+    - item.state == snow_state_assess
+    - item.approval != 'approved'
+
+  # -- PROD, once APPROVED: walk Assess -> Authorize -> Scheduled -> Implement
+  # The change model refuses each of these hops until the approval is granted,
+  # so these only fire for PROD changes sitting at Assess with approval=approved.
+  - name: "0 | APPROVED PROD: assess -> authorize"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: authorize
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state == snow_state_assess
+    - item.approval == 'approved'
+    failed_when: false
+
+  - name: "0 | APPROVED PROD: authorize -> scheduled"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
+    - item.state in [snow_state_assess, snow_state_authorize]
+    - item.approval == 'approved'
+    failed_when: false
+
+  - name: "0 | APPROVED PROD: scheduled -> implement"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }} ({{ item.env }})"
+    when:
+    - item.is_prod
     - item.state in [snow_state_assess, snow_state_authorize, snow_state_scheduled]
     - item.approval == 'approved'
     failed_when: false
 
   # -- Re-query for the executable queue -------------------------------------
-  # A change is executable when it is in 'implement' and approval has been
-  # granted (approval not in requested/rejected).
+  # A change is executable when it is in 'implement' AND (non-PROD, or PROD
+  # whose approval has been granted -- approval not in requested/rejected).
   - name: "0 | Re-query for the executable queue"
     ansible.builtin.uri:
       url: >-
