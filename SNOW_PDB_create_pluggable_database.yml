@@ -79,7 +79,8 @@
       url: >-
         {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
           ('short_descriptionSTARTSWITH' + snow_tag + ' |^stateIN'
-           + snow_state_new + ',' + snow_state_scheduled + ',' + snow_state_implement
+           + snow_state_new + ',' + snow_state_assess + ',' + snow_state_authorize + ','
+           + snow_state_scheduled + ',' + snow_state_implement
            + '^assignment_group.name=' + snow_assignment_group
            + '^assigned_to.name=' + snow_assigned_to
            + '^ORDERBYsys_created_on') | urlencode
@@ -163,11 +164,70 @@
     loop_control:
       label: "{{ item.issue_key }}"
 
-  # --- Promote new -> scheduled -> implement ---------------------------
-  # The change model refuses a direct new -> implement jump, so both hops
-  # are required. assignment_group must be a TOP-LEVEL module parameter on
-  # these writes; assigned_to is not a module parameter and goes in `other`.
-  - name: "2 | Promote new changes to scheduled (step 1 of 2)"
+  # --- Promote new -> assess (wait for approval) -> authorize -> scheduled
+  #     -> implement ----------------------------------------------------
+  # PDB requires MANAGEMENT approval: a single approval wait at Assess,
+  # then automatic pass-through Authorize->Scheduled once approved - no
+  # second approval wait. assignment_group must be a TOP-LEVEL module
+  # parameter on these writes; assigned_to is not a module parameter and
+  # goes in `other`.
+  - name: "2 | New change - request approval (state=assess)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: assess
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.state == snow_state_new
+    failed_when: false
+
+  - name: "2 | Work note: awaiting approval"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        work_notes: >-
+          PDB: create PDB {{ item.pdb_name }} in {{ item.cdb_name }} on
+          {{ item.target_host }} moved to Assess - awaiting management
+          approval before anything is touched.
+      status_code: 200
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.state == snow_state_new
+    failed_when: false
+
+  - name: "2 | Advance approved changes from Assess to Authorize"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ item.sys_id }}"
+      state: authorize
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when:
+    - item.state == snow_state_assess
+    - item.approval == 'approved'
+    failed_when: false
+
+  - name: "2 | Advance changes from Authorize to Scheduled"
     servicenow.itsm.change_request:
       instance:
         host: "{{ sn_instance }}"
@@ -181,10 +241,10 @@
     loop: "{{ pdb_jobs }}"
     loop_control:
       label: "{{ item.issue_key }}"
-    when: item.state == snow_state_new
+    when: item.state == snow_state_authorize
     failed_when: false
 
-  - name: "2 | Promote changes to implement (step 2 of 2)"
+  - name: "2 | Advance changes from Scheduled to Implement"
     servicenow.itsm.change_request:
       instance:
         host: "{{ sn_instance }}"
@@ -198,7 +258,7 @@
     loop: "{{ pdb_jobs }}"
     loop_control:
       label: "{{ item.issue_key }}"
-    when: item.state in [snow_state_new, snow_state_scheduled]
+    when: item.state == snow_state_scheduled
     register: pdb_promote
     failed_when: false
 
@@ -212,6 +272,43 @@
     when:
     - item is not skipped
     - item.failed | default(false)
+
+  # --- Re-query and filter: only genuinely-implemented jobs may proceed --
+  # CRITICAL: without this, a CR still sitting in Assess/Authorize/Scheduled
+  # awaiting approval would still have its PDB created below, since the
+  # execution steps loop over pdb_jobs unconditionally. pdb_jobs was built
+  # from a query taken BEFORE this run's promotion attempts, so its 'state'
+  # field is stale - a fresh query is required to know what's REALLY at
+  # Implement right now.
+  - name: "2 | Re-query for CRs that are genuinely at Implement now"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/table/change_request?sysparm_query={{
+          ('short_descriptionSTARTSWITH' + snow_tag + ' |^state=' + snow_state_implement
+           + '^assignment_group.name=' + snow_assignment_group
+           + '^assigned_to.name=' + snow_assigned_to) | urlencode
+        }}&sysparm_fields=sys_id&sysparm_limit={{ sn_max_results }}
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: pdb_implement_query
+    failed_when: false
+
+  - name: "2 | Filter pdb_jobs down to only the genuinely-implemented ones"
+    ansible.builtin.set_fact:
+      pdb_jobs: >-
+        {{
+          pdb_jobs
+          | selectattr('sys_id', 'in', (pdb_implement_query.json.result | default([]) | map(attribute='sys_id') | list))
+          | list
+        }}
+
+  - name: "2 | Nothing ready to execute this pass (still pending approval)"
+    ansible.builtin.meta: end_play
+    when: pdb_jobs | length == 0
 
   - name: "2 | Work note: PDB creation started"
     ansible.builtin.uri:

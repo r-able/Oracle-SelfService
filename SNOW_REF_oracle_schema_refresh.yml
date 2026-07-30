@@ -91,6 +91,7 @@
     ansible.builtin.include_tasks: COMMON_snow_intake.yml
     vars:
       snow_tag: "REF"
+      sn_type: "standard"
 
   - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
     ansible.builtin.debug:

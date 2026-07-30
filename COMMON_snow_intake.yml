@@ -79,7 +79,7 @@
       ({{ snow_all | map(attribute='number') | list | join(', ') | default('none', true) }}).
       CRs assigned to anyone else are ignored and left for humans.
 
-# --- Shepherd: request approval for new NORMAL changes ----------------------
+# --- Shepherd: request approval for new NORMAL changes (state=assess) ------
 - name: "SNOW | {{ snow_tag }} | Request approval for new normal changes (state=assess)"
   servicenow.itsm.change_request:
     instance:
@@ -114,6 +114,63 @@
   when:
   - item.state == snow_state_new
   - (sn_type | default('standard')) == 'standard' or item.approval == 'approved'
+  failed_when: false
+
+# --- Shepherd: walk approved NORMAL changes through Authorize/Scheduled ----
+# COMMON_snow_intake.yml previously had NO path from Assess to Implement for
+# normal-type changes once approved - this was a real gap (only New->Assess
+# and New->Implement existed). Fixed to match DDP's proven pattern: a single
+# approval gate at Assess, then automatic pass-through Authorize->Scheduled
+# once approved - no second approval wait. Converges one hop per cron run
+# (same eventually-consistent style as the rest of this file), rather than
+# attempting all hops in a single pass.
+- name: "SNOW | {{ snow_tag }} | Advance approved changes from Assess to Authorize"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ item.sys_id }}"
+    state: authorize
+  loop: "{{ snow_all }}"
+  loop_control:
+    label: "{{ item.number }}"
+  when:
+  - item.state == 'assess'
+  - (sn_type | default('standard')) == 'normal'
+  - item.approval == 'approved'
+  failed_when: false
+
+- name: "SNOW | {{ snow_tag }} | Advance changes from Authorize to Scheduled"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ item.sys_id }}"
+    state: scheduled
+  loop: "{{ snow_all }}"
+  loop_control:
+    label: "{{ item.number }}"
+  when:
+  - item.state == 'authorize'
+  - (sn_type | default('standard')) == 'normal'
+  failed_when: false
+
+- name: "SNOW | {{ snow_tag }} | Advance changes from Scheduled to Implement"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    sys_id: "{{ item.sys_id }}"
+    state: implement
+  loop: "{{ snow_all }}"
+  loop_control:
+    label: "{{ item.number }}"
+  when:
+  - item.state == 'scheduled'
+  - (sn_type | default('standard')) == 'normal'
   failed_when: false
 
 # --- Re-query and build the executable work list ----------------------------

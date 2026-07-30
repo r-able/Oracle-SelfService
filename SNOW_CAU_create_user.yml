@@ -80,6 +80,7 @@
     ansible.builtin.include_tasks: COMMON_snow_intake.yml
     vars:
       snow_tag: "CAU"
+      sn_type: "normal"
 
   - name: "1 | Show 'No Tasks Found' message when queue is empty"
     ansible.builtin.debug:
