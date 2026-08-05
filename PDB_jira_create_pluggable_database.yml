@@ -1,0 +1,700 @@
+---
+# PDB_jira_create_pluggable_database.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# Jira -> create an Oracle Pluggable Database (PDB) inside a CDB.
+# Mirror image of the SNOW_PDB_create_pluggable_database.yml playbook,
+# following the same 3-play Jira-driven workflow as REF/UPG/PAT:
+#
+#   PLAY 1 (localhost)   : shepherd intake (To Do -> Pending Approval ->
+#                          In Progress on approval) -> JQL search for
+#                          'In Progress' issues -> parse host/CDB/new-PDB
+#                          fields -> pre-flight validation
+#   PLAY 2 (oracle_host) : inspect the container -> generate admin password
+#                          -> CREATE PLUGGABLE DATABASE -> OPEN READ WRITE
+#                          -> SAVE STATE -> capture v$pdbs before/after as
+#                          evidence
+#   PLAY 3 (localhost)   : post the result as a comment (admin password
+#                          goes ONLY here, never in the attached log) ->
+#                          attach the evidence log -> transition Done/
+#                          Failed -> on Failed, open a DBA repair follow-up
+#                          task -> final summary
+#
+# BEHAVIOUR (matches the SNOW version):
+#   * if the PDB already exists the creation is SKIPPED and the issue is
+#     closed Done with evidence -- re-running is safe and idempotent.
+#   * v$pdbs is captured before and after and attached as proof.
+#   * the PDB admin password is posted in a COMMENT only, never written to
+#     the attached log.
+#   * approval is handled entirely by COMMON_jira_shepherd_statuses.yml
+#     (To Do -> Pending Approval -> In Progress once every entry in the
+#     Jira approvals field has finalDecision == 'approved') -- unlike the
+#     SNOW version there is no separate multi-state walk to build here,
+#     Jira's shepherd already generalizes across every project.
+#
+# NOTE: the three custom field IDs below (pdb_host_field, pdb_cdb_field,
+# pdb_new_field) are PLACEHOLDER assumptions following the CAU/PAT/DDP
+# pattern of parameterized select/text custom fields. Confirm the real
+# field IDs in the actual PDB project and update vars/main.yml -- the
+# same self-diagnosing WARNING pattern used everywhere else in this suite
+# is included below, so a mismatch is obvious on first run rather than
+# failing silently.
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   # Jira
+#   jira_url, jira_user, jira_api_token, jira_cloud
+#   jira_jql_pdb       : "project = PDB AND status = 'In Progress'"
+#   jira_max_results, jira_status_done, jira_status_failed
+#   pdb_host_field     : "customfield_10760"   # select/text: target host
+#   pdb_cdb_field      : "customfield_10761"   # text: container DB name
+#   pdb_new_field      : "customfield_10762"   # text: new PDB name
+#
+#   # Oracle (per-host lookup, same shape as SNOW's oracle_instance_map)
+#   oracle_instance_map: { lnx001: { oracle_sid: CDB1, oracle_home: ...,
+#                                     oracle_user: oracle }, ... }
+#
+#   # Follow-up
+#   jira_followup_enabled, followup_log_dir
+#
+# Usage:
+#   ansible-playbook PDB_jira_create_pluggable_database.yml --ask-vault-pass
+# =============================================================================
+
+# -- PLAY 1: Ansible controller -- fetch Jira issues, validate spec ----------
+- name: "PLAY 1 | Fetch Jira PDB creation tasks and validate the spec fields"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    pdb_admin_user: "PDBADMIN"
+    pdb_log_dir: "/tmp/jira_pdb_logs"
+    pdb_name_pattern: '^[A-Za-z][A-Za-z0-9_]{0,29}$'
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  - name: "0 | Shepherd PDB intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "PDB"
+
+  - name: "1 | Search Jira for PDB issues ready to execute"
+    ansible.builtin.uri:
+      url: >-
+        {{ jira_url }}/rest/api/3/search/jql?jql={{
+          jira_jql_pdb | urlencode
+        }}&fields=status,{{ pdb_host_field }},{{ pdb_cdb_field }},{{ pdb_new_field }}&maxResults={{ jira_max_results }}
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: jira_search
+    failed_when: false
+
+  - name: "1 | Collect issues found"
+    ansible.builtin.set_fact:
+      pdb_all: "{{ jira_search.json.issues | default([]) }}"
+
+  - name: "1 | Intake summary"
+    ansible.builtin.debug:
+      msg: >-
+        PDB: {{ pdb_all | length }} issue(s) in progress ({{ pdb_all | map(attribute='key') | list | join(', ') | default('none', true) }}).
+
+  - name: "1 | Exit cleanly when there is nothing to do"
+    ansible.builtin.meta: end_play
+    when: pdb_all | length == 0
+
+  - name: "1 | WARN and skip issues with an unusable spec"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.key }} has an unusable spec -- skipping. host='{{ p_host }}' cdb='{{ p_cdb }}' new_pdb='{{ p_new }}'. {% if p_host not in oracle_instance_map %}Unknown host '{{ p_host }}' (known: {{ oracle_instance_map.keys() | list | join(', ') }}). {% endif %} {% if p_new is not match(pdb_name_pattern) %}'{{ p_new }}' is not a valid PDB name (letter first, then letters/digits/underscore, max 30). {% endif %} Check pdb_host_field/pdb_cdb_field/pdb_new_field in vars/main.yml against the real custom field IDs.
+    loop: "{{ pdb_all }}"
+    loop_control:
+      label: "{{ item.key }}"
+    vars:
+      p_host: "{{ item.fields[pdb_host_field] | default('') | trim }}"
+      p_cdb: "{{ item.fields[pdb_cdb_field] | default('') | trim | upper }}"
+      p_new: "{{ item.fields[pdb_new_field] | default('') | trim | upper }}"
+    when: >-
+      p_host not in oracle_instance_map or p_cdb | length == 0 or p_new is not match(pdb_name_pattern)
+
+  - name: "1 | Build the PDB creation job list"
+    ansible.builtin.set_fact:
+      pdb_jobs: >-
+        {{
+          pdb_jobs | default([]) + [{
+            'issue_key':   item.key,
+            'target_host': p_host,
+            'cdb_name':    p_cdb,
+            'pdb_name':    p_new,
+            'oracle_sid':  oracle_instance_map[p_host].oracle_sid,
+            'oracle_home': oracle_instance_map[p_host].oracle_home,
+            'oracle_user': oracle_instance_map[p_host].oracle_user
+          }]
+        }}
+    loop: "{{ pdb_all }}"
+    loop_control:
+      label: "{{ item.key }}"
+    vars:
+      p_host: "{{ item.fields[pdb_host_field] | default('') | trim }}"
+      p_cdb: "{{ item.fields[pdb_cdb_field] | default('') | trim | upper }}"
+      p_new: "{{ item.fields[pdb_new_field] | default('') | trim | upper }}"
+    when:
+    - p_host in oracle_instance_map
+    - p_cdb | length > 0
+    - p_new is match(pdb_name_pattern)
+
+  - name: "1 | Nothing valid to process"
+    ansible.builtin.meta: end_play
+    when: pdb_jobs | default([]) | length == 0
+
+  - name: "1 | Jobs queued"
+    ansible.builtin.debug:
+      msg: "{{ item.issue_key }} -- create PDB {{ item.pdb_name }} in {{ item.cdb_name }} on {{ item.target_host }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "1 | Write job list for PLAY 2"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_pdb_jobs.json"
+      content: "{{ pdb_jobs | to_json }}"
+      mode: '0640'
+
+  - name: "1 | Remove stale outcomes file from any previous run"
+    ansible.builtin.file:
+      path: "/tmp/jira_pdb_outcomes.json"
+      state: absent
+
+# -- PLAY 2: runs directly on the Oracle host --------------------------------
+- name: "PLAY 2 | Create the pluggable database(s) on the Oracle host"
+  hosts: "{{ oracle_host }}"
+  gather_facts: false
+  become: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    pdb_admin_user: "PDBADMIN"
+
+  tasks:
+
+  - name: "2 | Slurp the job list from the controller"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_pdb_jobs.json"
+    delegate_to: localhost
+    register: pdb_jobs_raw
+
+  - name: "2 | Decode the job list"
+    ansible.builtin.set_fact:
+      pdb_jobs: "{{ pdb_jobs_raw.content | b64decode | from_json }}"
+
+  - name: "2 | Capture container state, OMF setting and seed datafile path"
+    ansible.builtin.shell:
+      cmd: |
+        set -o pipefail
+        export ORACLE_SID={{ item.oracle_sid }}
+        export ORACLE_HOME={{ item.oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOSQL'
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 400 TRIMSPOOL ON
+        SELECT 'CDB=' || CDB FROM v$database;
+        SELECT 'DBNAME=' || name FROM v$database;
+        SELECT 'PDBEXISTS=' || COUNT(*) FROM v$pdbs WHERE UPPER(name) = UPPER('{{ item.pdb_name }}');
+        SELECT 'OMF=' || NVL(MAX(value),'NONE') FROM v$parameter WHERE name = 'db_create_file_dest';
+        SELECT 'SEEDFILE=' || MIN(name) FROM v$datafile WHERE con_id = 2;
+        EXIT;
+        EOSQL
+      executable: /bin/bash
+    become_user: "{{ item.oracle_user }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.cdb_name }}"
+    register: pdb_precheck
+    changed_when: false
+    failed_when: false
+
+  - name: "2 | Fold the pre-check results into each job"
+    ansible.builtin.set_fact:
+      pdb_jobs: >-
+        {{
+          pdb_jobs
+          | rejectattr('issue_key', 'equalto', item.item.issue_key)
+          | list
+          + [ item.item | combine({
+                'precheck_out':    item.stdout | default(''),
+                'is_cdb':          ('CDB=YES' in (item.stdout | default(''))),
+                'already_exists':  (((item.stdout | default('')).splitlines() | select('match', 'PDBEXISTS=') | map('regex_replace', '^PDBEXISTS=', '') | list | first | default('0') | int) > 0),
+                'omf_dest':        ((item.stdout | default('')).splitlines() | select('match', 'OMF=') | map('regex_replace', '^OMF=', '') | list | first | default('NONE') | trim),
+                'seed_file':       ((item.stdout | default('')).splitlines() | select('match', 'SEEDFILE=') | map('regex_replace', '^SEEDFILE=', '') | list | first | default('') | trim)
+              }) ]
+        }}
+    loop: "{{ pdb_precheck.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+
+  - name: "2 | Show what the pre-check found"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }}: container is CDB? {{ item.is_cdb }} | {{ item.pdb_name }} already exists? {{ item.already_exists }} | OMF: {{ item.omf_dest }}
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "3 | Generate a PDB admin password for each job"
+    ansible.builtin.set_fact:
+      pdb_jobs: >-
+        {{
+          pdb_jobs
+          | rejectattr('issue_key', 'equalto', item.issue_key)
+          | list
+          + [ item | combine({
+                'admin_password': lookup('password', '/dev/null length=16 chars=ascii_letters,digits') + 'Ab1_'
+              }) ]
+        }}
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    no_log: true
+
+  - name: "3 | Create the datafile directory when OMF is not in use"
+    ansible.builtin.file:
+      path: "{{ (item.seed_file | dirname | dirname) + '/' + item.pdb_name }}"
+      state: directory
+      owner: "{{ item.oracle_user }}"
+      mode: '0750'
+    become_user: root
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when:
+    - item.is_cdb
+    - not item.already_exists
+    - item.omf_dest in ['NONE', '']
+    - item.seed_file | length > 0
+    failed_when: false
+
+  - name: "3 | Create, open and save the state of the pluggable database"
+    ansible.builtin.shell:
+      cmd: |
+        set -o pipefail
+        export ORACLE_SID={{ item.oracle_sid }}
+        export ORACLE_HOME={{ item.oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOSQL'
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET ECHO ON FEEDBACK ON LINESIZE 400 PAGESIZE 200
+        SET SQLBLANKLINES ON
+        CREATE PLUGGABLE DATABASE "{{ item.pdb_name }}" ADMIN USER "{{ pdb_admin_user }}" IDENTIFIED BY "{{ item.admin_password }}"{{ pdb_storage_clause }};
+        ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" OPEN READ WRITE;
+        ALTER SESSION SET CONTAINER = "{{ item.pdb_name }}";
+        GRANT CONNECT, RESOURCE, CREATE SESSION TO "{{ pdb_admin_user }}";
+        ALTER SESSION SET CONTAINER = CDB$ROOT;
+        ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" SAVE STATE;
+        EXIT;
+        EOSQL
+      executable: /bin/bash
+    become_user: "{{ item.oracle_user }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.pdb_name }}"
+    vars:
+      pdb_storage_clause: >-
+        {{ (" FILE_NAME_CONVERT = ('" + (item.seed_file | dirname) + "/', '"
+            + (item.seed_file | dirname | dirname) + "/" + item.pdb_name + "/')")
+           if (item.omf_dest in ['NONE', ''] and (item.seed_file | default('') | length) > 0
+               and (item.seed_file | dirname | dirname | length) > 1)
+           else '' }}
+    register: pdb_create
+    when:
+    - item.is_cdb
+    - not item.already_exists
+    failed_when: false
+    no_log: true
+
+  - name: "4 | Capture v$pdbs after the operation"
+    ansible.builtin.shell:
+      cmd: |
+        set -o pipefail
+        export ORACLE_SID={{ item.oracle_sid }}
+        export ORACLE_HOME={{ item.oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOSQL'
+        SET HEADING ON FEEDBACK OFF PAGESIZE 200 LINESIZE 200
+        COLUMN name FORMAT A30
+        COLUMN open_mode FORMAT A12
+        COLUMN restricted FORMAT A10
+        SELECT con_id, name, open_mode, restricted FROM v$pdbs ORDER BY con_id;
+        EXIT;
+        EOSQL
+      executable: /bin/bash
+    become_user: "{{ item.oracle_user }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    register: pdb_postcheck
+    changed_when: false
+    failed_when: false
+
+  - name: "4 | Determine the outcome for each issue"
+    ansible.builtin.set_fact:
+      pdb_outcomes: >-
+        {{
+          pdb_outcomes | default({}) | combine({
+            item.issue_key: (
+              'done' if (
+                item.already_exists
+                or (
+                  item.is_cdb
+                  and ((pdb_create.results | default([])
+                        | selectattr('item.issue_key', 'defined')
+                        | selectattr('item.issue_key', 'equalto', item.issue_key)
+                        | map(attribute='rc') | list | first | default(1)) == 0)
+                )
+              ) else 'failed'
+            )
+          })
+        }}
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "4 | Per-issue outcome"
+    ansible.builtin.debug:
+      msg: "{{ item.key }} -> {{ item.value | upper }}"
+    loop: "{{ pdb_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+
+  - name: "5 | Ensure the log directory exists on controller"
+    ansible.builtin.file:
+      path: "/tmp/jira_pdb_logs"
+      state: directory
+      mode: '0750'
+    delegate_to: localhost
+
+  - name: "5 | Set the run timestamp"
+    ansible.builtin.set_fact:
+      pdb_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+
+  - name: "5 | Write the evidence log for each issue (admin password intentionally omitted)"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_pdb_logs/PDB_{{ item.issue_key }}_{{ pdb_run_ts }}.log"
+      mode: '0640'
+      content: |
+        Automated Oracle Pluggable Database creation -- evidence log
+        ======================================================================
+        Issue            : {{ item.issue_key }}
+        Host             : {{ item.target_host }}
+        Container (CDB)  : {{ item.cdb_name }}  (ORACLE_SID {{ item.oracle_sid }})
+        New PDB          : {{ item.pdb_name }}
+        Oracle home      : {{ item.oracle_home }}
+        Timestamp        : {{ '%Y-%m-%dT%H:%M:%S' | strftime }}
+        Outcome          : {{ pdb_outcomes[item.issue_key] | upper }}
+        Already existed  : {{ item.already_exists }}
+        ======================================================================
+        -- Container pre-check --------------------------------------------
+        {{ item.precheck_out | trim }}
+
+        -- Creation output -------------------------------------------------
+        {% for r in pdb_create.results | default([]) if (r.item.issue_key | default('')) == item.issue_key and r.rc is defined %}
+        rc={{ r.rc }}
+        {{ (r.stdout | default('(no output)')) | trim }}
+        {% if r.rc != 0 %}
+        stderr:
+        {{ (r.stderr | default('(none)')) | trim }}
+        {% endif %}
+        {% else %}
+        (creation skipped -- {{ 'the PDB already existed' if item.already_exists else 'the container check failed' }})
+        {% endfor %}
+
+        -- v$pdbs after the operation --------------------------------------
+        {% for r in pdb_postcheck.results | default([]) if (r.item.issue_key | default('')) == item.issue_key %}
+        {{ (r.stdout | default('(no output)')) | trim }}
+        {% endfor %}
+        ======================================================================
+        NOTE: the PDB admin password is intentionally omitted from this log.
+        It is posted as a Jira comment on the issue.
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    delegate_to: localhost
+
+  - name: "5 | Write outcomes + job data for PLAY 3"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_pdb_outcomes.json"
+      content: >-
+        {{
+          {
+            'jobs': pdb_jobs,
+            'outcomes': pdb_outcomes,
+            'run_ts': pdb_run_ts
+          } | to_json
+        }}
+      mode: '0640'
+    delegate_to: localhost
+    no_log: true
+
+# -- PLAY 3: Ansible controller -- comment, attach, transition, follow-up ---
+- name: "PLAY 3 | Post results and transition issues based on creation outcomes"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "6 | Slurp outcomes from PLAY 2"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_pdb_outcomes.json"
+    register: pdb_outcomes_raw
+    no_log: true
+
+  - name: "6 | Decode outcomes"
+    ansible.builtin.set_fact:
+      pdb_jobs: "{{ (pdb_outcomes_raw.content | b64decode | from_json).jobs }}"
+      pdb_outcomes: "{{ (pdb_outcomes_raw.content | b64decode | from_json).outcomes }}"
+      pdb_run_ts: "{{ (pdb_outcomes_raw.content | b64decode | from_json).run_ts }}"
+    no_log: true
+
+  - name: "6 | Attach the evidence log to each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: attach
+      issue: "{{ item.issue_key }}"
+      attachment:
+        filename: "/tmp/jira_pdb_logs/PDB_{{ item.issue_key }}_{{ pdb_run_ts }}.log"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    ignore_errors: true
+
+  - name: "7 | Post the result comment (admin password goes ONLY here)"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.issue_key }}"
+      comment: |
+        *Automated PDB creation -- {{ pdb_outcomes[item.issue_key] | upper }}*
+
+        ||Field||Value||
+        |Host|{{ item.target_host }}|
+        |Container|{{ item.cdb_name }}|
+        |Pluggable DB|{{ item.pdb_name }}|
+        {% if item.already_exists %}
+        The pluggable database {{ item.pdb_name }} already existed; no
+        creation was attempted and nothing was changed. The current v$pdbs
+        listing is attached as proof.
+        {% elif pdb_outcomes[item.issue_key] == 'done' %}
+        The pluggable database was created, opened READ WRITE and its state
+        saved so it re-opens automatically when the container restarts.
+
+        |PDB admin user|{{ pdb_admin_user | default('PDBADMIN') }}|
+        |Temporary password|{{ item.admin_password }}|
+
+        ! *Please change this password immediately after first use and do
+        not share this comment outside the team.*
+        {% else %}
+        The creation FAILED. See the attached evidence log for the full
+        SQL*Plus output. A DBA repair follow-up task is being raised.
+        {% endif %}
+        Executed by: Ansible automation ({{ jira_auth_check.json.displayName | default('service account') }})
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ pdb_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    failed_when: false
+    no_log: true
+
+  - name: "8 | Get available transitions for DONE issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ pdb_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'done'
+    register: pdb_done_transitions
+    failed_when: false
+
+  - name: "8 | Transition DONE issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ pdb_done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_done }}'. Set jira_status_done in vars/main.yml to a real workflow status.
+    loop: "{{ pdb_done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+
+  - name: "8 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ pdb_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'failed'
+    register: pdb_failed_transitions
+    failed_when: false
+
+  - name: "8 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ pdb_failed_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_failed }}'. Set jira_status_failed in vars/main.yml to a real workflow status.
+    loop: "{{ pdb_failed_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+
+  - name: "9 | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ pdb_outcomes | dict2items }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.value == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.key }}"
+      fu_job: "{{ pdb_jobs | selectattr('issue_key', 'equalto', fu_item.key) | first }}"
+      fu_summary: "DBA repair required: could not create PDB {{ fu_job.pdb_name }} in {{ fu_job.cdb_name }} on {{ fu_job.target_host }}"
+      fu_description: |-
+        Automated Oracle pluggable database creation FAILED and the issue
+        has been transitioned to "{{ jira_status_failed }}". Please
+        investigate and repair.
+
+        Host            : {{ fu_job.target_host }}
+        Container (CDB) : {{ fu_job.cdb_name }} (ORACLE_SID {{ fu_job.oracle_sid }})
+        New PDB         : {{ fu_job.pdb_name }}
+        Container is CDB: {{ fu_job.is_cdb }}
+        PDB pre-existed : {{ fu_job.already_exists }}
+
+        The full SQL*Plus output and the v$pdbs listing are in the attached
+        evidence log.
+      fu_attach_files:
+      - "/tmp/jira_pdb_logs/PDB_{{ fu_item.key }}_{{ pdb_run_ts }}.log"
+
+  - name: "10 | Final summary"
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira PDB Creation Summary"
+      - "======================================================"
+      - "  Run timestamp   : {{ ansible_date_time.iso8601 }}"
+      - "  Issues found    : {{ pdb_jobs | length }}"
+      - "  Done            : {{ pdb_outcomes | dict2items | selectattr('value', 'equalto', 'done') | list | length }}"
+      - "  Failed          : {{ pdb_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length }}"
+      - "  Evidence logs   : /tmp/jira_pdb_logs"
+      - "======================================================"
