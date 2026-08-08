@@ -1,0 +1,85 @@
+---
+# COMMON_orchestration_spawn_step.yml
+#
+# Creates ONE dependent change request in ServiceNow, tagged so a future
+# domain module (or a human, for now) can find and act on it, plus the
+# u_orchestration_step record that tracks it.
+#
+# Called by COMMON_orchestration_gate_check.yml (for 'pre' dependencies)
+# and COMMON_orchestration_fire_post.yml (for 'post' dependencies) - both
+# share this exact same creation logic, only the caller differs.
+#
+# Required vars from the caller:
+#   orch_run_id          : the orchestration_runs.u_run_id this step belongs to
+#   orch_dep              : one entry from dependency_registry, i.e. a dict with
+#                            {ci, depends_on_ci, relationship, domain_module, on_failure}
+#   orch_primary_key      : the primary CR's number, e.g. CHG0033120 (for the
+#                            new CR's description, so a human can trace it back)
+#   orch_sequence_order    : integer position in the run
+#
+# Sets on return:
+#   orch_new_key           : the new CR's number (e.g. CHG0033121)
+
+- name: "ORCH | Create dependent change request for {{ orch_dep.depends_on_ci }} ({{ orch_dep.relationship }})"
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    short_description: >-
+      {{ orch_dep.domain_module }} | {{ orch_dep.depends_on_ci }} | triggered by {{ orch_primary_key }} ({{ orch_dep.relationship }}-dependency)
+    description: |-
+      Automatically opened by the orchestration core.
+
+      This change was created because {{ orch_primary_key }} affects
+      {{ orch_dep.ci }}, which has a registered '{{ orch_dep.relationship }}'
+      dependency on {{ orch_dep.depends_on_ci }} (domain: {{ orch_dep.domain_module }}).
+
+      {% if orch_dep.relationship == 'pre' %}
+      {{ orch_primary_key }} is BLOCKED until this change reaches Closed
+      Successful.
+      {% else %}
+      This change was opened because {{ orch_primary_key }} completed
+      successfully. {% if orch_dep.on_failure == 'block' %}A failure here will be escalated.{% else %}This is advisory - a failure here will be logged but will not retroactively affect {{ orch_primary_key }}.{% endif %}
+      {% endif %}
+
+      Run ID: {{ orch_run_id }}
+    type: standard
+    other:
+      assignment_group: "{{ orchestration_group | default(snow_assignment_group) }}"
+  register: orch_spawn_result
+  failed_when: false
+
+- name: "ORCH | Record the new CR's number"
+  ansible.builtin.set_fact:
+    orch_new_key: "{{ orch_spawn_result.record.number | default('') }}"
+    orch_new_sys_id: "{{ orch_spawn_result.record.sys_id | default('') }}"
+
+- name: "ORCH | WARN if the dependent change request could not be created"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not create the dependent change for
+      {{ orch_dep.depends_on_ci }} (domain {{ orch_dep.domain_module }}),
+      triggered by {{ orch_primary_key }}: {{ orch_spawn_result.msg | default('unknown error') }}
+  when: orch_new_key | length == 0
+
+- name: "ORCH | Insert the orchestration_step record"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/u_orchestration_step"
+    method: POST
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      u_run_id: "{{ orch_run_id }}"
+      u_ci: "{{ orch_dep.depends_on_ci }}"
+      u_key: "{{ orch_new_key }}"
+      u_domain_module: "{{ orch_dep.domain_module }}"
+      u_relationship: "{{ orch_dep.relationship }}"
+      u_sequence_order: "{{ orch_sequence_order | string }}"
+      u_status: "waiting"
+      u_on_failure: "{{ orch_dep.on_failure }}"
+    status_code: 201
+  when: orch_new_key | length > 0
+  failed_when: false

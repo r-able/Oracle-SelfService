@@ -1,0 +1,152 @@
+---
+# COMMON_orchestration_gate_check.yml
+#
+# Called by a domain module (PAT, first integration) at the exact point
+# it currently checks "am I approved and ready to implement." Adds one
+# more condition: does this CI have any unsatisfied 'pre' dependencies?
+#
+# First time a given (CI, primary CR) pair is seen, this CREATES the
+# dependent change request(s) for every registered 'pre' dependency and
+# reports the gate as NOT clear (since they were just opened - they can't
+# be done yet). On every subsequent pass, it checks whether those
+# dependent CRs have reached Closed Successful, and only reports the gate
+# clear once ALL of them have.
+#
+# MANUAL TESTING NOTE (until COMMON_orchestration_step_watch.yml exists):
+# nothing automatically watches the dependent CR's real ServiceNow state
+# and flips u_orchestration_step.u_status to 'done' yet. For now, close
+# the dependent CR AND manually update its u_orchestration_step record's
+# u_status to 'done' in ServiceNow to simulate that watcher - the next
+# run will then see the gate as clear. This manual step goes away once
+# the Step Watcher is built.
+#
+# Required vars from the caller:
+#   orch_ci           : the CI name being gated, e.g. "lnx001:CDB1"
+#   orch_primary_key  : the primary CR's number, e.g. CHG0033120
+#
+# Sets on return:
+#   orchestration_gate_clear : true if there are no unsatisfied pre-deps
+#   orchestration_run_id     : the run ID (new or existing), '' if none needed
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | Find registered pre-dependencies for {{ orch_ci }}"
+  ansible.builtin.set_fact:
+    orch_pre_deps: >-
+      {{ dependency_registry | default([]) | selectattr('ci', 'equalto', orch_ci) | selectattr('relationship', 'equalto', 'pre') | list }}
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | No pre-dependencies registered - gate is clear"
+  ansible.builtin.set_fact:
+    orchestration_gate_clear: true
+    orchestration_run_id: ""
+  when: orch_pre_deps | length == 0
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | Check for an existing run"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/table/u_orchestration_run?sysparm_query={{
+        ('u_primary_ci=' + orch_ci + '^u_primary_key=' + orch_primary_key) | urlencode
+      }}&sysparm_fields=u_run_id,u_status&sysparm_limit=1
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: orch_run_lookup
+  when: orch_pre_deps | length > 0
+  failed_when: false
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | No run exists yet - create it and spawn every pre-dependency"
+  when:
+  - orch_pre_deps | length > 0
+  - (orch_run_lookup.json.result | default([])) | length == 0
+  block:
+
+  - name: "ORCH-GATE | Generate a new run ID"
+    ansible.builtin.set_fact:
+      orchestration_run_id: "{{ orch_ci | regex_replace('[^A-Za-z0-9]', '-') }}-{{ orch_primary_key }}-{{ '%Y%m%dT%H%M%S' | strftime }}"
+
+  - name: "ORCH-GATE | Insert the orchestration_run record"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/u_orchestration_run"
+      method: POST
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        u_run_id: "{{ orchestration_run_id }}"
+        u_primary_ci: "{{ orch_ci }}"
+        u_primary_key: "{{ orch_primary_key }}"
+        u_status: "in_progress"
+      status_code: 201
+
+  - name: "ORCH-GATE | Spawn a dependent change for each registered pre-dependency"
+    ansible.builtin.include_tasks: COMMON_orchestration_spawn_step.yml
+    loop: "{{ orch_pre_deps }}"
+    loop_control:
+      loop_var: orch_dep
+      index_var: orch_sequence_order
+      label: "{{ orch_dep.depends_on_ci }}"
+
+  - name: "ORCH-GATE | Just created the dependent change(s) - gate is NOT clear this pass"
+    ansible.builtin.set_fact:
+      orchestration_gate_clear: false
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | A run already exists - check whether every pre-step is done"
+  when:
+  - orch_pre_deps | length > 0
+  - (orch_run_lookup.json.result | default([])) | length > 0
+  block:
+
+  - name: "ORCH-GATE | Record the existing run ID"
+    ansible.builtin.set_fact:
+      orchestration_run_id: "{{ orch_run_lookup.json.result[0].u_run_id }}"
+
+  - name: "ORCH-GATE | Fetch this run's pre-dependency steps"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/table/u_orchestration_step?sysparm_query={{
+          ('u_run_id=' + orchestration_run_id + '^u_relationship=pre') | urlencode
+        }}&sysparm_fields=u_key,u_status,u_on_failure
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: orch_pre_steps
+
+  - name: "ORCH-GATE | Show current pre-step status"
+    ansible.builtin.debug:
+      msg: "{{ item.u_key }} ({{ item.u_status }})"
+    loop: "{{ orch_pre_steps.json.result | default([]) }}"
+    loop_control:
+      label: "{{ item.u_key }}"
+
+  - name: "ORCH-GATE | A blocking pre-step has failed - escalate and keep the gate closed"
+    ansible.builtin.set_fact:
+      orchestration_gate_clear: false
+      orchestration_gate_blocked_permanently: true
+    when: >-
+      orch_pre_steps.json.result | default([])
+      | selectattr('u_status', 'equalto', 'failed')
+      | selectattr('u_on_failure', 'equalto', 'block')
+      | list | length > 0
+
+  - name: "ORCH-GATE | All pre-steps done - gate is clear"
+    ansible.builtin.set_fact:
+      orchestration_gate_clear: true
+    when:
+    - orchestration_gate_blocked_permanently | default(false) == false
+    - (orch_pre_steps.json.result | default([]) | rejectattr('u_status', 'equalto', 'done') | list | length) == 0
+
+  - name: "ORCH-GATE | Some pre-steps still pending - gate remains closed"
+    ansible.builtin.set_fact:
+      orchestration_gate_clear: false
+    when:
+    - orchestration_gate_blocked_permanently | default(false) == false
+    - (orch_pre_steps.json.result | default([]) | rejectattr('u_status', 'equalto', 'done') | list | length) > 0
+
+- name: "ORCH-GATE | {{ orch_primary_key }} | Result"
+  ansible.builtin.debug:
+    msg: "orchestration_gate_clear = {{ orchestration_gate_clear }} (run: {{ orchestration_run_id | default('none') }})"

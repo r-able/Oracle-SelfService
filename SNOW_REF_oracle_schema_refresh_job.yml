@@ -30,6 +30,20 @@
     job_exp_log_path: "{{ datapump_dir }}/{{ job_exp_log }}"
     job_imp_log_path: "{{ datapump_dir }}/{{ job_imp_log }}"
 
+# -- ITIL classification (CI link, risk/impact, change schedule) --------
+# CI is the TARGET service, since that's what's actually being
+# overwritten by the refresh.
+- name: "JOB | {{ job.issue_key }} | ITIL: classify this refresh (CI link, risk, impact, schedule)"
+  ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
+  vars:
+    itil_primary_key: "{{ job.issue_key }}"
+    itil_sys_id: "{{ job.sys_id }}"
+    itil_ci_name: "{{ job.target_service }}"
+    itil_risk: "low"
+    itil_impact: "low"
+    itil_planned_duration_hours: 4
+# -- END ITIL classification ----------------------------------------------
+
 - name: "JOB | {{ job.issue_key }} | Pre-flight: confirm source schema exists in {{ job.source_service }}"
   ansible.builtin.shell:
     cmd: |

@@ -1,0 +1,117 @@
+---
+# COMMON_snow_itil_classify.yml
+#
+# Adds ITIL-required classification to a change request: CMDB CI linkage,
+# risk/impact, and a planned start/end window (Forward Schedule of
+# Change). Purely additive - does not touch approval logic, state
+# transitions, or any existing behavior. Call once early in a project's
+# flow, right after the job/work list is built and before the first
+# state transition.
+#
+# WHY THIS IS SEPARATE FROM APPROVAL/ORCHESTRATION/BUDGET GATES:
+# those three are genuine control-flow gates (they can block a change
+# from proceeding). This is classification metadata only - it always
+# succeeds (or fails soft with a WARN), never blocks anything.
+#
+# IMPORTANT - VERIFY BEFORE RELYING ON THIS:
+# risk/impact are passed as plain strings ('low'/'medium'/'high') below.
+# Common ServiceNow out-of-box choice values for change_request.risk and
+# change_request.impact are High/Moderate/Low, but CONFIRM the real
+# sys_choice values on your actual instance before trusting this blindly
+# - the same lookup-first discipline that caught the Multi Line Text and
+# Attachment-type mistakes earlier in this project applies here too.
+# Query sys_choice where name=change_request and element in (risk,impact)
+# to get the real values, and adjust ITIL_RISK_MAP below if they differ.
+#
+# Required vars from the caller:
+#   itil_primary_key           : the CR's number, e.g. CHG0033120
+#   itil_ci_name                : the CI name to look up in the CMDB,
+#                                 e.g. "lnx001:CDB1" or a hostname
+#   itil_risk                   : 'low' / 'medium' / 'high'
+#   itil_impact                 : 'low' / 'medium' / 'high'
+#   itil_planned_duration_hours : how many hours to plan the change
+#                                 window for (used to compute end_date)
+#   itil_sys_id                 : OPTIONAL - the CR's sys_id directly, if
+#                                 the caller already has it (e.g. from its
+#                                 own query results). If not provided,
+#                                 falls back to snow_cr_map[itil_primary_key]
+#                                 - the convention used by projects built
+#                                 on COMMON_snow_intake.yml.
+#
+# Sets on return:
+#   itil_cmdb_ci_found : true if a matching CMDB CI record was found
+#                         and linked, false if not (classification still
+#                         applied either way - CI linkage is best-effort)
+
+- name: "ITIL | {{ itil_primary_key }} | Resolve the CR's sys_id"
+  ansible.builtin.set_fact:
+    itil_target_sys_id: "{{ itil_sys_id | default(snow_cr_map[itil_primary_key] | default('')) }}"
+
+- name: "ITIL | {{ itil_primary_key }} | WARN and skip if sys_id could not be resolved"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: could not resolve a sys_id for {{ itil_primary_key }} (neither
+      itil_sys_id nor snow_cr_map lookup worked) - skipping ITIL
+      classification for this change. This does not block the change itself.
+  when: itil_target_sys_id | length == 0
+
+- name: "ITIL | {{ itil_primary_key }} | Look up the CMDB CI record for {{ itil_ci_name }}"
+  ansible.builtin.uri:
+    url: >-
+      {{ sn_instance }}/api/now/table/cmdb_ci?sysparm_query={{
+        ('name=' + itil_ci_name) | urlencode
+      }}&sysparm_fields=sys_id,name&sysparm_limit=1
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: itil_ci_lookup
+  failed_when: false
+  when: itil_target_sys_id | length > 0
+
+- name: "ITIL | {{ itil_primary_key }} | Record whether a CMDB CI was found"
+  ansible.builtin.set_fact:
+    itil_cmdb_ci_found: "{{ (itil_ci_lookup.json.result | default([])) | length > 0 }}"
+    itil_cmdb_ci_sys_id: "{{ (itil_ci_lookup.json.result | default([{}]))[0].sys_id | default('') }}"
+  when: itil_target_sys_id | length > 0
+
+- name: "ITIL | {{ itil_primary_key }} | WARN if no matching CMDB CI record exists"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: no CMDB CI record found matching '{{ itil_ci_name }}' -
+      change request {{ itil_primary_key }} will be classified (risk/
+      impact/schedule) but will NOT have a formal CI link. Consider
+      creating a CMDB CI record for this host/database so future changes
+      link correctly.
+  when:
+  - itil_target_sys_id | length > 0
+  - not itil_cmdb_ci_found
+
+- name: "ITIL | {{ itil_primary_key }} | Compute the planned change window"
+  ansible.builtin.set_fact:
+    itil_start_date: "{{ '%Y-%m-%d %H:%M:%S' | strftime }}"
+    itil_end_date: "{{ '%Y-%m-%d %H:%M:%S' | strftime((ansible_date_time.epoch | int) + (itil_planned_duration_hours | int * 3600)) }}"
+  when: itil_target_sys_id | length > 0
+
+- name: "ITIL | {{ itil_primary_key }} | Apply classification to the change request"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/change_request/{{ itil_target_sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body: >-
+      {{
+        {
+          'risk': itil_risk,
+          'impact': itil_impact,
+          'start_date': itil_start_date,
+          'end_date': itil_end_date
+        } | combine({'cmdb_ci': itil_cmdb_ci_sys_id} if itil_cmdb_ci_found else {})
+      }}
+    status_code: 200
+  failed_when: false
+  when: itil_target_sys_id | length > 0

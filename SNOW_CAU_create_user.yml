@@ -148,6 +148,25 @@
       label: "{{ item.issue_key }}"
     when: item.target_dbs | length > 0
 
+  # -- ITIL classification (CI link, risk/impact, change schedule) --------
+  # CAU can target multiple databases per issue - classifying against the
+  # first one as the primary CI is a simplification; a request spanning
+  # several databases technically touches several CIs.
+  - name: "2b | ITIL | Classify each user-creation job (CI link, risk, impact, schedule)"
+    ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
+    loop: "{{ issues_to_process | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    vars:
+      itil_primary_key: "{{ item.issue_key }}"
+      itil_sys_id: "{{ item.sys_id }}"
+      itil_ci_name: "{{ item.target_dbs[0] | default('') }}"
+      itil_risk: "low"
+      itil_impact: "low"
+      itil_planned_duration_hours: 1
+    when: item.target_dbs | length > 0
+  # -- END ITIL classification ----------------------------------------------
+
   # -- 3. Generate one random password per issue -----------------------------
   # The same password is used across all target databases for a given issue
   # so the user only needs to remember one credential set.

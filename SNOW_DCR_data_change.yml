@@ -148,6 +148,21 @@
            | zip(dcr_annotated | default([]) | map(attribute='env')) | list }}.
         Only changes assigned to '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}' are considered.
 
+  # -- ITIL classification (CI link, risk/impact, change schedule) --------
+  - name: "0a | ITIL | Classify each DCR change (CI link, risk, impact, schedule)"
+    ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      itil_primary_key: "{{ item.number }}"
+      itil_sys_id: "{{ item.sys_id }}"
+      itil_ci_name: "{{ item.env }}"
+      itil_risk: "medium"
+      itil_impact: "medium"
+      itil_planned_duration_hours: 1
+  # -- END ITIL classification ----------------------------------------------
+
   # -- Non-PROD: promote straight to implement (no approval) ------------------
   # Standard/pre-approved changes must walk the state lifecycle in order
   # (new -> scheduled -> implement); ServiceNow's "Change Model: Check State

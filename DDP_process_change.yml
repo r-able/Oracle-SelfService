@@ -30,6 +30,20 @@
     ddp_oracle_sid: "{{ oracle_instance_map[ddp_host].oracle_sid }}"
     ddp_oracle_user: "{{ oracle_instance_map[ddp_host].oracle_user }}"
 
+# -- ITIL classification (CI link, risk/impact, change schedule) --------
+# Applied once, early, before any approval/state changes - matches the
+# same principle used across all 9 projects.
+- name: "ITIL | {{ ddp_cr.number }} | Classify this drop (CI link, risk, impact, schedule)"
+  ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
+  vars:
+    itil_primary_key: "{{ ddp_cr.number }}"
+    itil_sys_id: "{{ ddp_cr.sys_id }}"
+    itil_ci_name: "{{ ddp_host }}:{{ ddp_cdb }}:{{ ddp_target_pdb }}"
+    itil_risk: "high"
+    itil_impact: "medium"
+    itil_planned_duration_hours: 1
+# -- END ITIL classification ----------------------------------------------
+
 # -----------------------------------------------------------------
 # Intake / approval walk. Drop always requires approval, so this is a
 # "normal" change walked New -> Assess (hold) -> Authorize -> Scheduled

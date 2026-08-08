@@ -1,0 +1,40 @@
+# Required additions to vars/main.yml
+#
+# Add these to your existing vars/main.yml. Nothing else in the file needs
+# to change - these are purely additive.
+
+# -- Orchestration core (used by PAT's gate check / fire post) --------------
+# Hand-maintained dependency map. Add real entries as you register real
+# cross-team dependencies. Currently empty entries here simply mean the
+# gate check always reports clear (no dependencies registered yet) -
+# PAT will run exactly as it did before until you add a real row.
+dependency_registry: []
+
+# Example, once you're ready to test the APPSTOP/APPSTART scenario:
+# dependency_registry:
+#   - ci: "lnx001:CDB1"
+#     depends_on_ci: "AppServer-PROD-01"
+#     relationship: "pre"
+#     domain_module: "APPSTOP"
+#     on_failure: "block"
+#   - ci: "lnx001:CDB1"
+#     depends_on_ci: "AppServer-PROD-01"
+#     relationship: "post"
+#     domain_module: "APPSTART"
+#     on_failure: "warn"
+
+# Which assignment group new dependent CRs go to - defaults to the same
+# group everything else uses if you don't set this
+orchestration_group: "Database Atlanta"
+
+# -- Budget/cost gate (used by UPG) ------------------------------------------
+# Real storage pricing for your infrastructure - REPLACE this placeholder
+# with your actual cost per GB before relying on this for real budget
+# decisions. Currently a placeholder ($0.10/GB).
+cost_storage_per_gb_onetime: 0.10
+
+# How large an out-of-place upgrade clone is expected to be, in GB.
+# UPG uses this to estimate the one-time storage cost before gating on
+# budget approval. Adjust to match your real environment's typical
+# Oracle home size.
+upg_clone_size_gb_estimate: 300

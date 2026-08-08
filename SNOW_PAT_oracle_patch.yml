@@ -157,6 +157,66 @@
     loop_control:
       label: "{{ item.issue_key }}"
 
+  # -- ORCHESTRATION HOOK 1: gate check ------------------------------------
+  # For each patch job, check whether its CI has any unsatisfied 'pre'
+  # dependencies registered in dependency_registry. First time a given
+  # (CI, CR) pair is seen, this CREATES the dependent change request(s)
+  # and reports NOT clear this pass. On later passes it checks whether
+  # those dependent changes have reached Closed Successful.
+  - name: "2a | ORCHESTRATION | Gate-check each patch job and record its result"
+    vars:
+      orch_ci: "{{ orch_job.target_host }}:{{ orch_job.oracle_sid }}"
+      orch_primary_key: "{{ orch_job.issue_key }}"
+    loop: "{{ patch_jobs | default([]) }}"
+    loop_control:
+      loop_var: orch_job
+      label: "{{ orch_job.issue_key }}"
+    block:
+
+    - name: "2a | ORCHESTRATION | Run the gate check for this job"
+      ansible.builtin.include_tasks: COMMON_orchestration_gate_check.yml
+
+    - name: "2a | ORCHESTRATION | Record this job's gate result"
+      ansible.builtin.set_fact:
+        orch_gate_results: >-
+          {{ orch_gate_results | default({}) | combine({ orch_job.issue_key: orchestration_gate_clear }) }}
+
+  - name: "2a | ORCHESTRATION | WARN about jobs still blocked on a dependency"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.key }} is BLOCKED on an unsatisfied dependency - staying in
+        the queue, will re-check next run. See the dependent change request(s)
+        opened under this CI for what needs to close first.
+    loop: "{{ orch_gate_results | default({}) | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: not item.value
+
+  - name: "2a | ORCHESTRATION | Filter patch_jobs down to only gate-cleared jobs"
+    ansible.builtin.set_fact:
+      patch_jobs: >-
+        {{ patch_jobs | default([]) | selectattr('issue_key', 'in', (orch_gate_results | default({}) | dict2items | selectattr('value', 'equalto', true) | map(attribute='key') | list)) | list }}
+
+  - name: "2a | ORCHESTRATION | Nothing left to execute this pass - everything is gated"
+    ansible.builtin.meta: end_play
+    when: patch_jobs | default([]) | length == 0
+  # -- END ORCHESTRATION HOOK 1 ---------------------------------------------
+
+  # -- ITIL classification (CI link, risk/impact, change schedule) --------
+  - name: "2b | ITIL | Classify each remaining patch job (CI link, risk, impact, schedule)"
+    ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
+    loop: "{{ patch_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    vars:
+      itil_primary_key: "{{ item.issue_key }}"
+      itil_sys_id: "{{ item.sys_id }}"
+      itil_ci_name: "{{ item.target_host }}:{{ item.oracle_sid }}"
+      itil_risk: "medium"
+      itil_impact: "medium"
+      itil_planned_duration_hours: 2
+  # -- END ITIL classification ----------------------------------------------
+
   - name: "3 | Write patch job list to temp file for PLAY 2"
     ansible.builtin.copy:
       content: "{{ patch_jobs | to_json }}"
@@ -246,6 +306,23 @@
   - name: "10 | Show worklog post outcome"
     ansible.builtin.debug:
       msg: "{{ worklog_result.stdout_lines | default(['(no output)']) }}"
+
+  # -- ORCHESTRATION HOOK 2: fire post-dependencies ------------------------
+  # For every successfully-patched issue, check dependency_registry for
+  # 'post' dependencies on that CI and open the dependent change(s) - e.g.
+  # restarting the app server that was stopped for this patch.
+  - name: "10a | ORCHESTRATION | Fire post-dependencies for successfully patched issues"
+    ansible.builtin.include_tasks: COMMON_orchestration_fire_post.yml
+    loop: "{{ patch_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    vars:
+      orch_ci: "{{ item.target_host }}:{{ item.oracle_sid }}"
+      orch_primary_key: "{{ item.issue_key }}"
+      orchestration_run_id: ""
+    when: item.status == 'done'
+  # -- END ORCHESTRATION HOOK 2 ---------------------------------------------
+
   # -- 11. Close change requests based on outcome ---------------------------
   - name: "11 | Move SUCCESSFUL changes to review"
     servicenow.itsm.change_request:
