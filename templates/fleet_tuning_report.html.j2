@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fleet SQL Tuning POC Report</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; color: #333; margin: 30px; background: #fafafa; }
+  h1 { color: #1a3c5e; margin-bottom: 4px; }
+  .subtitle { color: #777; margin-bottom: 24px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }
+  .card { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 16px 20px; min-width: 160px; }
+  .card .num { font-size: 28px; font-weight: bold; color: #1a3c5e; }
+  .card .label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  h2 { color: #1a3c5e; border-bottom: 2px solid #e0e0e0; padding-bottom: 6px; margin-top: 36px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px; }
+  th { background: #eef3f8; color: #444; text-align: left; padding: 8px 10px; font-weight: 600; }
+  td { padding: 7px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+  tr:hover { background: #f5f9fc; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-yes { background: #e3f4e3; color: #2c7a2c; }
+  .badge-no { background: #f0f0f0; color: #999; }
+  .rank-tag { display: inline-block; background: #fff3d6; color: #8a6300; border-radius: 3px; padding: 1px 6px; font-size: 11px; margin-right: 3px; }
+  .note { font-size: 12px; color: #999; margin-top: 30px; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>Fleet SQL Tuning POC — Live Scan Results</h1>
+<div class="subtitle">
+  CDB service <code>{{ fleet_results.cdb_service }}</code> ·
+  {{ fleet_results.pdbs | length }} PDBs scanned simultaneously ·
+  window: last {{ fleet_results.hours_window }}h ·
+  generated {{ fleet_results.scan_completed }}
+</div>
+
+{% set total_analyzed = fleet_results.pdbs.values() | map('length') | sum %}
+{% set total_found = namespace(n=0) %}
+{% for pdb, rows in fleet_results.pdbs.items() %}
+  {% for r in rows %}
+    {% if r.has_recommendation %}{% set total_found.n = total_found.n + 1 %}{% endif %}
+  {% endfor %}
+{% endfor %}
+
+<div class="summary">
+  <div class="card"><div class="num">{{ fleet_results.pdbs | length }}</div><div class="label">PDBs scanned</div></div>
+  <div class="card"><div class="num">{{ total_analyzed }}</div><div class="label">Unique SQL statements analyzed</div></div>
+  <div class="card"><div class="num">{{ total_found.n }}</div><div class="label">Tuning opportunities found</div></div>
+  <div class="card"><div class="num">{{ fleet_results.top_n }}</div><div class="label">Top-N per ranking, per PDB</div></div>
+</div>
+
+{% for pdb, rows in fleet_results.pdbs.items() %}
+<h2>PDB: {{ pdb }}</h2>
+{% if rows | length == 0 %}
+<p style="color:#999;">No SQL statements returned for this window.</p>
+{% else %}
+<table>
+  <tr>
+    <th>SQL_ID</th>
+    <th>Ranked By</th>
+    <th>Recommendation Found</th>
+    <th>Type</th>
+    <th>Est. Benefit</th>
+</tr>
+  {% for r in rows %}
+  <tr>
+    <td><code>{{ r.sql_id }}</code></td>
+    <td>{% for tag in r.ranked_by %}<span class="rank-tag">{{ tag }}</span>{% endfor %}</td>
+    <td>{% if r.has_recommendation %}<span class="badge badge-yes">YES</span>{% else %}<span class="badge badge-no">none</span>{% endif %}</td>
+    <td>{{ r.recommendation_type or '—' }}</td>
+    <td>{% if r.benefit_pct %}{{ r.benefit_pct }}%{% else %}—{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endfor %}
+
+<div class="note">
+  Phase 1 POC — analysis only. No SQL Profile, index, or PROD change was applied by this run.
+  Phase 2 routes confirmed, above-threshold recommendations through the existing
+  ServiceNow/Jira approval-gated apply workflow before anything touches PROD.
+</div>
+
+</body>
+</html>
+

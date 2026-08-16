@@ -1,0 +1,481 @@
+---
+# SNOW_CAUPG_create_postgres_user.yml
+#
+# PILOT: PostgreSQL (Aurora/RDS) equivalent of SNOW_CAU_create_user.yml
+# Uses a DISTINCT tag (CAUPG, not CAU) so this cannot collide with or affect
+# the already-hardened, production Oracle CAU project in any way.
+#
+# Sister project to SNOW_CDPPG_reset_postgres_password.yml (same pilot,
+# same pg_environments, same architectural corrections) - the two together
+# exercise both halves of a real credential lifecycle: creating a role and
+# later resetting its password, using the SAME real RDS/Aurora connectivity
+# and psycopg2 pattern already proven in CDPPG.
+#
+# GENUINE ARCHITECTURAL DIFFERENCES FROM THE ORACLE VERSION (read before use):
+#
+#   1. PostgreSQL ROLES ARE CLUSTER-WIDE, NOT PER-DATABASE.
+#      Oracle's CAU creates a user separately inside each named target
+#      database (PDB). PostgreSQL has no equivalent of "a user that exists
+#      inside one PDB" - a role is created ONCE per cluster and then granted
+#      access to whichever databases it needs within that same cluster.
+#      This version therefore parses a list of TARGET ENVIRONMENTS (cluster
+#      names from pg_environments), not a list of target database names -
+#      "CAUPG | Full Name | TEST,UAT" creates the SAME role once in the
+#      TEST cluster and once in the UAT cluster, not two different databases
+#      inside one cluster.
+#
+#   2. Idempotency check is role-existence, not "already granted."
+#      Since a role can only be created once per cluster, this checks
+#      pg_catalog.pg_roles before attempting CREATE ROLE - a repeat request
+#      for a role that already exists in that environment is treated as
+#      already-done, not a failure, matching the spirit of the Oracle
+#      version's per-database grant loop (safe to re-run).
+#
+#   3. NO SHARED HOST, lower-case role names, rds_superuser scope, and
+#      psycopg2.sql-based safe DDL construction - same reasoning as
+#      SNOW_CDPPG_reset_postgres_password.yml. See that file's header for
+#      the full explanation; not repeated here.
+#
+# NOT YET DONE (deliberately out of scope for this pilot):
+#   * AWS Secrets Manager integration (vault-encrypted plain vars for now,
+#     matching CDPPG and the existing Oracle pattern).
+#   * IAM database authentication.
+#   * Fine-grained privilege scoping - this pilot grants ALL PRIVILEGES ON
+#     DATABASE for simplicity, matching CAU's own CONNECT+DBA breadth on the
+#     Oracle side; a production version would likely want a narrower,
+#     role-specific grant instead.
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   sn_instance, sn_username, sn_password
+#   pg_environments:            # SAME dict CDPPG uses - shared, not duplicated
+#     TEST:
+#       endpoint: "..."
+#       port: 5432
+#       dbname: "testdb"
+#       master_user: "pgadmin"
+#       master_pass: !vault |
+#         ...
+#
+# Requirements:
+#   pip install psycopg2-binary
+#
+# Usage:
+#   ansible-playbook SNOW_CAUPG_create_postgres_user.yml --ask-vault-pass
+
+- name: "ServiceNow -> Parse change -> Create PostgreSQL (Aurora/RDS) user in requested environments -> Close change"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    issue_outcomes: {} # { "CHG0012345": "done" | "failed" }
+
+  tasks:
+
+  # -- PRE-FLIGHT + intake ----------------------------------------------------
+  - name: "0-1 | ServiceNow intake and shepherd for CAUPG"
+    ansible.builtin.include_tasks: COMMON_snow_intake.yml
+    vars:
+      snow_tag: "CAUPG"
+      sn_type: "normal"   # matches CAU's real MANAGEMENT approval tier -
+                           # creating a new credential is higher-risk than
+                           # resetting an existing one (CDPPG, standard/none)
+
+  - name: "1 | Abort if no work found"
+    ansible.builtin.debug:
+      msg: "No ServiceNow change requests tagged 'CAUPG |' are ready to execute. Exiting cleanly."
+    when: snow_work | length == 0
+
+  - name: "1 | End play gracefully when queue is empty"
+    ansible.builtin.meta: end_play
+    when: snow_work | length == 0
+
+  # Parse "CAUPG | Full Name | ENV1,ENV2,..." from short_description.
+  # Role name derivation matches CDPPG exactly: first initial + last name,
+  # lower-cased ("Vlad Grigorian" -> "vgrigorian").
+  - name: "2 | WARN and skip changes with a missing user name or environments"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.number }} has a missing user name or environment
+        list (short_description: '{{ item.short_description }}') --
+        skipping. Expected 'CAUPG | Full Name | ENV1,ENV2'.
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      cau_name: "{{ item.short_description.split('|')[1] | default('') | trim }}"
+      cau_envs_raw: "{{ item.short_description.split('|')[2] | default('') | trim }}"
+    when: cau_name | length == 0 or cau_envs_raw | length == 0
+
+  - name: "2 | Build change -> PostgreSQL role + target environments mapping"
+    ansible.builtin.set_fact:
+      issues_to_create: >-
+        {{
+          issues_to_create | default([]) + [{
+            'issue_key':    item.number,
+            'sys_id':       item.sys_id,
+            'display_name': cau_name,
+            'pg_role': (
+              (cau_name.split(' ')[0][0] + cau_name.split(' ')[-1])
+              if (cau_name.split(' ') | length) > 1
+              else cau_name
+            ) | lower,
+            'target_envs': (
+              cau_envs_raw.split(',')
+              | map('trim') | map('upper') | list
+              | select('in', pg_environments.keys() | list) | list
+            )
+          }]
+        }}
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+    vars:
+      cau_name: "{{ item.short_description.split('|')[1] | default('') | trim }}"
+      cau_envs_raw: "{{ item.short_description.split('|')[2] | default('') | trim }}"
+    when: cau_name | length > 0 and cau_envs_raw | length > 0
+
+  - name: "2 | WARN if none of the requested environments are recognised"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.issue_key }} requested environments not found in
+        pg_environments (known: {{ pg_environments.keys() | list | join(', ') }}).
+        This issue will be skipped.
+    loop: "{{ issues_to_create | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.target_envs | length == 0
+
+  - name: "2 | Show user -> PostgreSQL role -> target environments mapping"
+    ansible.builtin.debug:
+      msg: "{{ item.issue_key }} -> PostgreSQL role: {{ item.pg_role }} | environments: {{ item.target_envs | join(', ') }}"
+    loop: "{{ issues_to_create | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.target_envs | length > 0
+
+  # -- 3. Generate one random password per issue -----------------------------
+  # Same password used across every target environment for a given issue -
+  # matches both CAU (Oracle) and CDPPG's own convention: one credential
+  # set per requester, regardless of how many places it's valid in.
+
+  - name: "3 | Generate random password for each issue"
+    ansible.builtin.shell:
+      cmd: |
+        upper=$(tr -dc 'A-Z'    </dev/urandom | head -c 1 || true)
+        lower=$(tr -dc 'a-z'    </dev/urandom | head -c 1 || true)
+        digit=$(tr -dc '0-9'    </dev/urandom | head -c 1 || true)
+        special=$(tr -dc '@#$%' </dev/urandom | head -c 1 || true)
+        rest=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || true)
+        echo "${upper}${lower}${digit}${special}${rest}"
+    register: generated_passwords
+    loop: "{{ issues_to_create | default([]) | selectattr('target_envs', '!=', []) | list }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    no_log: true
+    changed_when: false
+
+  - name: "3 | Attach generated password to each issue entry"
+    ansible.builtin.set_fact:
+      issues_to_create: >-
+        {{
+          issues_to_create
+          | rejectattr('issue_key', 'equalto', item.item.issue_key) | list
+          + [ item.item | combine({'new_password': item.stdout | trim}) ]
+        }}
+    loop: "{{ generated_passwords.results }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+    no_log: true
+
+  # -- 4. Create the role in each requested environment ----------------------
+  # product() builds every (issue, environment) pair actually requested -
+  # NOT every environment in pg_environments (unlike CDPPG's password reset,
+  # which applies everywhere by design). A create request only touches the
+  # specific environments the requester asked for, matching CAU's own
+  # "only the named target databases" behaviour on the Oracle side.
+
+  - name: "4 | Create PostgreSQL role in each requested environment"
+    ansible.builtin.shell:
+      cmd: |
+        python3 - << 'PYEOF'
+        import sys, os
+        import psycopg2
+        from psycopg2 import sql
+
+        host        = os.environ["PG_HOST"]
+        port        = os.environ["PG_PORT"]
+        dbname      = os.environ["PG_DBNAME"]
+        master_user = os.environ["PG_MASTER_USER"]
+        master_pass = os.environ["PG_MASTER_PASS"]
+        target_role = os.environ["PG_TARGET_ROLE"]
+        new_pass    = os.environ["PG_NEW_PASS"]
+        env_name    = os.environ["PG_ENV_NAME"]
+
+        try:
+            conn = psycopg2.connect(
+                host=host, port=port, dbname=dbname,
+                user=master_user, password=master_pass,
+                connect_timeout=10,
+            )
+        except Exception as e:
+            print(f"ERROR: [{env_name}] Could not connect to PostgreSQL "
+                  f"endpoint '{host}:{port}/{dbname}': {e}", file=sys.stderr)
+            sys.exit(1)
+
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        # Idempotency check: roles are cluster-wide, so a role created by an
+        # earlier (possibly re-run) pass already exists - that is success,
+        # not failure, same spirit as CAU's own safe-to-re-run grant loop.
+        cur.execute(
+            "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s",
+            (target_role,)
+        )
+        already_exists = cur.fetchone() is not None
+
+        if already_exists:
+            print(f"OK: [{env_name}] role '{target_role}' already exists - "
+                  f"skipping creation, granting privileges only.")
+        else:
+            create_stmt = sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD {}").format(
+                sql.Identifier(target_role),
+                sql.Literal(new_pass),
+            )
+            cur.execute(create_stmt)
+            print(f"OK: [{env_name}] role '{target_role}' created.")
+
+        grant_stmt = sql.SQL("GRANT ALL PRIVILEGES ON DATABASE {} TO {}").format(
+            sql.Identifier(dbname),
+            sql.Identifier(target_role),
+        )
+        cur.execute(grant_stmt)
+        print(f"OK: [{env_name}] granted privileges on '{dbname}' to {target_role}")
+
+        cur.close()
+        conn.close()
+        PYEOF
+    environment:
+      PG_HOST: "{{ pg_environments[item.1].endpoint }}"
+      PG_PORT: "{{ pg_environments[item.1].port | string }}"
+      PG_DBNAME: "{{ pg_environments[item.1].dbname }}"
+      PG_MASTER_USER: "{{ pg_environments[item.1].master_user }}"
+      PG_MASTER_PASS: "{{ pg_environments[item.1].master_pass }}"
+      PG_TARGET_ROLE: "{{ item.0.pg_role }}"
+      PG_NEW_PASS: "{{ item.0.new_password }}"
+      PG_ENV_NAME: "{{ item.1 }}"
+    loop: >-
+      {{
+        issues_to_create | default([])
+        | selectattr('target_envs', '!=', [])
+        | list
+        | subelements('target_envs')
+      }}
+    loop_control:
+      label: "{{ item.0.issue_key }} | {{ item.0.pg_role }} -> {{ item.1 }}"
+    register: pg_create_results
+    ignore_errors: true
+    no_log: true
+
+  - name: "4b | Show role-creation outcome per issue per environment"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.item.0.issue_key }} | {{ item.item.0.pg_role }} -> {{ item.item.1 }}: {{ 'SUCCESS' if item.rc == 0 else 'FAILED (rc=' + (item.rc | string) + ')' }} {% if item.rc != 0 %}| stderr: {{ item.stderr | default('(none)') | trim }}{% endif %}
+    loop: "{{ pg_create_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.0.issue_key }} / {{ item.item.1 }}"
+
+  # -- 5. Post temporary password as a work note (all-success only) ---------
+
+  - name: "5 | Post new temporary password as a work note (all environments succeeded)"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ item.sys_id }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        work_notes: |
+          Automated PostgreSQL (Aurora/RDS) user creation completed successfully.
+
+          PostgreSQL Role     : {{ item.pg_role }}
+          Temporary Password  : {{ item.new_password }}
+          Environments        : {{ item.target_envs | join(', ') }}
+          Created By          : {{ sn_username }} (Ansible automation)
+          Timestamp           : {{ ansible_date_time.iso8601 }}
+
+          Please change this password immediately after your first login.
+          Do not share this password.
+      status_code: 200
+    loop: "{{ issues_to_create | default([]) | selectattr('target_envs', '!=', []) | list }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: >-
+      (
+        pg_create_results.results | default([])
+        | selectattr('item.0.issue_key', 'equalto', item.issue_key)
+        | selectattr('rc', 'ne', 0)
+        | list
+        | length
+      ) == 0
+    register: caupg_password_note
+    no_log: true
+    ignore_errors: true
+
+  - name: "5 | WARN if the password work note could not be posted"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: the temporary password work note failed to post for one or
+        more changes. The role was created successfully, but the requester
+        will not see the new password on the change. Check sn_instance /
+        credentials and the change sys_id.
+    when: caupg_password_note is defined and (caupg_password_note.results | default([]) | selectattr('failed', 'defined') | selectattr('failed') | list | length > 0)
+
+  # -- 6. Compute per-issue outcome and transition ---------------------------
+
+  - name: "6 | Mark issues DONE (all requested environments succeeded)"
+    ansible.builtin.set_fact:
+      issue_outcomes: >-
+        {{ issue_outcomes | combine({ item.issue_key: 'done' }) }}
+    loop: "{{ issues_to_create | default([]) | selectattr('target_envs', '!=', []) | list }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: >-
+      (
+        pg_create_results.results | default([])
+        | selectattr('item.0.issue_key', 'equalto', item.issue_key)
+        | selectattr('rc', 'ne', 0)
+        | list
+        | length
+      ) == 0
+
+  - name: "6 | Mark issues FAILED (no valid environments, or one or more failed)"
+    ansible.builtin.set_fact:
+      issue_outcomes: >-
+        {{ issue_outcomes | combine({ item.issue_key: 'failed' }) }}
+    loop: "{{ issues_to_create | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: >-
+      item.target_envs | length == 0
+      or (
+        pg_create_results.results | default([])
+        | selectattr('item.0.issue_key', 'equalto', item.issue_key)
+        | selectattr('rc', 'ne', 0)
+        | list
+        | length
+      ) > 0
+
+  - name: "6 | Move SUCCESSFUL changes to review"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ snow_cr_map[item.key] }}"
+      state: review
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'done'
+    failed_when: false
+
+  - name: "6 | Close SUCCESSFUL changes (close_code successful)"
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      sys_id: "{{ snow_cr_map[item.key] }}"
+      state: closed
+      close_code: successful
+      close_notes: |-
+        Automated PostgreSQL (Aurora/RDS) user creation COMPLETED in all requested environments - {{ ansible_date_time.iso8601 }}
+        The temporary password is in the work notes on this change.
+        Please change it immediately after first login.
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'done'
+    failed_when: false
+
+  - name: "6 | Post failure work note and close FAILED changes"
+    block:
+    - name: "6a | Post failure work note (per-environment breakdown)"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/change_request/{{ snow_cr_map[item.key] }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          work_notes: |
+            Automated PostgreSQL user creation FAILED, or no recognised
+            target environments were found.
+
+            Per-environment outcome:
+            {% for r in pg_create_results.results | default([])
+                  if r.item.0.issue_key == item.key %}
+            * {{ r.item.1 }}: {{ 'SUCCESS' if r.rc == 0 else 'FAILED' }}
+            {% endfor %}
+
+            No temporary password has been issued. A DBA repair follow-up
+            change request is being raised.
+
+            Timestamp: {{ ansible_date_time.iso8601 }}
+          status_code: 200
+      loop: "{{ issue_outcomes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value == 'failed'
+      ignore_errors: true
+    - name: "6b | Close FAILED changes (close_code unsuccessful)"
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        sys_id: "{{ snow_cr_map[item.key] }}"
+        state: closed
+        close_code: unsuccessful
+        close_notes: "Automated PostgreSQL user creation FAILED - see work notes for per-environment detail."
+      loop: "{{ issue_outcomes | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: item.value == 'failed'
+      failed_when: false
+
+  - name: "6c | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.key }}"
+    when: fu_item.value == 'failed'
+    vars:
+      fu_tag: "CAUPG"
+      fu_original_number: "{{ fu_item.key }}"
+      fu_original_sys_id: "{{ snow_cr_map[fu_item.key] }}"
+      fu_summary: "DBA repair required: PostgreSQL user creation failed for {{ fu_item.key }}"
+      fu_description: |-
+        Automated PostgreSQL (Aurora/RDS) user creation FAILED (or no
+        recognised target environments were found) and the change request
+        has been closed unsuccessful. Please investigate and repair, then
+        create the role manually if needed.
+
+        Requested role      : {{ issues_to_create | default([]) | selectattr('issue_key', 'equalto', fu_item.key) | map(attribute='pg_role') | list | first | default('unknown') }}
+        Environments failed : {{ pg_create_results.results | default([]) | selectattr('item.0.issue_key', 'equalto', fu_item.key) | selectattr('rc', 'ne', 0) | list | length }}
+
+  - name: "7 | Build + print final summary"
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  CAUPG PostgreSQL User Creation Summary"
+      - "======================================================"
+      - "  Done   : {{ issue_outcomes | dict2items | selectattr('value', 'equalto', 'done') | list | length }}"
+      - "  Failed : {{ issue_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length }}"
+      - "======================================================"
