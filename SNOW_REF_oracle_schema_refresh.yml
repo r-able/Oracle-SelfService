@@ -309,7 +309,7 @@
         Target         : {{ fu_item.target_host }}:{{ fu_item.target_schema }}@{{ fu_item.target_service }}
         Import rc      : {{ fu_item.import_rc | default('n/a') }}
         Error          : {{ fu_item.error | default('See attached log.') }}
-      fu_attach_files: "{{ [fu_item.failure_log | default('')] | select() | list }}"
+      fu_attach_files: "{{ [fu_item.failure_log | default(''), fu_item.backup_export_log | default('')] | select() | list }}"
 
   - name: "9 | Print final summary"
     ansible.builtin.debug:

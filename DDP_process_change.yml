@@ -43,87 +43,87 @@
 - name: New change - promote to Assess and hold for approval
   when: ddp_cr.state == 'new'
   block:
-    - name: Set change type to normal
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        type: "{{ sn_ddp_type }}"
-        state: assess
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
+  - name: Set change type to normal
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      type: "{{ sn_ddp_type }}"
+      state: assess
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
 
-    - name: Post work note - awaiting approval
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          work_notes: "DDP: drop request for {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} moved to Assess - awaiting approval before anything is touched."
+  - name: Post work note - awaiting approval
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        work_notes: "DDP: drop request for {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} moved to Assess - awaiting approval before anything is touched."
 
 - name: Change is pending approval or mid-walk - advance if approved
   when: ddp_cr.state in ['assess', 'authorize', 'scheduled']
   block:
-    - name: Re-check approval status
-      servicenow.itsm.change_request_info:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-      register: ddp_recheck
+  - name: Re-check approval status
+    servicenow.itsm.change_request_info:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+    register: ddp_recheck
 
-    - name: Not yet approved - leave in place
-      ansible.builtin.meta: end_host
-      when: ddp_recheck.records[0].approval | default('') != 'approved'
+  - name: Not yet approved - leave in place
+    ansible.builtin.meta: end_host
+    when: ddp_recheck.records[0].approval | default('') != 'approved'
 
-    - name: Walk Assess -> Authorize
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        state: authorize
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
-      when: ddp_cr.state == 'assess'
+  - name: Walk Assess -> Authorize
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: authorize
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    when: ddp_cr.state == 'assess'
 
-    - name: Walk Authorize -> Scheduled
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        state: scheduled
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
-      when: ddp_cr.state in ['assess', 'authorize']
+  - name: Walk Authorize -> Scheduled
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: scheduled
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    when: ddp_cr.state in ['assess', 'authorize']
 
-    - name: Walk Scheduled -> Implement
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        state: implement
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
+  - name: Walk Scheduled -> Implement
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: implement
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
 
-    - name: Mark ready to execute this pass
-      ansible.builtin.set_fact:
-        ddp_ready: true
+  - name: Mark ready to execute this pass
+    ansible.builtin.set_fact:
+      ddp_ready: true
 
 - name: Already at Implement - ready to execute
   ansible.builtin.set_fact:
@@ -153,67 +153,66 @@
     ddp_blocked: true
     ddp_block_reason: "{{ ddp_target_pdb }} is on the protected list (ddp_protected_pdbs)"
   when: >
-    ddp_target_pdb in ddp_protected_pdbs and
-    not (ddp_allow_protected_override | bool)
+    ddp_target_pdb in ddp_protected_pdbs and not (ddp_allow_protected_override | bool)
 
 - name: Handle blocked drop - close unsuccessful with follow-up
   when: ddp_blocked | bool
   block:
-    - name: Work note - blocked
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          work_notes: "DDP BLOCKED: {{ ddp_block_reason }}. No database action taken."
+  - name: Work note - blocked
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        work_notes: "DDP BLOCKED: {{ ddp_block_reason }}. No database action taken."
 
-    - name: Walk Implement -> Review (blocked)
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        state: review
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
+  - name: Walk Implement -> Review (blocked)
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: review
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
 
-    - name: Walk Review -> Closed unsuccessful (blocked)
-      servicenow.itsm.change_request:
-        instance:
-          host: "{{ sn_instance }}"
-          username: "{{ sn_username }}"
-          password: "{{ sn_password }}"
-        number: "{{ ddp_cr.number }}"
-        state: closed
-        close_code: "unsuccessful"
-        close_notes: "DDP blocked: {{ ddp_block_reason }}"
-        assignment_group: "{{ snow_assignment_group }}"
-        other:
-          assigned_to: "{{ snow_assigned_to }}"
-      register: ddp_blocked_close
-      failed_when: false
+  - name: Walk Review -> Closed unsuccessful (blocked)
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: closed
+      close_code: "unsuccessful"
+      close_notes: "DDP blocked: {{ ddp_block_reason }}"
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    register: ddp_blocked_close
+    failed_when: false
 
-    - name: WARN if blocked CR could not be closed
-      ansible.builtin.debug:
-        msg: "WARNING: {{ ddp_cr.number }} could not be closed after a block - it will re-enter the queue next pass."
-      when: ddp_blocked_close is failed
+  - name: WARN if blocked CR could not be closed
+    ansible.builtin.debug:
+      msg: "WARNING: {{ ddp_cr.number }} could not be closed after a block - it will re-enter the queue next pass."
+    when: ddp_blocked_close is failed
 
-    - name: Open DBA follow-up for blocked drop
-      ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
-      vars:
-        fu_tag: "{{ snow_project_tag }}"
-        fu_original_number: "{{ ddp_cr.number }}"
-        fu_original_sys_id: "{{ ddp_cr.sys_id }}"
-        fu_summary: "DDP drop of {{ ddp_target_pdb }} blocked"
-        fu_description: "{{ ddp_block_reason }}"
+  - name: Open DBA follow-up for blocked drop
+    ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+    vars:
+      fu_tag: "{{ snow_project_tag }}"
+      fu_original_number: "{{ ddp_cr.number }}"
+      fu_original_sys_id: "{{ ddp_cr.sys_id }}"
+      fu_summary: "DDP drop of {{ ddp_target_pdb }} blocked"
+      fu_description: "{{ ddp_block_reason }}"
 
-    - name: Stop processing this CR
-      ansible.builtin.meta: end_host
+  - name: Stop processing this CR
+    ansible.builtin.meta: end_host
 
 # -----------------------------------------------------------------
 # Execution - pre-drop snapshot, then close + drop including datafiles
@@ -222,6 +221,239 @@
 # for oracle to reach the files below, not just the leaf directory. The
 # parent ddp_work_dir gets auto-created by the file module the first time
 # this runs and would otherwise inherit a restrictive default - set its
+# -----------------------------------------------------------------
+# ROLLBACK SAFETY NET - taken BEFORE the drop, not after. Two artifacts,
+# per explicit requirement: a logical export (expdp) AND a physical
+# backup (RMAN) of the whole PDB. Naming convention (same across every
+# export/backup/restore point in this suite):
+#   <CR#>_rollback_<DB>_<SCHEMA>_<YYYY-MM-DD-HH-MM-SS>
+# For DDP there is no schema (this is a whole-PDB operation) - the SCHEMA
+# slot is repurposed to hold the PDB being dropped, DB holds the CDB name.
+# -----------------------------------------------------------------
+
+- name: Compute rollback artifact name
+  ansible.builtin.set_fact:
+    ddp_rollback_name: "{{ ddp_cr.number }}_rollback_{{ ddp_cdb }}_{{ ddp_target_pdb }}_{{ '%Y-%m-%d-%H-%M-%S' | strftime }}"
+    # RMAN TAG has a hard 31-character Oracle limit (ORA-19705) - the full
+    # naming convention above is far longer, so the TAG itself uses a short
+    # form (well under the limit) while the actual backup piece FILENAMES
+    # (via FORMAT, no such length restriction) still carry the full
+    # convention for browsing/matching on disk. Multiple runs against the
+    # same CR sharing one tag is fine - RMAN tags don't need to be unique.
+    ddp_rman_tag: "DDP_{{ ddp_cr.number }}"
+
+# Pre-flight: confirm the shared ROLLBACK directory object exists (created
+# once, manually, across all nodes - the OS path is /rollback, read/write
+# to oracle - NOT self-provisioned by this playbook, unlike an earlier
+# version of this file). Same fail-loud-with-instructions pattern REF
+# already uses for its REFRESH directory.
+- name: Confirm the ROLLBACK directory object exists
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ddp_oracle_home }}
+      export ORACLE_SID={{ ddp_oracle_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S / AS SYSDBA << 'EOF'
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT directory_path FROM dba_directories WHERE directory_name = 'ROLLBACK';
+      EXIT;
+      EOF
+  delegate_to: "{{ ddp_host }}"
+  become: true
+  become_user: "{{ ddp_oracle_user }}"
+  register: ddp_dir_check
+  no_log: true
+  changed_when: false
+
+- name: Set rollback backup directory OS path fact
+  ansible.builtin.set_fact:
+    ddp_backup_dir: "{{ ddp_dir_check.stdout | default('') | trim }}"
+
+- name: Refuse to proceed if the ROLLBACK directory object is missing
+  ansible.builtin.set_fact:
+    ddp_backup_failed: true
+    ddp_backup_fail_reason: "The ROLLBACK directory object does not exist on this instance (expected to point at /rollback) - required before any drop can proceed. Create it: CREATE DIRECTORY ROLLBACK AS '/rollback'; GRANT READ, WRITE ON DIRECTORY ROLLBACK TO PUBLIC;"
+  when: ddp_backup_dir | default('') | length == 0
+
+- name: Purge rollback artifacts older than 7 days for this CDB+PDB
+  ansible.builtin.shell:
+    cmd: >-
+      find {{ ddp_backup_dir }} -maxdepth 1 -type f -name '*_rollback_{{ ddp_cdb }}_{{ ddp_target_pdb }}_*' -mtime +7 -delete
+  delegate_to: "{{ ddp_host }}"
+  failed_when: false
+  changed_when: false
+  when: not (ddp_backup_failed | default(false))
+
+# -- Logical export (expdp), full PDB. Connects directly to the PDB's own
+#    service name - same established convention CAU/CDP already rely on
+#    (the PDB name doubles as its own connectable Oracle service).
+- name: Export full PDB before drop (rollback safety net - logical export)
+  ansible.builtin.shell:
+    cmd: >-
+      export ORACLE_HOME={{ ddp_oracle_home }} && export PATH=$ORACLE_HOME/bin:$PATH && expdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ ddp_host }}:{{ oracle_port | default(1521) }}/{{ ddp_target_pdb }} FULL=Y DIRECTORY=ROLLBACK DUMPFILE={{ ddp_rollback_name }}_export.dmp LOGFILE={{ ddp_rollback_name }}_export.log
+  delegate_to: "{{ ddp_host }}"
+  become: true
+  become_user: "{{ ddp_oracle_user }}"
+  register: ddp_export
+  async: 7200
+  poll: 20
+  no_log: true
+  ignore_errors: true
+  when: not (ddp_backup_failed | default(false))
+
+- name: Flag export failure
+  ansible.builtin.set_fact:
+    ddp_backup_failed: true
+    ddp_backup_fail_reason: "Pre-drop logical export of {{ ddp_target_pdb }} failed (rc={{ ddp_export.rc | default('n/a') }})."
+  when:
+  - ddp_export is defined
+  - ddp_export.rc | default(1) != 0
+
+# -- Physical backup (RMAN), whole PDB. Runs via the same OS/bequeath
+#    connection to the CDB root the rest of DDP already uses - RMAN backs
+#    up a named pluggable database directly, no separate network
+#    connection needed.
+- name: Backup full PDB before drop (rollback safety net - physical RMAN backup)
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ddp_oracle_home }}
+      export ORACLE_SID={{ ddp_oracle_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      rman target / << 'EOF'
+      BACKUP PLUGGABLE DATABASE {{ ddp_target_pdb }} FORMAT '{{ ddp_backup_dir }}/{{ ddp_rollback_name }}_%U.bkp' TAG '{{ ddp_rman_tag }}';
+      EXIT;
+      EOF
+  delegate_to: "{{ ddp_host }}"
+  become: true
+  become_user: "{{ ddp_oracle_user }}"
+  register: ddp_rman_backup
+  async: 7200
+  poll: 20
+  ignore_errors: true
+  when: not (ddp_backup_failed | default(false))
+
+# RMAN's own output previously only lived in Ansible's captured result (not
+# a real file) - write it to disk explicitly so it's a genuine, inspectable
+# artifact, same as the expdp log, rather than something only visible in
+# ansible-playbook's own console scrollback.
+- name: Write RMAN backup output to a real log file
+  ansible.builtin.copy:
+    content: |
+      RMAN backup output for {{ ddp_rollback_name }}
+      rc={{ ddp_rman_backup.rc | default('n/a') }}
+      ======================================================================
+      STDOUT:
+      {{ ddp_rman_backup.stdout | default('(none)') }}
+      ======================================================================
+      STDERR:
+      {{ ddp_rman_backup.stderr | default('(none)') }}
+    dest: "{{ ddp_backup_dir }}/{{ ddp_rollback_name }}_rman.log"
+    mode: '0644'
+  delegate_to: "{{ ddp_host }}"
+  become: true
+  become_user: "{{ ddp_oracle_user }}"
+  when: ddp_rman_backup is defined
+
+- name: Flag RMAN backup failure
+  ansible.builtin.set_fact:
+    ddp_backup_failed: true
+    ddp_backup_fail_reason: "Pre-drop RMAN backup of {{ ddp_target_pdb }} failed (rc={{ ddp_rman_backup.rc | default('n/a') }}). {{ 'RMAN reported an ERROR in its output even though rc may show 0 - treat as failed.' if 'ERROR' in (ddp_rman_backup.stdout | default('')) else '' }}"
+  when: >
+    (ddp_rman_backup is defined and ddp_rman_backup.rc | default(1) != 0) or (ddp_rman_backup is defined and 'ERROR' in (ddp_rman_backup.stdout | default('')))
+
+# Per explicit instruction: NEVER delete rollback artifacts on failure, even
+# incomplete ones - keep everything in /rollback for forensics. The
+# following block attaches the relevant logs to the follow-up instead.
+
+- name: Handle rollback backup failure - close unsuccessful with follow-up, refuse to drop
+  when: ddp_backup_failed | default(false)
+  block:
+  - name: Work note - backup failed, drop refused
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        work_notes: "DDP REFUSED TO DROP {{ ddp_target_pdb }}: {{ ddp_backup_fail_reason }} No database action was taken - a drop is never attempted without a verified rollback backup in place."
+
+  - name: Walk Implement -> Review (backup failed)
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: review
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+
+  - name: Walk Review -> Closed unsuccessful (backup failed)
+    servicenow.itsm.change_request:
+      instance:
+        host: "{{ sn_instance }}"
+        username: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+      number: "{{ ddp_cr.number }}"
+      state: closed
+      close_code: "unsuccessful"
+      close_notes: "DDP refused to drop {{ ddp_target_pdb }}: {{ ddp_backup_fail_reason }}"
+      assignment_group: "{{ snow_assignment_group }}"
+      other:
+        assigned_to: "{{ snow_assigned_to }}"
+    register: ddp_backup_fail_close
+    failed_when: false
+
+  - name: WARN if backup-failure CR could not be closed
+    ansible.builtin.debug:
+      msg: "WARNING: {{ ddp_cr.number }} could not be closed after a backup failure - it will re-enter the queue next pass."
+    when: ddp_backup_fail_close is failed
+
+  - name: Ensure local follow-up log directory exists on controller
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    delegate_to: localhost
+    become: false
+
+  - name: Fetch export log to controller (if it was produced) for attachment
+    ansible.builtin.fetch:
+      src: "{{ ddp_backup_dir }}/{{ ddp_rollback_name }}_export.log"
+      dest: "{{ followup_log_dir }}/{{ ddp_rollback_name }}_export.log"
+      flat: true
+    delegate_to: "{{ ddp_host }}"
+    failed_when: false
+
+  - name: Fetch RMAN log to controller (if it was produced) for attachment
+    ansible.builtin.fetch:
+      src: "{{ ddp_backup_dir }}/{{ ddp_rollback_name }}_rman.log"
+      dest: "{{ followup_log_dir }}/{{ ddp_rollback_name }}_rman.log"
+      flat: true
+    delegate_to: "{{ ddp_host }}"
+    failed_when: false
+
+  - name: Open DBA follow-up for rollback backup failure
+    ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
+    vars:
+      fu_tag: "{{ snow_project_tag }}"
+      fu_original_number: "{{ ddp_cr.number }}"
+      fu_original_sys_id: "{{ ddp_cr.sys_id }}"
+      fu_summary: "DDP pre-drop rollback backup failed for {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }}"
+      fu_description: "{{ ddp_backup_fail_reason }} No drop was attempted. Export and RMAN logs are attached (where produced) and the underlying files remain in place on {{ ddp_host }} at {{ ddp_backup_dir }} - nothing was deleted."
+      fu_attach_files:
+      - "{{ followup_log_dir }}/{{ ddp_rollback_name }}_export.log"
+      - "{{ followup_log_dir }}/{{ ddp_rollback_name }}_rman.log"
+
+  - name: Stop processing this CR (backup failure)
+    ansible.builtin.meta: end_host
+
+# -----------------------------------------------------------------
+# Working directory setup + snapshot/drop, unchanged from before, now
+# only reached once a verified rollback backup exists.
 # mode explicitly rather than relying on state: directory alone.
 - name: Ensure base working directory exists and is world-traversable
   ansible.builtin.file:
@@ -320,7 +552,7 @@
 - name: Downgrade to failure if any ORA- error line is present
   ansible.builtin.set_fact:
     ddp_success: false
-  when: ddp_error_lines | length > 0
+  when: ddp_error_lines | default([]) | length > 0
 
 - name: Attach snapshot and drop logs to the change request
   ansible.builtin.uri:
@@ -338,8 +570,8 @@
     status_code: 201
   delegate_to: "{{ ddp_host }}"
   loop:
-    - "snapshot.log"
-    - "drop.log"
+  - "snapshot.log"
+  - "drop.log"
   loop_control:
     label: "{{ item }}"
   ignore_errors: true
@@ -348,14 +580,13 @@
 - name: WARN if any log failed to attach
   ansible.builtin.debug:
     msg: >-
-      WARNING: could not attach {{ item.item }} to {{ ddp_cr.number }}
-      (HTTP {{ item.status | default('n/a') }}: {{ item.msg | default('unknown error') }}).
+      WARNING: could not attach {{ item.item }} to {{ ddp_cr.number }} (HTTP {{ item.status | default('n/a') }}: {{ item.msg | default('unknown error') }}).
   loop: "{{ ddp_attach.results | default([]) }}"
   loop_control:
     label: "{{ item.item | default('unknown') }}"
   when:
-    - item is not skipped
-    - item.failed | default(false) or (item.status | default(0)) != 201
+  - item is not skipped
+  - item.failed | default(false) or (item.status | default(0)) != 201
 
 - name: Post work note - outcome summary
   servicenow.itsm.change_request:
@@ -421,6 +652,33 @@
     msg: "WARNING: {{ ddp_cr.number }} could not be closed - it will re-enter the queue next pass and may re-run."
   when: (ddp_success | bool and ddp_close_ok is failed) or (not (ddp_success | bool) and ddp_close_fail is failed)
 
+- name: Ensure local follow-up log directory exists on controller (drop failure)
+  ansible.builtin.file:
+    path: "{{ followup_log_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+  when: not (ddp_success | bool)
+
+- name: Fetch snapshot.log to controller for follow-up attachment
+  ansible.builtin.fetch:
+    src: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/snapshot.log"
+    dest: "{{ followup_log_dir }}/DDP_{{ ddp_cr.number }}_snapshot.log"
+    flat: true
+  delegate_to: "{{ ddp_host }}"
+  failed_when: false
+  when: not (ddp_success | bool)
+
+- name: Fetch drop.log to controller for follow-up attachment
+  ansible.builtin.fetch:
+    src: "{{ ddp_work_dir }}/{{ ddp_cr.number }}/drop.log"
+    dest: "{{ followup_log_dir }}/DDP_{{ ddp_cr.number }}_drop.log"
+    flat: true
+  delegate_to: "{{ ddp_host }}"
+  failed_when: false
+  when: not (ddp_success | bool)
+
 - name: Open DBA follow-up on failed drop
   ansible.builtin.include_tasks: COMMON_snow_create_followup.yml
   vars:
@@ -429,6 +687,12 @@
     fu_original_sys_id: "{{ ddp_cr.sys_id }}"
     fu_summary: "DDP drop of {{ ddp_target_pdb }} on {{ ddp_cdb }}@{{ ddp_host }} failed"
     fu_description: >-
-      Drop attempt failed.
-      {{ (ddp_error_lines | join(' | '))[:900] if ddp_error_lines | default([]) | length > 0 else 'See attached drop.log on ' ~ ddp_cr.number ~ ' for details.' }}
+      Drop attempt failed. {{ (ddp_error_lines | join(' | '))[:900] if ddp_error_lines | default([]) | length > 0 else 'See attached drop.log for details.' }}
+
+      A pre-drop rollback backup (logical export + RMAN physical backup) was successfully taken before this failure and remains available on {{ ddp_host }} at:
+        {{ ddp_backup_dir }}/{{ ddp_rollback_name }}_export.dmp
+        {{ ddp_backup_dir }}/{{ ddp_rollback_name }}_*.bkp
+    fu_attach_files:
+    - "{{ followup_log_dir }}/DDP_{{ ddp_cr.number }}_snapshot.log"
+    - "{{ followup_log_dir }}/DDP_{{ ddp_cr.number }}_drop.log"
   when: not (ddp_success | bool)

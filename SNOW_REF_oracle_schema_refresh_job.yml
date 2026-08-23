@@ -127,6 +127,133 @@
   - ref_success
   - (ref_tgt_dir_check.stdout | default('') | trim) == '0'
 
+# -- ROLLBACK SAFETY NET: back up the existing target schema before it is
+#    dropped and overwritten. Naming convention (applies to every export,
+#    backup, and restore point created across this whole suite):
+#      <CR#>_rollback_<DB>_<SCHEMA>_<YYYY-MM-DD-HH-MM-SS>
+#    For REF, DB = target service, SCHEMA = target schema.
+
+- name: "JOB | {{ job.issue_key }} | Compute rollback artifact name"
+  ansible.builtin.set_fact:
+    ref_rollback_name: "{{ job.issue_key }}_rollback_{{ job.target_service }}_{{ job.target_schema }}_{{ '%Y-%m-%d-%H-%M-%S' | strftime }}"
+  when: ref_success
+
+# -- Look up the REFRESH directory object's REAL filesystem path from
+#    Oracle itself, rather than assuming one - the directory's OS path is
+#    host-specific and set whenever REFRESH was created, and is not
+#    otherwise tracked anywhere in this playbook.
+- name: "JOB | {{ job.issue_key }} | Look up REFRESH directory's real OS path"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT directory_path FROM dba_directories WHERE directory_name = 'REFRESH';
+      EXIT;
+      EOF
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_refresh_path_lookup
+  no_log: true
+  changed_when: false
+  when: ref_success
+
+- name: "JOB | {{ job.issue_key }} | Set REFRESH directory OS path fact"
+  ansible.builtin.set_fact:
+    ref_refresh_dir_path: "{{ ref_refresh_path_lookup.stdout | default('') | trim }}"
+  when: ref_success
+
+# NOTE: the 7-day retention purge has MOVED to run AFTER the refresh
+# completes, gated on ref_success being true at that point - see
+# "Purge rollback exports older than 7 days" near the outcome write below.
+# A FAILED refresh never deletes older rollback artifacts for this target,
+# even past 7 days - the last known-good backup is never removed out from
+# under a failure.
+
+# -- Check whether the target schema currently has anything worth backing
+#    up. A fresh/nonexistent target produces nothing useful to export, and
+#    running expdp against a schema with zero objects is wasted work.
+- name: "JOB | {{ job.issue_key }} | Check whether target schema currently exists"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT COUNT(*) FROM dba_users WHERE username = UPPER('{{ job.target_schema }}');
+      EXIT;
+      EOF
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_tgt_exists_check
+  no_log: true
+  changed_when: false
+  when: ref_success
+
+- name: "JOB | {{ job.issue_key }} | Export existing target schema before drop (rollback safety net)"
+  ansible.builtin.shell:
+    cmd: >-
+      export ORACLE_HOME={{ ref_tgt_home }} && export PATH=$ORACLE_HOME/bin:$PATH && expdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }} SCHEMAS={{ job.target_schema }} DIRECTORY=REFRESH DUMPFILE={{ ref_rollback_name }}.dmp LOGFILE={{ ref_rollback_name }}_export.log
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_backup_export
+  async: 3600
+  poll: 15
+  no_log: true
+  ignore_errors: true
+  when:
+  - ref_success
+  - (ref_tgt_exists_check.stdout | default('') | trim) != '0'
+
+- name: "JOB | {{ job.issue_key }} | Refuse to proceed if the pre-drop backup failed"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "Pre-drop rollback export of {{ job.target_schema }} failed (rc={{ ref_backup_export.rc | default('n/a') }}) - refusing to drop the target schema without a verified backup in place."
+  when:
+  - ref_backup_export is defined
+  - ref_backup_export.rc | default(1) != 0
+
+# -- Per your explicit instruction: NEVER delete rollback artifacts on
+#    failure, even incomplete ones - keep everything in /refresh for
+#    forensics, and attach the log (not the potentially-huge .dmp) to the
+#    DBA follow-up instead. Fetch it to the controller first since
+#    fu_attach_files only accepts controller-local paths.
+- name: "JOB | {{ job.issue_key }} | Ensure local follow-up log directory exists on controller (backup failure)"
+  ansible.builtin.file:
+    path: "{{ followup_log_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  become: false
+  when:
+  - ref_backup_export is defined
+  - ref_backup_export.rc | default(1) != 0
+
+- name: "JOB | {{ job.issue_key }} | Fetch the (possibly partial) export log to the controller"
+  ansible.builtin.fetch:
+    src: "{{ ref_refresh_dir_path }}/{{ ref_rollback_name }}_export.log"
+    dest: "{{ followup_log_dir }}/{{ ref_rollback_name }}_export.log"
+    flat: true
+  delegate_to: "{{ job.target_host }}"
+  failed_when: false
+  when:
+  - ref_backup_export is defined
+  - ref_backup_export.rc | default(1) != 0
+  - ref_refresh_dir_path | default('') | length > 0
+
+- name: "JOB | {{ job.issue_key }} | Note rollback backup was skipped (target schema did not yet exist)"
+  ansible.builtin.debug:
+    msg: "{{ job.issue_key }}: target schema {{ job.target_schema }} did not exist yet - nothing to back up before this refresh creates it."
+  when:
+  - ref_success
+  - (ref_tgt_exists_check.stdout | default('') | trim) == '0'
+
 # -- Drop target schema before import (idempotent, same logic as before,
 #    now delegated to target_host specifically) --------------------------
 - name: "JOB | {{ job.issue_key }} | Drop target schema {{ job.target_schema }} (idempotent)"
@@ -281,6 +408,7 @@
         Target:         {{ job.target_host }}:{{ job.target_schema }}@{{ job.target_service }}
         {{ 'CROSS-HOST refresh (via NETWORK_LINK, no dump file)' if job.source_host != job.target_host else 'Same-host refresh (via NETWORK_LINK)' }}
         Objects found:  {{ ref_verify.stdout_lines | default([]) | length }} object type(s) in target schema
+        Rollback backup: {{ (ref_refresh_dir_path | default('')) + '/' + ref_rollback_name + '.dmp' if (ref_backup_export is defined and ref_backup_export.rc | default(1) == 0) else 'none taken (target schema did not exist yet)' }}
         Overall result: {{ 'DONE' if ref_success else 'FAILED - ' + ref_fail_reason }}
         Performed by:   {{ sn_username }} (Ansible automation)
         Timestamp:      {{ ansible_date_time.iso8601 }}
@@ -318,6 +446,30 @@
   become: false
   when: not ref_success
 
+# -- Retention: delete any prior CR's rollback export for this SAME target
+#    service+schema older than 7 days - MOVED here, after the refresh
+#    completed, and gated on the FINAL ref_success value. A failed refresh
+#    never deletes older rollback artifacts for this target, even past 7
+#    days - the last known-good backup is never removed out from under a
+#    failure. Scoped to this target (not a blanket wipe of the whole
+#    REFRESH directory) so unrelated schemas' rollback artifacts are
+#    untouched.
+- name: "JOB | {{ job.issue_key }} | Purge rollback exports older than 7 days for this target"
+  ansible.builtin.shell:
+    cmd: >-
+      find {{ ref_refresh_dir_path }}
+      -maxdepth 1 -type f
+      -name '*_rollback_{{ job.target_service }}_{{ job.target_schema }}_*'
+      -mtime +7 -delete
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  failed_when: false
+  changed_when: false
+  when:
+  - ref_success
+  - ref_refresh_dir_path | default('') | length > 0
+
 # -- Write outcome for PLAY 3 ----------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Write outcome to controller temp file"
   ansible.builtin.shell:
@@ -345,7 +497,8 @@
           "import_rc":      {{ ref_impdp.rc | default(-1) }},
           "object_count":   {{ ref_verify.stdout_lines | default([]) | length }},
           "error":          "{{ ref_fail_reason }}",
-          "failure_log":    "" if {{ ref_success }} else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ ref_job_ts }}.log"
+          "failure_log":    "" if {{ ref_success }} else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ ref_job_ts }}.log",
+          "backup_export_log": "" if {{ ref_success }} or {{ (ref_backup_export is not defined) or (ref_backup_export.rc | default(0) == 0) }} else "{{ followup_log_dir }}/{{ ref_rollback_name | default('') }}_export.log"
       })
 
       with open(outfile, "w") as f:

@@ -36,6 +36,62 @@
   block:
 
   # =========================================================================
+  # 0. Purge orphaned guaranteed restore points older than 7 days for this
+  #    SID. AutoUpgrade names its own GRPs internally (we do not control or
+  #    know the naming pattern in advance), so this cannot be scoped by our
+  #    usual <CR#>_rollback_... naming convention - it matches on
+  #    guarantee_flashback_database='YES' + age instead. ASSUMPTION worth
+  #    verifying: this could drop an unrelated guaranteed restore point a
+  #    DBA created manually for other purposes if one happens to be older
+  #    than 7 days on this SID - the WARN below lists exactly what gets
+  #    dropped so it stays auditable.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Find guaranteed restore points older than 7 days"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOF'
+        set heading off feedback off pagesize 0
+        select name from v$restore_point where guarantee_flashback_database='YES' and time < sysdate - 7;
+        exit;
+        EOF
+    delegate_to: "{{ oracle_host }}"
+    become: true
+    become_user: oracle
+    register: upg_old_grps
+    changed_when: false
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | WARN before dropping orphaned old restore points"
+    ansible.builtin.debug:
+      msg: "WARNING: dropping guaranteed restore point '{{ item }}' on {{ job.oracle_sid }} - older than 7 days."
+    loop: "{{ upg_old_grps.stdout_lines | default([]) | select() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "JOB | {{ job.issue_key }} | Drop orphaned restore points older than 7 days"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOF'
+        whenever sqlerror continue
+        drop restore point "{{ item }}";
+        exit;
+        EOF
+    delegate_to: "{{ oracle_host }}"
+    become: true
+    become_user: oracle
+    loop: "{{ upg_old_grps.stdout_lines | default([]) | select() | list }}"
+    loop_control:
+      label: "{{ item }}"
+    failed_when: false
+    changed_when: true
+
+  # =========================================================================
   # 1. Opening work note (the change is already in implement via the intake
   #    shepherd, so no state change is needed here)
   # =========================================================================
@@ -568,9 +624,218 @@
 
   # ===========================================================================
   # ===========================================================================
-  # RESCUE: detect -> halt -> notify. Never auto-clears recovery data.
+  # RESCUE: detect -> auto-rollback where safe -> notify. Never auto-clears
+  # recovery data.
+  #
+  # Two failure shapes get automatic rollback here:
+  #   A) Deploy itself failed and AutoUpgrade's OWN internal mechanism already
+  #      flashed the database back (deploy_jobs_restored != '0', detected via
+  #      the "Assert deploy succeeded" task). We did not cause this rollback -
+  #      Oracle's own tool did - we only confirm it and clean up the now-used
+  #      restore point (storage parity).
+  #   B) Deploy itself succeeded per AutoUpgrade's own report, but OUR
+  #      separate post-deploy verification (restart under 26ai, confirm
+  #      version/OPEN) failed. This is the real gap: AutoUpgrade has no idea
+  #      this check even exists, so it never rolls back for it. We do here -
+  #      explicitly flashback to the retained guaranteed restore point,
+  #      re-verify the database is back on the ORIGINAL version, and only
+  #      then drop the restore point.
+  #
+  # Any other failure (e.g. ANALYZE phase, pre-flight, before a GRP even
+  # exists) gets no rollback action - there is nothing to roll back from yet.
   # ===========================================================================
   rescue:
+
+  - name: "JOB | {{ job.issue_key }} | Determine which task failed"
+    ansible.builtin.set_fact:
+      upg_failed_task_name: "{{ ansible_failed_task.name | default('') }}"
+      upg_auto_rollback_attempted: false
+      upg_auto_rollback_result: ""
+
+  # -- Branch A: AutoUpgrade's own deploy-phase restore already happened ----
+  - name: "JOB | {{ job.issue_key }} | Branch A - confirm AutoUpgrade's own auto-restore"
+    when:
+    - "'Assert deploy succeeded' in upg_failed_task_name"
+    - deploy_jobs_restored | default('0') != '0'
+    block:
+
+    - name: "JOB | {{ job.issue_key }} | Write version-check script (post AutoUpgrade auto-restore)"
+      ansible.builtin.copy:
+        dest: "{{ verify_script }}"
+        owner: oracle
+        group: oinstall
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          export ORACLE_SID={{ job.oracle_sid }}
+          export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOF'
+          set heading off feedback off pagesize 0
+          select 'VERSION='||version_full from v$instance;
+          select 'STATUS='||status from v$instance;
+          select 'GRP='||name from v$restore_point where guarantee_flashback_database='YES';
+          exit;
+          EOF
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: root
+
+    - name: "JOB | {{ job.issue_key }} | Confirm database state after AutoUpgrade's auto-restore"
+      ansible.builtin.command:
+        cmd: "{{ verify_script }}"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: upg_autorestore_check
+      changed_when: false
+      failed_when: false
+
+    - name: "JOB | {{ job.issue_key }} | Drop the now-consumed restore point (storage parity)"
+      ansible.builtin.shell:
+        cmd: |
+          export ORACLE_SID={{ job.oracle_sid }}
+          export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOF'
+          {{ deploy_grp_drop_cmd | default('') }};
+          exit;
+          EOF
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      when: deploy_grp_drop_cmd | default('') | length > 0
+      failed_when: false
+      changed_when: true
+
+    - name: "JOB | {{ job.issue_key }} | Record Branch A rollback outcome"
+      ansible.builtin.set_fact:
+        upg_auto_rollback_attempted: true
+        upg_auto_rollback_result: >-
+          AutoUpgrade's own internal mechanism auto-flashed the database back
+          to its pre-upgrade state during the deploy phase (this was NOT
+          triggered by this playbook - Oracle's own tool did it as part of
+          deploy failure handling). Post-restore state:
+          {{ upg_autorestore_check.stdout | default('(could not verify)') | trim }}
+          The now-consumed guaranteed restore point has been dropped.
+
+  # -- Branch B: our own post-deploy verify failed - deploy itself was fine
+  #    per AutoUpgrade, so we must explicitly flashback ourselves -----------
+  - name: "JOB | {{ job.issue_key }} | Branch B - explicit rollback after post-deploy verify failure"
+    when:
+    - "'Assert database is on 26ai and OPEN' in upg_failed_task_name"
+    - deploy_jobs_failed | default('?') == '0'
+    - deploy_jobs_restored | default('?') == '0'
+    block:
+
+    - name: "JOB | {{ job.issue_key }} | Look up the retained guaranteed restore point name"
+      ansible.builtin.shell:
+        cmd: |
+          export ORACLE_SID={{ job.oracle_sid }}
+          export ORACLE_HOME={{ oracle_target_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOF'
+          set heading off feedback off pagesize 0
+          select name from v$restore_point where guarantee_flashback_database='YES';
+          exit;
+          EOF
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: upg_grp_lookup
+      changed_when: false
+      failed_when: false
+
+    - name: "JOB | {{ job.issue_key }} | Set restore point name fact"
+      ansible.builtin.set_fact:
+        upg_grp_name: "{{ upg_grp_lookup.stdout | default('') | trim }}"
+
+    - name: "JOB | {{ job.issue_key }} | Refuse auto-rollback if no guaranteed restore point was found"
+      ansible.builtin.set_fact:
+        upg_auto_rollback_attempted: false
+        upg_auto_rollback_result: "Post-deploy verification failed, but no guaranteed restore point could be found - automatic rollback was NOT possible. Manual DBA recovery required immediately."
+      when: upg_grp_name | default('') | length == 0
+
+    - name: "JOB | {{ job.issue_key }} | Write flashback script (mount, flashback, resetlogs, under ORIGINAL home)"
+      ansible.builtin.copy:
+        dest: "{{ verify_script }}"
+        owner: oracle
+        group: oinstall
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          export ORACLE_SID={{ job.oracle_sid }}
+          export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOF'
+          whenever sqlerror exit sql.sqlcode
+          shutdown immediate;
+          startup mount;
+          flashback database to restore point "{{ upg_grp_name }}";
+          alter database open resetlogs;
+          set heading off feedback off pagesize 0
+          select 'VERSION='||version_full from v$instance;
+          select 'STATUS='||status from v$instance;
+          exit;
+          EOF
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: root
+      when: upg_grp_name | default('') | length > 0
+
+    - name: "JOB | {{ job.issue_key }} | Execute flashback to guaranteed restore point"
+      ansible.builtin.command:
+        cmd: "{{ verify_script }}"
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      register: upg_flashback_result
+      async: 1800
+      poll: 15
+      failed_when: false
+      changed_when: true
+      when: upg_grp_name | default('') | length > 0
+
+    - name: "JOB | {{ job.issue_key }} | Confirm flashback actually returned the DB to its ORIGINAL version"
+      ansible.builtin.set_fact:
+        upg_flashback_confirmed: >-
+          {{
+            upg_grp_name | default('') | length > 0
+            and (upg_flashback_result.rc | default(1) == 0)
+            and ('STATUS=OPEN' in (upg_flashback_result.stdout | default('')))
+            and not (upg_flashback_result.stdout | default('') is regex('VERSION=(23\.26|26)\.'))
+          }}
+
+    - name: "JOB | {{ job.issue_key }} | Drop the restore point now that it has been used (storage parity)"
+      ansible.builtin.shell:
+        cmd: |
+          export ORACLE_SID={{ job.oracle_sid }}
+          export ORACLE_HOME={{ oracle_instance_map[oracle_host].oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba <<'EOF'
+          drop restore point "{{ upg_grp_name }}";
+          exit;
+          EOF
+      delegate_to: "{{ oracle_host }}"
+      become: true
+      become_user: oracle
+      when:
+      - upg_grp_name | default('') | length > 0
+      - upg_flashback_confirmed | default(false)
+      failed_when: false
+      changed_when: true
+
+    - name: "JOB | {{ job.issue_key }} | Record Branch B rollback outcome"
+      ansible.builtin.set_fact:
+        upg_auto_rollback_attempted: true
+        upg_auto_rollback_result: >-
+          {%- if upg_grp_name | default('') | length == 0 -%}
+          Post-deploy verification failed and no guaranteed restore point was found - automatic rollback was NOT possible. MANUAL DBA RECOVERY REQUIRED IMMEDIATELY.
+          {%- elif upg_flashback_confirmed | default(false) -%}
+          Post-deploy verification failed (database restarted under 26ai but did not verify correctly). Automatically flashed back to guaranteed restore point "{{ upg_grp_name }}" and confirmed the database is back on its ORIGINAL pre-upgrade version and OPEN. The restore point has been dropped. Result: {{ upg_flashback_result.stdout | default('') | trim }}
+          {%- else -%}
+          Post-deploy verification failed and an automatic flashback to restore point "{{ upg_grp_name }}" was ATTEMPTED but could NOT be confirmed successful (rc={{ upg_flashback_result.rc | default('n/a') }}). The restore point has been LEFT IN PLACE for manual recovery. MANUAL DBA INTERVENTION REQUIRED IMMEDIATELY - do not assume the database is in a known-good state. Output: {{ upg_flashback_result.stdout | default('') | trim }} {{ upg_flashback_result.stderr | default('') | trim }}
+          {%- endif -%}
 
   - name: "JOB | {{ job.issue_key }} | Classify failure"
     ansible.builtin.set_fact:
@@ -595,6 +860,10 @@
 
           {{ job_failed_reason }}
 
+          {% if upg_auto_rollback_attempted | default(false) %}
+          ROLLBACK: {{ upg_auto_rollback_result }}
+          {% endif %}
+
           Logs: {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log
       status_code: 200
     failed_when: false
@@ -607,7 +876,10 @@
       sys_id: "{{ job.sys_id }}"
       state: closed
       close_code: unsuccessful
-      close_notes: "AutoUpgrade halted; see work notes and the DBA repair follow-up change. Recovery data was NOT cleared automatically."
+      close_notes: >-
+        AutoUpgrade halted; see work notes and the DBA repair follow-up change.
+        Recovery data was NOT cleared automatically.
+        {{ ('Rollback: ' + upg_auto_rollback_result) if upg_auto_rollback_attempted | default(false) else '' }}
     failed_when: false
 
   # ---------------------------------------------------------------------------

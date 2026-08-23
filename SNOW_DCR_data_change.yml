@@ -591,6 +591,252 @@
       label: "{{ item.issue_key }}"
     when: item.host not in oracle_instance_map
 
+  # -- ROLLBACK SAFETY NET (schema-level export + PDB-level restore point) --
+  #
+  # Taken BEFORE each script runs, since DCR executes arbitrary user-supplied
+  # SQL and there is no way to auto-generate a real rollback for unknown
+  # statements. This is insurance for a human to use, NOT automatic
+  # rollback-on-failure - DCR scripts can partially succeed in ways that are
+  # legitimate even when the final statement errors, so auto-reverting here
+  # would be unsafe without a human's judgment call (unlike UPG, where a
+  # post-deploy verification failure has an unambiguous correct response).
+  #
+  # Naming convention (same across every export/backup/restore point in this
+  # suite): <CR#>_rollback_<DB>_<SCHEMA>_<YYYY-MM-DD-HH-MM-SS>
+  # For the RESTORE POINT specifically, hyphens are replaced with
+  # underscores - Oracle restore point names must be valid identifiers and
+  # do not accept hyphens unquoted. File names (dump/log) use the literal
+  # requested format.
+  #
+  # ASSUMPTION requiring verification: this assumes PDB-level Flashback
+  # Database is enabled on every target PDB (the same mechanism UPG already
+  # depends on for its own guaranteed restore points). If flashback is not
+  # enabled on a given PDB, restore point creation will fail here and this
+  # script correctly refuses to run rather than proceeding without a safety
+  # net - but that also means DCR cannot execute against that PDB until
+  # flashback is enabled there.
+
+  - name: "5f | Compute rollback artifact names per script"
+    ansible.builtin.set_fact:
+      dcr_rollback_names: >-
+        {{
+          dcr_rollback_names | default({}) | combine({
+            item.issue_key: {
+              'file': item.issue_key + '_rollback_' + item.sid + '_' + item.schema + '_' + ('%Y-%m-%d-%H-%M-%S' | strftime),
+              'restore_point': (item.issue_key + '_rollback_' + item.sid + '_' + item.schema + '_' + ('%Y%m%d_%H%M%S' | strftime)) | regex_replace('[^A-Za-z0-9_]', '_')
+            }
+          })
+        }}
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.host in oracle_instance_map
+
+  # -- Pre-flight: confirm the shared ROLLBACK directory object exists on
+  #    each target host (OS path /rollback, created once manually across
+  #    all nodes - NOT self-provisioned here, same as REF's REFRESH and
+  #    DDP's ROLLBACK checks). Runs on the TARGET HOST, since this is a
+  #    server-side directory object - the actual dump files live on
+  #    item.host's filesystem, not the controller.
+  - name: "5f | Confirm the ROLLBACK directory object exists on each target host"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -S /nolog << 'EOF'
+        CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }}
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+        SELECT directory_path FROM dba_directories WHERE directory_name = 'ROLLBACK';
+        EXIT;
+        EOF
+    delegate_to: "{{ item.host }}"
+    register: dcr_rollbackdir_lookup
+    no_log: true
+    changed_when: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when: item.host in oracle_instance_map
+
+  - name: "5f | Record ROLLBACK directory path per script"
+    ansible.builtin.set_fact:
+      dcr_rollbackdir_by_key: >-
+        {{
+          dcr_rollbackdir_by_key | default({}) | combine({
+            item.item.issue_key: (item.stdout | default('') | trim)
+          })
+        }}
+    loop: "{{ dcr_rollbackdir_lookup.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('?') }}"
+      loop_var: item
+    when: item.item is defined
+
+  - name: "5f | WARN and remove scripts whose target host is missing the ROLLBACK directory"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.issue_key }} - the ROLLBACK directory object does not exist on {{ item.host }} (expected to point at /rollback). Refusing to run without a rollback safety net. Create it there: CREATE DIRECTORY ROLLBACK AS '/rollback'; GRANT READ, WRITE ON DIRECTORY ROLLBACK TO PUBLIC;
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when:
+    - item.host in oracle_instance_map
+    - dcr_rollbackdir_by_key[item.issue_key] | default('') | length == 0
+
+  - name: "5f | Build list of issue_keys missing the ROLLBACK directory"
+    ansible.builtin.set_fact:
+      dcr_missing_rollbackdir_keys: >-
+        {{
+          scripts_to_run | default([])
+          | selectattr('host', 'in', oracle_instance_map.keys() | list)
+          | rejectattr('issue_key', 'in',
+              dcr_rollbackdir_by_key | default({}) | dict2items
+              | rejectattr('value', 'equalto', '') | map(attribute='key') | list)
+          | map(attribute='issue_key') | list
+        }}
+
+  - name: "5f | Drop scripts missing the ROLLBACK directory from the run list"
+    ansible.builtin.set_fact:
+      scripts_to_run: >-
+        {{
+          scripts_to_run | default([])
+          | rejectattr('issue_key', 'in', dcr_missing_rollbackdir_keys | default([]))
+          | list
+        }}
+
+  # NOTE: the 7-day retention purge (exports + restore points) has been
+  # MOVED to run AFTER script execution, gated on that specific issue's
+  # outcome being 'done' - see "7c | Purge rollback artifacts..." below.
+  # This ensures a FAILED run never deletes older rollback artifacts for
+  # the same project, even if they've crossed 7 days - the last known-good
+  # safety net is never removed out from under a failure.
+
+  - name: "5f | Export target schema before running the script (rollback safety net)"
+    ansible.builtin.shell:
+      cmd: >-
+        export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }} && export PATH=$ORACLE_HOME/bin:$PATH && expdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }} SCHEMAS={{ item.schema }} DIRECTORY=ROLLBACK DUMPFILE={{ dcr_rollback_names[item.issue_key].file }}_export.dmp LOGFILE={{ dcr_rollback_names[item.issue_key].file }}_export.log
+    delegate_to: "{{ item.host }}"
+    register: dcr_rollback_export
+    async: 3600
+    poll: 15
+    no_log: true
+    ignore_errors: true
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when: item.host in oracle_instance_map
+
+  - name: "5f | Create PDB-level guaranteed restore point before running the script"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -S /nolog << 'EOF'
+        CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }}
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        CREATE RESTORE POINT "{{ dcr_rollback_names[item.issue_key].restore_point }}" GUARANTEE FLASHBACK DATABASE;
+        EXIT;
+        EOF
+    delegate_to: "{{ item.host }}"
+    register: dcr_rollback_grp
+    no_log: true
+    ignore_errors: true
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when: item.host in oracle_instance_map
+
+  - name: "5f | Mark scripts whose rollback safety net failed to build"
+    ansible.builtin.set_fact:
+      dcr_rollback_failed_keys: >-
+        {{
+          dcr_rollback_failed_keys | default([])
+          + (
+              [item.item.issue_key]
+              if (item.rc | default(1) != 0)
+              else []
+            )
+        }}
+    loop: "{{ (dcr_rollback_export.results | default([])) + (dcr_rollback_grp.results | default([])) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('?') }}"
+      loop_var: item
+    when: item.item is defined
+
+  - name: "5f | WARN and remove any script whose rollback safety net failed"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item }} - could not build a rollback safety net (export or guaranteed restore point failed). Refusing to run this script without one. Check flashback is enabled on the target PDB and the ROLLBACK directory is valid.
+    loop: "{{ dcr_rollback_failed_keys | default([]) | unique }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "5f | Remove scripts whose rollback safety net failed from the run list"
+    ansible.builtin.set_fact:
+      scripts_to_run: >-
+        {{
+          scripts_to_run | default([])
+          | rejectattr('issue_key', 'in', dcr_rollback_failed_keys | default([]))
+          | list
+        }}
+
+  # Per explicit instruction: NEVER delete rollback artifacts on failure,
+  # even incomplete ones - keep everything in /rollback for forensics.
+  # This CR isn't closed here (it stays open and retries next pass once the
+  # underlying issue - flashback not enabled, directory missing, etc - is
+  # fixed), so this posts a work note + direct attachment to the ORIGINAL
+  # CR rather than opening a separate DBA follow-up record.
+  - name: "5f | Work note on the original CR - rollback safety net failed"
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/change_request/{{ snow_cr_map[item] }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        work_notes: >-
+          DCR could not build a rollback safety net for this script (export
+          or guaranteed restore point failed) - refusing to run it without
+          one. Check flashback is enabled on the target PDB and the
+          ROLLBACK directory is valid. Nothing was deleted - any partial
+          export remains on {{ dcr_target_by_key[item].host }} at
+          {{ dcr_rollbackdir_by_key[item] | default('(unknown path)') }}
+          for inspection. This CR will be retried on the next pass.
+      status_code: 200
+    loop: "{{ dcr_rollback_failed_keys | default([]) | unique }}"
+    loop_control:
+      label: "{{ item }}"
+    failed_when: false
+    when: snow_cr_map[item] is defined
+
+  - name: "5f | Attach the (possibly partial) export log directly to the original CR"
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/attachment/file?table_name=change_request&table_sys_id={{
+          snow_cr_map[item] }}&file_name={{ dcr_rollback_names[item].file }}_export.log
+      method: POST
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      headers:
+        Content-Type: "text/plain"
+      src: "{{ dcr_rollbackdir_by_key[item] | default('') }}/{{ dcr_rollback_names[item].file }}_export.log"
+      remote_src: true
+      status_code: 201
+    delegate_to: "{{ dcr_target_by_key[item].host }}"
+    loop: "{{ dcr_rollback_failed_keys | default([]) | unique }}"
+    loop_control:
+      label: "{{ item }}"
+    failed_when: false
+    when:
+    - snow_cr_map[item] is defined
+    - dcr_rollbackdir_by_key[item] | default('') | length > 0
+
   # -- 5b/5c/5e. Wrap each script with a DYNAMIC per-CR connection header ----
   #
   # REDESIGNED (host:sid:schema): previously every script was wrapped with
@@ -899,6 +1145,61 @@
     loop_control:
       label: "{{ item.key }} ({{ item.value }})"
     ignore_errors: true
+
+  # -- 7c. Retention purge - MOVED here (after outcome is known) so a
+  #    FAILED run never deletes older rollback artifacts for the same
+  #    project, even if they're past 7 days. Only runs for issues whose
+  #    outcome is 'done' - the last known-good safety net is never removed
+  #    out from under a failure.
+
+  - name: "7c | Purge rollback export files older than 7 days (successful issues only)"
+    ansible.builtin.shell:
+      cmd: >-
+        find {{ dcr_rollbackdir_by_key[item.issue_key] }}
+        -maxdepth 1 -type f
+        -name '*_rollback_{{ item.sid }}_{{ item.schema }}_*'
+        -mtime +7 -delete
+    delegate_to: "{{ item.host }}"
+    failed_when: false
+    changed_when: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when:
+    - issue_outcomes.get(item.issue_key, '') == 'done'
+    - dcr_rollbackdir_by_key[item.issue_key] | default('') | length > 0
+
+  - name: "7c | Purge restore points older than 7 days (successful issues only)"
+    ansible.builtin.shell:
+      cmd: |
+        export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -S /nolog << 'EOF'
+        CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }}
+        SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF SERVEROUTPUT ON
+        DECLARE
+          CURSOR c IS
+            SELECT name FROM v$restore_point
+            WHERE name LIKE '%\_rollback\_{{ item.sid }}\_{{ item.schema }}\_%' ESCAPE '\'
+              AND time < SYSDATE - 7;
+        BEGIN
+          FOR r IN c LOOP
+            EXECUTE IMMEDIATE 'DROP RESTORE POINT "' || r.name || '"';
+          END LOOP;
+        END;
+        /
+        EXIT;
+        EOF
+    delegate_to: "{{ item.host }}"
+    failed_when: false
+    changed_when: false
+    no_log: true
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+      loop_var: item
+    when: issue_outcomes.get(item.issue_key, '') == 'done'
 
   # -- 8/9. Close change requests based on outcome ---------------------------
 
