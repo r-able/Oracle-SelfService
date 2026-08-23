@@ -50,9 +50,7 @@
 - name: "ITIL | {{ itil_primary_key }} | WARN and skip if sys_id could not be resolved"
   ansible.builtin.debug:
     msg: >-
-      WARNING: could not resolve a sys_id for {{ itil_primary_key }} (neither
-      itil_sys_id nor snow_cr_map lookup worked) - skipping ITIL
-      classification for this change. This does not block the change itself.
+      WARNING: could not resolve a sys_id for {{ itil_primary_key }} (neither itil_sys_id nor snow_cr_map lookup worked) - skipping ITIL classification for this change. This does not block the change itself.
   when: itil_target_sys_id | length == 0
 
 - name: "ITIL | {{ itil_primary_key }} | Look up the CMDB CI record for {{ itil_ci_name }}"
@@ -80,11 +78,7 @@
 - name: "ITIL | {{ itil_primary_key }} | WARN if no matching CMDB CI record exists"
   ansible.builtin.debug:
     msg: >-
-      WARNING: no CMDB CI record found matching '{{ itil_ci_name }}' -
-      change request {{ itil_primary_key }} will be classified (risk/
-      impact/schedule) but will NOT have a formal CI link. Consider
-      creating a CMDB CI record for this host/database so future changes
-      link correctly.
+      WARNING: no CMDB CI record found matching '{{ itil_ci_name }}' - change request {{ itil_primary_key }} will be classified (risk/ impact/schedule) but will NOT have a formal CI link. Consider creating a CMDB CI record for this host/database so future changes link correctly.
   when:
   - itil_target_sys_id | length > 0
   - not itil_cmdb_ci_found

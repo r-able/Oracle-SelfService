@@ -62,15 +62,23 @@
   #
   # DCR does NOT use the shared COMMON_snow_intake.yml, because its approval
   # path depends on the TARGET ENVIRONMENT of each change, which is unique to
-  # DCR. The short_description format is:
+  # DCR. The short_description format is now (REDESIGNED - was previously
+  # "DCR | <ENV> | <free title>" with no real per-CR connection target at
+  # all - see the connection-logic note at task 5b/5c below):
   #
-  #     DCR | <ENV> | <free title>          e.g. "DCR | PROD | Q3 migration"
-  #                                              "DCR | DEV  | add index"
+  #     DCR | <HOST>:<SID>:<SCHEMA> | <free title>
+  #     e.g. "DCR | lnx001:PRO:APPUSER | Q3 migration"
+  #          "DCR | lnx001:DEV:APPUSER | add index"
+  #
+  # PROD detection now comes from the real PDB name (SID) on the selected
+  # target, not a free-typed ENV word - lnx001's environment-tier PDBs use
+  # "PRO" (not "PROD") as the real value, matching u_oracle_target/
+  # oracle_instance_map elsewhere in this suite.
   #
   # Routing, per change request:
-  #   * ENV != PROD  -> no approval needed: promote new -> implement and run
+  #   * SID != PRO   -> no approval needed: promote new -> implement and run
   #                     immediately this pass.
-  #   * ENV == PROD  -> approval required (but NOT CAB -- that is configured on
+  #   * SID == PRO   -> approval required (but NOT CAB -- that is configured on
   #                     the ServiceNow side via the change model): a new PROD
   #                     change is moved to 'assess' to request approval and is
   #                     NOT run this pass; it only runs on a later pass once it
@@ -126,14 +134,17 @@
           | map('combine', {}) | list
         }}
 
-  - name: "0 | Annotate each change with its environment and PROD flag"
+  - name: "0 | Annotate each change with its target host:sid:schema and PROD flag"
     ansible.builtin.set_fact:
       dcr_annotated: >-
         {{
           dcr_annotated | default([]) + [
             item | combine({
-              'env':     (item.short_description.split('|')[1] | default('') | trim | upper),
-              'is_prod': ((item.short_description.split('|')[1] | default('') | trim | upper) == 'PROD')
+              'dcr_target_parts': (item.short_description.split('|')[1] | default('') | trim | split(':')),
+              'host':   (item.short_description.split('|')[1] | default('') | trim | split(':') | first | default('')),
+              'sid':    (item.short_description.split('|')[1] | default('') | trim | split(':') | length > 1) | ternary((item.short_description.split('|')[1] | default('') | trim | split(':'))[1], ''),
+              'schema': (item.short_description.split('|')[1] | default('') | trim | split(':') | length > 2) | ternary((item.short_description.split('|')[1] | default('') | trim | split(':'))[2], ''),
+              'is_prod': (((item.short_description.split('|')[1] | default('') | trim | split(':') | length > 1) | ternary((item.short_description.split('|')[1] | default('') | trim | split(':'))[1], '')) | upper == 'PRO')
             })
           ]
         }}
@@ -141,27 +152,21 @@
     loop_control:
       label: "{{ item.number }}"
 
+  - name: "0 | WARN and skip any change whose target isn't HOST:SID:SCHEMA"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.number }} has a malformed target field ('{{ item.short_description.split('|')[1] | default('') | trim }}') -- expected 'HOST:SID:SCHEMA'. It will be treated as non-PROD/unroutable until corrected.
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }}"
+    when: item.host | length == 0 or item.sid | length == 0 or item.schema | length == 0
+
   - name: "0 | Intake summary"
     ansible.builtin.debug:
       msg: >-
         DCR: {{ dcr_annotated | default([]) | length }} tagged change(s) -- {{ dcr_annotated | default([]) | map(attribute='number')
-           | zip(dcr_annotated | default([]) | map(attribute='env')) | list }}.
+           | zip(dcr_annotated | default([]) | map(attribute='host'), dcr_annotated | default([]) | map(attribute='sid'), dcr_annotated | default([]) | map(attribute='schema')) | list }}.
         Only changes assigned to '{{ snow_assigned_to }}' in '{{ snow_assignment_group }}' are considered.
-
-  # -- ITIL classification (CI link, risk/impact, change schedule) --------
-  - name: "0a | ITIL | Classify each DCR change (CI link, risk, impact, schedule)"
-    ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
-    loop: "{{ dcr_annotated | default([]) }}"
-    loop_control:
-      label: "{{ item.number }}"
-    vars:
-      itil_primary_key: "{{ item.number }}"
-      itil_sys_id: "{{ item.sys_id }}"
-      itil_ci_name: "{{ item.env }}"
-      itil_risk: "medium"
-      itil_impact: "medium"
-      itil_planned_duration_hours: 1
-  # -- END ITIL classification ----------------------------------------------
 
   # -- Non-PROD: promote straight to implement (no approval) ------------------
   # Standard/pre-approved changes must walk the state lifecycle in order
@@ -184,7 +189,7 @@
         assigned_to: "{{ snow_assigned_to }}"
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - not item.is_prod
     - item.state == snow_state_new
@@ -204,7 +209,7 @@
         assigned_to: "{{ snow_assigned_to }}"
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - not item.is_prod
     - item.state in [snow_state_new, snow_state_scheduled]
@@ -214,7 +219,7 @@
   - name: "0 | WARN about any NON-PROD change that could not be advanced to implement"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.item.number }} ({{ item.item.env }}) could not be moved to implement: {{ item.msg | default('see ServiceNow change model / required fields') }}. It will remain in its current state and not run this pass.
+        WARNING: {{ item.item.number }} ({{ item.item.host }}:{{ item.item.sid }}) could not be moved to implement: {{ item.msg | default('see ServiceNow change model / required fields') }}. It will remain in its current state and not run this pass.
     loop: "{{ dcr_promote_impl.results | default([]) }}"
     loop_control:
       label: "{{ item.item.number | default('skipped') }}"
@@ -233,7 +238,7 @@
       state: assess
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - item.is_prod
     - item.state == snow_state_new
@@ -268,7 +273,7 @@
         assigned_to: "{{ snow_assigned_to }}"
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - item.is_prod
     - item.state == snow_state_assess
@@ -288,7 +293,7 @@
         assigned_to: "{{ snow_assigned_to }}"
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - item.is_prod
     - item.state in [snow_state_assess, snow_state_authorize]
@@ -308,7 +313,7 @@
         assigned_to: "{{ snow_assigned_to }}"
     loop: "{{ dcr_annotated | default([]) }}"
     loop_control:
-      label: "{{ item.number }} ({{ item.env }})"
+      label: "{{ item.number }} ({{ item.host }}:{{ item.sid }})"
     when:
     - item.is_prod
     - item.state in [snow_state_assess, snow_state_authorize, snow_state_scheduled]
@@ -336,14 +341,39 @@
     register: dcr_query2
     failed_when: false
 
-  - name: "0 | Build executable work list and sys_id map"
+  # Re-attach each executable item's already-parsed host/sid/schema from
+  # dcr_annotated (matched by sys_id) rather than re-parsing short_description
+  # a second time - the re-query above only returns raw ServiceNow fields, it
+  # does not carry over the annotation set earlier in this same run. This is
+  # NEW as of the host:sid:schema redesign - execution never needed a real
+  # per-CR target before, since every script ran against the same fixed
+  # dcr_connect_credentials regardless of what ENV said.
+  - name: "0 | Build a sys_id -> annotation lookup dict from dcr_annotated"
+    ansible.builtin.set_fact:
+      dcr_annotation_by_sysid: >-
+        {{
+          dcr_annotation_by_sysid | default({}) | combine({
+            item.sys_id: { 'host': item.host, 'sid': item.sid, 'schema': item.schema }
+          })
+        }}
+    loop: "{{ dcr_annotated | default([]) }}"
+    loop_control:
+      label: "{{ item.number }}"
+
+  - name: "0 | Build executable work list, re-attaching host/sid/schema per item"
     ansible.builtin.set_fact:
       snow_work: >-
         {{
-          dcr_query2.json.result | default([])
-          | rejectattr('approval', 'in', ['requested', 'rejected'])
-          | list
+          snow_work | default([]) + [
+            item | combine(dcr_annotation_by_sysid.get(item.sys_id, {'host': '', 'sid': '', 'schema': ''}))
+          ]
         }}
+    loop: "{{ dcr_query2.json.result | default([]) | rejectattr('approval', 'in', ['requested', 'rejected']) | list }}"
+    loop_control:
+      label: "{{ item.number }}"
+
+  - name: "0 | Build sys_id map"
+    ansible.builtin.set_fact:
       snow_cr_map: >-
         {{
           dict(
@@ -508,12 +538,31 @@
   # FIX: regex_search inside a Jinja2 expression (the inline `if`) also needs
   # "is not none" -- "| bool" has no effect inside Jinja2 string expressions.
 
+  # Lookup dict from issue_key (CR number) -> host/sid/schema, built from
+  # snow_work (which already carries the re-attached annotation from the
+  # sys_id lookup above). Needed because scripts_to_run is keyed by issue_key,
+  # not sys_id.
+  - name: "5 | Build issue_key -> host/sid/schema lookup from snow_work"
+    ansible.builtin.set_fact:
+      dcr_target_by_key: >-
+        {{
+          dcr_target_by_key | default({}) | combine({
+            item.number: { 'host': item.host, 'sid': item.sid, 'schema': item.schema }
+          })
+        }}
+    loop: "{{ snow_work }}"
+    loop_control:
+      label: "{{ item.number }}"
+
   - name: "5 | Build list of successfully downloaded scripts"
     ansible.builtin.set_fact:
       scripts_to_run: >-
         {{
           scripts_to_run | default([]) + [{
             'issue_key': item.item.0.key,
+            'host':   dcr_target_by_key.get(item.item.0.key, {}).get('host', ''),
+            'sid':    dcr_target_by_key.get(item.item.0.key, {}).get('sid', ''),
+            'schema': dcr_target_by_key.get(item.item.0.key, {}).get('schema', ''),
             'script_path': (
               item.dest | regex_replace('\.sql$', '.ssh')
               if item.item.1.file_name | lower | regex_search('\.sql$') is not none
@@ -533,35 +582,67 @@
       msg: "WARNING: No attachments were downloaded successfully. Nothing to execute."
     when: scripts_to_run | default([]) | length == 0
 
-  # -- 5b. Wrap each script with header and footer --------------------------
-  #
-  # lineinfile with insertbefore: BOF prepends dcr_connect_credentials as the
-  # very first line of each script (the sqlplus connection string / heredoc
-  # opener). A second task appends the literal string "EOF" as the last line,
-  # closing the heredoc so the shell script is syntactically complete.
-  #
-  # Both tasks operate on scripts_to_run, which already holds the final
-  # .ssh paths after the step-4b rename, so no path translation is needed.
+  - name: "5 | WARN and skip any script whose target host is not in oracle_instance_map"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.issue_key }} / {{ item.script_path | basename }} targets host '{{ item.host }}' which is not in oracle_instance_map - this script will fail at connection time rather than being silently skipped. Fix the CR's short_description and re-run.
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.host not in oracle_instance_map
 
-  - name: "5b | Insert connection header at top of each script"
+  # -- 5b/5c/5e. Wrap each script with a DYNAMIC per-CR connection header ----
+  #
+  # REDESIGNED (host:sid:schema): previously every script was wrapped with
+  # the SAME fixed dcr_connect_credentials/dcr_oracle_home regardless of what
+  # the CR's ENV field said - DCR never actually had a real per-CR connection
+  # target before. Now each script connects to the specific host/sid chosen
+  # on the CR and sets its session to the chosen schema before running.
+  #
+  # Connects via network auth (oracle_dba_user/oracle_dba_pass), same model
+  # CAU/REF already use for PDB-level work, rather than OS-level sysdba auth -
+  # this is required since we're now targeting a specific host+PDB per
+  # request rather than always running locally on a single fixed host.
+  #
+  # insertbefore: BOF stacks in REVERSE of desired final order - each new
+  # insert lands above everything already there. To get final top-to-bottom
+  # order [oracle_home_export, CONNECT, ALTER SESSION, ...script...], we
+  # insert ALTER SESSION first, then CONNECT, then the oracle_home export
+  # last (see the original 5b/5c ordering this replaces, which relied on the
+  # exact same stacking behavior with 2 lines instead of 3).
+
+  - name: "5b | Insert ALTER SESSION SET CURRENT_SCHEMA at top of each script"
     ansible.builtin.lineinfile:
       path: "{{ item.script_path }}"
-      line: "{{ dcr_connect_credentials }}"
+      line: "ALTER SESSION SET CURRENT_SCHEMA = {{ item.schema }};"
       insertbefore: BOF
       backup: false
     loop: "{{ scripts_to_run | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+    when: item.host in oracle_instance_map
 
-  - name: "5c | Insert the shell heading wrapper to the SQL scripts loop"
+  - name: "5c | Insert CONNECT line (network auth, per-CR host:sid) at top of each script"
     ansible.builtin.lineinfile:
       path: "{{ item.script_path }}"
-      line: "{{ dcr_oracle_home }}"
+      line: "CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }}"
       insertbefore: BOF
       backup: false
     loop: "{{ scripts_to_run | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+    when: item.host in oracle_instance_map
+
+  - name: "5e | Insert ORACLE_HOME export + sqlplus opener at top of each script"
+    ansible.builtin.lineinfile:
+      path: "{{ item.script_path }}"
+      line: "export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}; export PATH=$ORACLE_HOME/bin:$PATH; sqlplus -s /nolog <<EOF"
+      insertbefore: BOF
+      backup: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+    when: item.host in oracle_instance_map
 
   - name: "5d | Append EOF footer at bottom of each script"
     ansible.builtin.lineinfile:

@@ -1,0 +1,198 @@
+---
+# SNOW_sync_oracle_hosts.yml
+#
+# Syncs one row per host into a new ServiceNow table (label "u_oracle_host",
+# real internal name will be "u_u_oracle_host" - same double-prefix pattern
+# as u_oracle_target and u_oracle_schema). This is the host/CDB-level
+# counterpart to those two tables: PAT patches a whole Oracle home, not one
+# specific PDB, so its dropdown needs "lnx001:CDB1" / "lnx002:PERF" - values
+# that don't exist as their own rows in u_oracle_target, which is
+# deliberately PDB-granular.
+#
+# GENUINELY SIMPLER than the other two sync playbooks: the host->SID mapping
+# already exists statically in oracle_instance_map (vars/main.yml) - there is
+# no need to connect to any remote host or run any SQL at all. This just
+# reads a local var and syncs it.
+#
+# u_u_oracle_host fields (must be created in ServiceNow before this runs):
+#   u_host         - String, e.g. "lnx001"
+#   u_oracle_sid   - String, e.g. "CDB1"
+#   u_label        - String, Display=true, "host:SID" e.g. "lnx001:CDB1"
+#
+# Given how small and static this dataset genuinely is (adding a host means
+# editing oracle_instance_map by hand anyway), a light schedule is plenty -
+# every 15-30 minutes, or even just run manually after adding a new host to
+# oracle_instance_map. There's no live infrastructure state to fall behind on.
+
+- name: Sync host-level Oracle targets into ServiceNow u_u_oracle_host
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: Pre-flight - verify instance is awake and credentials valid
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/sys_user?sysparm_limit=1"
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: sync_preflight
+    failed_when: false
+
+  - name: Abort with a clear message if the instance is unreachable
+    ansible.builtin.fail:
+      msg: >-
+        ServiceNow pre-flight failed (HTTP {{ sync_preflight.status | default('n/a') }}). If the response was not JSON the PDI is probably HIBERNATING -- wake it at https://developer.servicenow.com and re-run.
+    when: sync_preflight.status | default(0) != 200 or sync_preflight.json is not defined
+
+  - name: Nothing to sync
+    ansible.builtin.meta: end_play
+    when: oracle_instance_map | default({}) | length == 0
+
+  - name: Build host entries with label directly from oracle_instance_map
+    ansible.builtin.set_fact:
+      sync_host_entries: >-
+        {{
+          sync_host_entries | default([]) + [ {
+            'host': item,
+            'oracle_sid': oracle_instance_map[item].oracle_sid,
+            'label': item ~ ':' ~ oracle_instance_map[item].oracle_sid
+          } ]
+        }}
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: Show hosts to sync
+    ansible.builtin.debug:
+      msg: "{{ sync_host_entries | map(attribute='label') | list }}"
+
+  - name: Check whether each host already exists in u_u_oracle_host
+    ansible.builtin.uri:
+      url: >-
+        {{ sn_instance }}/api/now/table/u_u_oracle_host?sysparm_query={{
+          ('u_host=' + item.host) | urlencode
+        }}&sysparm_fields=sys_id,u_label&sysparm_limit=1
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ sync_host_entries }}"
+    loop_control:
+      label: "{{ item.label }}"
+    register: sync_host_lookup
+
+  - name: Build create/update work list
+    ansible.builtin.set_fact:
+      sync_host_jobs: >-
+        {{ sync_host_jobs | default([]) + [ item.item | combine({
+             'existing_sys_id': (item.json.result | default([]) | first | default({})).sys_id | default(''),
+             'existing_label':  (item.json.result | default([]) | first | default({})).u_label | default('')
+           }) ] }}
+    loop: "{{ sync_host_lookup.results }}"
+    loop_control:
+      label: "{{ item.item.label }}"
+
+  - name: Create new host rows that don't exist yet
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/u_u_oracle_host"
+      method: POST
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        u_host: "{{ item.host }}"
+        u_oracle_sid: "{{ item.oracle_sid }}"
+        u_label: "{{ item.label }}"
+      status_code: 201
+    loop: "{{ sync_host_jobs }}"
+    loop_control:
+      label: "{{ item.label }}"
+    when: item.existing_sys_id | length == 0
+    failed_when: false
+
+  - name: Update host rows whose label has drifted
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/u_u_oracle_host/{{ item.existing_sys_id }}"
+      method: PATCH
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        u_label: "{{ item.label }}"
+        u_oracle_sid: "{{ item.oracle_sid }}"
+      status_code: 200
+    loop: "{{ sync_host_jobs }}"
+    loop_control:
+      label: "{{ item.label }}"
+    when:
+    - item.existing_sys_id | length > 0
+    - item.existing_label != item.label
+    failed_when: false
+
+  # -----------------------------------------------------------------
+  # Prune stale host rows - a host removed from oracle_instance_map
+  # should disappear from the dropdown too. Given this whole dataset
+  # is small and rebuilt fresh from oracle_instance_map every run,
+  # pruning is always safe here (unlike the PDB/schema syncs, there's
+  # no "couldn't reach this host, so leave it alone" case - the source
+  # of truth is the var itself, not a live remote query that can fail).
+  # -----------------------------------------------------------------
+  - name: Fetch ALL existing host rows
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/u_u_oracle_host?sysparm_fields=sys_id,u_host,u_label&sysparm_limit=1000"
+      method: GET
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: sync_host_existing_all
+
+  - name: Determine stale host rows (exist in ServiceNow but not in oracle_instance_map)
+    ansible.builtin.set_fact:
+      sync_host_stale_rows: >-
+        {{ (sync_host_existing_all.json.result | default([]))
+           | rejectattr('u_host', 'in', (oracle_instance_map.keys() | list))
+           | list }}
+
+  - name: Show stale host rows that will be removed
+    ansible.builtin.debug:
+      msg: "Removing stale host: {{ item.u_label }} (no longer in oracle_instance_map)"
+    loop: "{{ sync_host_stale_rows }}"
+    loop_control:
+      label: "{{ item.u_label }}"
+
+  - name: Delete stale host rows
+    ansible.builtin.uri:
+      url: "{{ sn_instance }}/api/now/table/u_u_oracle_host/{{ item.sys_id }}"
+      method: DELETE
+      user: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+      force_basic_auth: true
+      status_code: 204
+    loop: "{{ sync_host_stale_rows }}"
+    loop_control:
+      label: "{{ item.u_label }}"
+    failed_when: false
+
+  - name: Final summary
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  u_u_oracle_host sync summary"
+      - "======================================================"
+      - "  Hosts synced   : {{ sync_host_entries | length }}"
+      - "  Created        : {{ sync_host_jobs | selectattr('existing_sys_id', 'equalto', '') | list | length }}"
+      - "  Already existed: {{ sync_host_jobs | rejectattr('existing_sys_id', 'equalto', '') | list | length }}"
+      - "  Removed (stale): {{ sync_host_stale_rows | length }}"
+      - "======================================================"

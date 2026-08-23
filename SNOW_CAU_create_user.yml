@@ -1,12 +1,12 @@
 ---
-# jira_oracle_create_user.yml
+# SNOW_CAU_create_user.yml
 #
 # Workflow:
-#   0. Pre-flight : validate Jira API token via /rest/api/2/myself
-#   1. Search     : find all open issues matching the configured JQL
-#   2. Fetch      : retrieve each issue - extract reporter displayName
-#                   (Jira Cloud - reporter.name is absent on Cloud) and
-#                   target databases from the databases field ({{ jira_cau_db_field }})[].value
+#   0. Intake     : COMMON_snow_intake.yml finds/shepherds "CAU |" change
+#                   requests tagged for this project, returns the executable
+#                   queue in snow_work
+#   2. Parse      : extract the host:db target list and the name/username
+#                   from short_description (see spec format below)
 #   3. Generate   : create one random password per issue (shared across
 #                   all target databases for that user)
 #   4. Create     : for each issue x each target database:
@@ -19,35 +19,54 @@
 #                   succeeded, or "Failed" if ANY database failed
 #   7. Summary    : print a final outcome table
 #
-# Assumptions:
-#   - This is a Jira Cloud instance. reporter.displayName is used as the
-#     Oracle username (reporter.name is not populated on Jira Cloud).
-#   - Target databases are stored in the databases field ({{ jira_cau_db_field }}) as a list of
-#     checkbox option objects: [ { "id": "...", "value": "DEV" }, ... ]
-#     Values are matched against oracle_databases keys (case-insensitive).
-#   - vars/main.yml defines oracle_databases as a dict keyed by the
-#     environment name - see "Required vars" below.
+# Spec format (short_description, assembled by the ServiceNow producer script -
+# the user never types the "CAU |" prefix or picks a field order manually):
+#   CAU | HOST:DB,HOST:DB,... | Full_Name_or_Username
+#
+#   - Field order matches the intake form: host:db picker FIRST (List Collector
+#     against u_oracle_target, multi-select), name/username text box SECOND.
+#   - "CAU" prefix is hardcoded in the producer script (same pattern as REF/CDP) -
+#     this job never needs to see a user-typed prefix.
+#
+# Assumptions (CARRIED OVER FROM THE HOST:DB REDESIGN - VERIFY BEFORE DEPLOY):
+#   - Each "HOST:DB" entry names a real host key from oracle_instance_map
+#     (e.g. "lnx001", "lnx002") and a target PDB name synced into u_oracle_target
+#     (e.g. "DEV", "OLTP1_PERF"). This replaces the old fixed 6-env
+#     oracle_databases dict on a single implicit host.
+#   - The PDB name doubles as its own connectable Oracle service name (each PDB
+#     auto-registers a local service matching its name) - CAU connects DIRECTLY
+#     to that PDB service, unlike PRF which connects to the CDB and filters by
+#     CON_ID. If your PDB services are NOT named identically to the PDB, this
+#     needs a service-name lookup instead of using db_name directly.
+#   - Host->IP resolution: NOT NEEDED. oracle_instance_map has no IP field -
+#     confirmed against the real vars/main.yml. The job connects using the
+#     host key itself (e.g. "lnx001") directly as the hostname, same as DCR's
+#     EZConnect string elsewhere in this suite. oracle_instance_map is used
+#     only to validate that the host key in a submitted spec is a known host.
+#   - oracle_port is still a single global value (1521) shared across all hosts.
+#   - Username derivation is unchanged from the original CAU convention and now
+#     matches CDP's dual-mode parsing exactly: a single word is used directly
+#     as the Oracle username; two-or-more words are derived via first initial +
+#     last name, upper-cased ("Vlad Grigorian" -> VGRIGORIAN).
 #
 # Required vars (vars/main.yml - vault-encrypt sensitive values):
-#   jira_url          : "https://yourorg.atlassian.net"
-#   jira_user         : "ansible-svc@yourorg.com"
-#   jira_api_token    : !vault |  ...
-#   jira_jql          : "project = CNU AND issuetype = Task AND status = 'To Do'"
-#   jira_max_results  : 50
-#   jira_cloud        : true
-#   jira_status_done  : "Done"
-#   jira_status_failed: "Failed"
-#   oracle_host       : "db.yourorg.internal"
-#   oracle_port       : 1521
-#   oracle_dba_user   : "system"
-#   oracle_dba_pass   : !vault |  ...
-#   oracle_databases:
-#     DEV: "DEVDB"      # Oracle service name for each environment
-#     UAT: "UATDB"
-#     SIT: "SITDB"
-#     STG: "STGDB"
-#     CER: "CERDB"
-#     PRO: "PRODB"
+#   sn_instance        : "https://yourorg.service-now.com"
+#   sn_username        : "hyperautomation.platform"
+#   sn_password        : !vault |  ...
+#   oracle_port        : 1521
+#   oracle_dba_user    : "system"
+#   oracle_dba_pass    : !vault |  ...
+#   oracle_instance_map:            # keyed by host, authoritative elsewhere in the suite - no IP field, host key used directly
+#     lnx001:
+#       oracle_sid:  "CDB1"
+#       oracle_home: "/u01/app/oracle/product/21.0.0/dbhome_1"
+#       oracle_base: "/u01/app/oracle"
+#       oracle_user: "oracle"
+#     lnx002:
+#       oracle_sid:  "PERF"
+#       oracle_home: "/u01/app/oracle/product/21.0.0/dbhome_1"
+#       oracle_base: "/u01/app/oracle"
+#       oracle_user: "oracle"
 #
 # Usage:
 #   ansible-playbook jira_oracle_create_user.yml --ask-vault-pass
@@ -91,22 +110,24 @@
     ansible.builtin.meta: end_play
     when: snow_work | length == 0
 
-  # Parse "CAU | Full Name | DB1,DB2,..." from short_description.
-  # Oracle username convention: first letter of first name + entire last name,
-  # upper-cased ("Vlad Grigorian" -> VGRIGORIAN); single-word names as-is.
-  # Database names are normalized via oracle_db_name_aliases (PROD -> PRO).
-  - name: "2 | WARN and skip changes with a missing user name or databases"
+  # Parse "CAU | HOST:DB,HOST:DB,... | Full_Name_or_Username" from
+  # short_description. Field order matches the redesigned intake form: the
+  # host:db multi-select comes FIRST, the name/username text box SECOND.
+  # Oracle username convention (identical to CDP): first letter of first name
+  # + entire last name, upper-cased ("Vlad Grigorian" -> VGRIGORIAN);
+  # single-word input ("VGRIGORIAN") is used directly as-is.
+  - name: "2 | WARN and skip changes with a missing target list or name"
     ansible.builtin.debug:
       msg: >-
-        WARNING: {{ item.number }} is missing the user name or database list (short_description: '{{ item.short_description }}') -- skipping. Expected 'CAU | Full Name | DB1,DB2'.
+        WARNING: {{ item.number }} is missing the host:db target list or the user name (short_description: '{{ item.short_description }}') -- skipping. Expected 'CAU | HOST:DB,HOST:DB | Full_Name_or_Username'.
     loop: "{{ snow_work }}"
     loop_control:
       label: "{{ item.number }}"
     vars:
       cau_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
-    when: cau_parts | length < 3 or cau_parts[1] | length == 0
+    when: cau_parts | length < 3 or cau_parts[2] | length == 0
 
-  - name: "2 | Build change -> user + target databases mapping"
+  - name: "2 | Build change -> user + host:db targets mapping"
     ansible.builtin.set_fact:
       issues_to_process: >-
         {{
@@ -121,11 +142,10 @@
             'display_name': cau_name,
             'approver': 'per ServiceNow change approval',
             'target_dbs': (
-              cau_parts[2] | default('')
+              cau_parts[1] | default('')
               | split(',')
-              | map('trim') | map('upper')
-              | select('in', oracle_db_name_aliases.keys() | list)
-              | map('extract', oracle_db_name_aliases)
+              | map('trim')
+              | select('search', '^[^:]+:[^:]+$')
               | list
             )
           }]
@@ -135,37 +155,24 @@
       label: "{{ item.number }}"
     vars:
       cau_parts: "{{ item.short_description.split('|') | map('trim') | list }}"
-      cau_name: "{{ cau_parts[1] | default('') }}"
+      cau_name: "{{ cau_parts[2] | default('') }}"
     when:
     - cau_parts | length >= 3
     - cau_name | length > 0
-  - name: "2 | Show user -> Oracle username -> target databases mapping"
+
+  # Well-formed "HOST:DB" entries are accepted here; an unknown host key
+  # (not present in oracle_instance_map) is NOT filtered out at this stage -
+  # it is deliberately allowed through to task 4, where it fails loudly as a
+  # per-target rc!=0 with a clear "Unknown host" stderr message, rather than
+  # silently disappearing from the target list at parse time.
+  - name: "2 | Show user -> Oracle username -> host:db targets mapping"
     ansible.builtin.debug:
       msg: >-
-        {{ item.issue_key }} -> display name: {{ item.display_name }} | oracle user: {{ item.oracle_user }} | databases: {{ item.target_dbs | join(', ') }}
+        {{ item.issue_key }} -> display name: {{ item.display_name }} | oracle user: {{ item.oracle_user }} | targets: {{ item.target_dbs | join(', ') }}
     loop: "{{ issues_to_process | default([]) }}"
     loop_control:
       label: "{{ item.issue_key }}"
     when: item.target_dbs | length > 0
-
-  # -- ITIL classification (CI link, risk/impact, change schedule) --------
-  # CAU can target multiple databases per issue - classifying against the
-  # first one as the primary CI is a simplification; a request spanning
-  # several databases technically touches several CIs.
-  - name: "2b | ITIL | Classify each user-creation job (CI link, risk, impact, schedule)"
-    ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
-    loop: "{{ issues_to_process | default([]) }}"
-    loop_control:
-      label: "{{ item.issue_key }}"
-    vars:
-      itil_primary_key: "{{ item.issue_key }}"
-      itil_sys_id: "{{ item.sys_id }}"
-      itil_ci_name: "{{ item.target_dbs[0] | default('') }}"
-      itil_risk: "low"
-      itil_impact: "low"
-      itil_planned_duration_hours: 1
-    when: item.target_dbs | length > 0
-  # -- END ITIL classification ----------------------------------------------
 
   # -- 3. Generate one random password per issue -----------------------------
   # The same password is used across all target databases for a given issue
@@ -240,6 +247,7 @@
                 return cx_Oracle.connect(user=user, password=password, dsn=dsn)
 
         host        = os.environ["ORA_HOST"]
+        host_known  = os.environ["ORA_HOST_KNOWN"]
         port        = os.environ["ORA_PORT"]
         service     = os.environ["ORA_SERVICE"]
         dba_user    = os.environ["ORA_DBA_USER"]
@@ -248,10 +256,16 @@
         new_pass    = os.environ["ORA_NEW_PASS"]
         db_name     = os.environ["ORA_DB_NAME"]
 
+        if host_known != "1":
+            print(f"ERROR: [{db_name}] Unknown host key -- not present in "
+                  f"oracle_instance_map. Check the host:db spec on the change request.",
+                  file=sys.stderr)
+            sys.exit(1)
+
         try:
             conn = connect(dba_user, dba_pass, host, port, service)
         except Exception as e:
-            print(f"ERROR: [{db_name}] Could not connect to Oracle service '{service}': {e}",
+            print(f"ERROR: [{db_name}] Could not connect to Oracle service '{service}' on '{host}': {e}",
                   file=sys.stderr)
             sys.exit(1)
 
@@ -285,9 +299,16 @@
         conn.close()
         PYEOF
     environment:
-      ORA_HOST: "{{ oracle_host }}"
+      # item.1 is a "HOST:DB" string (e.g. "lnx001:DEV") - split it here so
+      # every downstream var is resolved per-target, not per-issue.
+      # oracle_instance_map has no IP field (confirmed) - lnx001/lnx002 are
+      # used directly as connectable hostnames, same as DCR's EZConnect
+      # string elsewhere in this suite. oracle_instance_map is used here only
+      # to validate the host key is a real, known host.
+      ORA_HOST: "{{ item.1.split(':')[0] }}"
+      ORA_HOST_KNOWN: "{{ '1' if item.1.split(':')[0] in oracle_instance_map else '0' }}"
       ORA_PORT: "{{ oracle_port | string }}"
-      ORA_SERVICE: "{{ oracle_databases[item.1] }}"
+      ORA_SERVICE: "{{ item.1.split(':')[1] }}"
       ORA_DBA_USER: "{{ oracle_dba_user }}"
       ORA_DBA_PASS: "{{ oracle_dba_pass }}"
       ORA_TARGET_USER: "{{ item.0.oracle_user }}"

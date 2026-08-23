@@ -44,7 +44,7 @@
 
 set -euo pipefail
 
-# -- Configuration - change these if you want, sensible defaults otherwise --
+# ── Configuration - change these if you want, sensible defaults otherwise ──
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
 DB_INSTANCE_ID="${DB_INSTANCE_ID:-cdppg-test}"
@@ -55,7 +55,7 @@ MASTER_USERNAME="${MASTER_USERNAME:-pgadmin}"
 DB_NAME="testdb"
 SECURITY_GROUP_NAME="cdppg-test-sg"
 
-# -- Preflight checks -----------------------------------------------------
+# ── Preflight checks ─────────────────────────────────────────────────────
 
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not found. Install AWS CLI v2 first."; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not found. Install it (e.g. 'sudo apt install jq' or 'sudo yum install jq')."; exit 1; }
@@ -72,12 +72,12 @@ echo "Instance class  : ${DB_INSTANCE_CLASS}"
 echo "Storage         : ${ALLOCATED_STORAGE_GB}GB ${STORAGE_TYPE}"
 echo "========================================================"
 
-# -- 1. Generate a random master password (never echoed to the terminal) ---
+# ── 1. Generate a random master password (never echoed to the terminal) ───
 
 MASTER_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 || true)Aa1!"
 echo "Generated a random master password (not shown here - saved to ./cdppg_test_credentials.txt, chmod 600)."
 
-# -- 2. Find your current public IP, so the security group only allows YOU -
+# ── 2. Find your current public IP, so the security group only allows YOU ─
 
 MY_IP="$(curl -s https://checkip.amazonaws.com)"
 if [[ -z "${MY_IP}" ]]; then
@@ -86,7 +86,7 @@ if [[ -z "${MY_IP}" ]]; then
 fi
 echo "Your public IP  : ${MY_IP} (security group will allow only this /32)"
 
-# -- 3. Find the default VPC (most accounts have one) ----------------------
+# ── 3. Find the default VPC (most accounts have one) ──────────────────────
 
 DEFAULT_VPC_ID="$(aws ec2 describe-vpcs --region "${AWS_REGION}" \
     --filters Name=isDefault,Values=true \
@@ -99,7 +99,7 @@ if [[ "${DEFAULT_VPC_ID}" == "None" || -z "${DEFAULT_VPC_ID}" ]]; then
 fi
 echo "Default VPC     : ${DEFAULT_VPC_ID}"
 
-# -- 4. Create a dedicated security group, locked to your IP only ----------
+# ── 4. Create a dedicated security group, locked to your IP only ──────────
 
 EXISTING_SG="$(aws ec2 describe-security-groups --region "${AWS_REGION}" \
     --filters Name=group-name,Values="${SECURITY_GROUP_NAME}" Name=vpc-id,Values="${DEFAULT_VPC_ID}" \
@@ -123,7 +123,7 @@ else
     echo "  -> allowed inbound TCP 5432 from ${MY_IP}/32 only"
 fi
 
-# -- 5. Create the RDS instance ---------------------------------------------
+# ── 5. Create the RDS instance ─────────────────────────────────────────────
 
 echo ""
 echo "Launching RDS instance '${DB_INSTANCE_ID}' - this typically takes 5-10 minutes..."
@@ -150,7 +150,7 @@ aws rds create-db-instance \
 echo "Waiting for the instance to become available (this is the slow part)..."
 aws rds wait db-instance-available --region "${AWS_REGION}" --db-instance-identifier "${DB_INSTANCE_ID}"
 
-# -- 6. Print connection details --------------------------------------------
+# ── 6. Print connection details ────────────────────────────────────────────
 
 ENDPOINT="$(aws rds describe-db-instances --region "${AWS_REGION}" \
     --db-instance-identifier "${DB_INSTANCE_ID}" \

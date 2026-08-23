@@ -1,0 +1,73 @@
+---
+# Fleet SQL Tuning POC - proactive scan across multiple PDBs, live demo build
+# Phase 1: analysis and reporting only. No PROD changes are made.
+# Scans the 6 primaries on lnx001 (OLTP1-4, DW1-2). The matching
+# OLTP*_PERF / DW*_PERF twins live on lnx002 and are used separately
+# to test candidate fixes — not part of this scan.
+
+- name: Fleet SQL Tuning POC - scan and report
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars_files:
+    - vars/main.yml
+
+  vars:
+    poc_cdb_host: lnx001
+    poc_cdb_port: 1521
+    poc_cdb_service: cdb1
+    poc_pdb_list: "OLTP1,OLTP2,OLTP3,OLTP4,DW1,DW2"
+    poc_hours_window: 24
+    poc_top_n: 5
+    poc_work_dir: "/home/ansible_admin/fleet_tuning_poc"
+    poc_results_json: "{{ poc_work_dir }}/fleet_tuning_results.json"
+    poc_report_html: "{{ poc_work_dir }}/fleet_tuning_report_{{ ansible_date_time.iso8601_basic_short }}.html"
+
+  tasks:
+    - name: Ensure working directory exists
+      ansible.builtin.file:
+        path: "{{ poc_work_dir }}"
+        state: directory
+        mode: "0770"
+
+    - name: Copy the fleet scan script
+      ansible.builtin.copy:
+        src: fleet_sql_tuning_poc.py
+        dest: "{{ poc_work_dir }}/fleet_sql_tuning_poc.py"
+        mode: "0750"
+
+    - name: Run the fleet SQL tuning scan (this is the part to narrate live)
+      ansible.builtin.command:
+        cmd: >
+          python3 {{ poc_work_dir }}/fleet_sql_tuning_poc.py
+          --host {{ poc_cdb_host }}
+          --port {{ poc_cdb_port }}
+          --service {{ poc_cdb_service }}
+          --pdbs {{ poc_pdb_list }}
+          --hours {{ poc_hours_window }}
+          --top-n {{ poc_top_n }}
+          --output {{ poc_results_json }}
+      environment:
+        ORACLE_POC_USER: "{{ vault_oracle_poc_user }}"
+        ORACLE_POC_PASSWORD: "{{ vault_oracle_poc_password }}"
+      register: scan_output
+      no_log: false
+
+    - name: Show scan summary in the terminal
+      ansible.builtin.debug:
+        msg: "{{ scan_output.stdout_lines }}"
+
+    - name: Load scan results
+      ansible.builtin.set_fact:
+        fleet_results: "{{ lookup('file', poc_results_json) | from_json }}"
+
+    - name: Render the live demo report
+      ansible.builtin.template:
+        src: fleet_tuning_report.html.j2
+        dest: "{{ poc_report_html }}"
+        mode: "0640"
+
+    - name: Report is ready
+      ansible.builtin.debug:
+        msg: "Open this in a browser for the demo: {{ poc_report_html }}"

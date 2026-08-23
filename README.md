@@ -19,20 +19,6 @@ A small **PostgreSQL/Aurora RDS pilot** (ServiceNow only, two of the nine
 workflows) and an early **cross-domain orchestration layer** (ServiceNow
 only, one workflow) are also included — see below.
 
-## Screenshots
-
-**ServiceNow** — the nine workflows as a Service Catalog category
-(*Database Automation Platform*), what a business user sees when
-requesting work:
-
-![ServiceNow Database Automation Platform catalog](screenshots/servicenow-catalog.png)
-
-**Jira** — one project's board (*Migrate Code* / DCR) mid-run: work
-sitting in **To Do** waiting on the poller, two issues already picked up
-and sitting in **In Progress**:
-
-![Jira DCR board](screenshots/jira-board.png)
-
 ## The nine DBA workflows
 
 | Tag | Workflow | Approval | Jira playbook(s) | ServiceNow playbook(s) |

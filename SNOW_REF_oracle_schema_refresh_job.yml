@@ -1,101 +1,140 @@
 ---
 # SNOW_REF_oracle_schema_refresh_job.yml
 #
-# Included by SNOW_REF_oracle_schema_refresh.yml for each refresh job.
-# Loop variable: `job`  (a dict with issue_key, source_service, source_schema,
-#                         target_service, target_schema, raw_spec)
+# REWRITTEN (August 2026) - NETWORK_LINK based, genuinely cross-host.
+# Included per job by SNOW_REF_oracle_schema_refresh.yml. Loop variable:
+# `job` (issue_key, sys_id, raw_spec, source_host, source_service,
+#  source_schema, target_host, target_service, target_schema).
 #
-# Writes its outcome into /tmp/snow_refresh_outcomes.json on the controller
-# for PLAY 3 to pick up.
+# ALL Oracle-side work in this file runs delegated to job.target_host -
+# that is where the database link is created, where impdp actually
+# executes (pulling from source over the network), and where the drop-
+# target-schema and verify steps run. Nothing runs on job.source_host
+# directly - it is only ever CONNECTED TO, via the database link, never
+# logged into.
 #
-# CHANGES (July 2026):
-#   * New task posts export/import results directly to the issue's Jira
-#     worklog (before cleanup, so it reflects final state and full output).
-#   * Cleanup of dump/log files now only runs when the import succeeded,
-#     so failed refreshes preserve their evidence for diagnosis.
-#   * no_log stays OFF on expdp/impdp: their stdout contains no credentials
-#     (the password is only in the registered cmd field, which is never
-#     posted), and the worklog needs the stdout.
+# Writes its outcome into /tmp/snow_refresh_outcomes.json on the
+# controller for PLAY 3 to pick up - same contract as before.
 
-- name: "JOB | {{ job.issue_key }} | Set per-job file names"
+- name: "JOB | {{ job.issue_key }} | Resolve source and target hosts' real Oracle facts"
   ansible.builtin.set_fact:
-    job_ts: "{{ ansible_date_time.iso8601_basic_short }}"
-    job_dump: "{{ job.source_schema }}_to_{{ job.target_schema }}_{{ ansible_date_time.iso8601_basic_short }}.dmp"
-    job_exp_log: "{{ job.source_schema }}_export_{{ ansible_date_time.iso8601_basic_short }}.log"
-    job_imp_log: "{{ job.target_schema }}_import_{{ ansible_date_time.iso8601_basic_short }}.log"
+    ref_src_home: "{{ oracle_instance_map[job.source_host].oracle_home }}"
+    ref_src_user: "{{ oracle_instance_map[job.source_host].oracle_user }}"
+    ref_tgt_home: "{{ oracle_instance_map[job.target_host].oracle_home }}"
+    ref_tgt_user: "{{ oracle_instance_map[job.target_host].oracle_user }}"
+    ref_job_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    ref_link_name: "REF_LINK_{{ job.issue_key }}"
+    ref_success: true
+    ref_fail_reason: ""
 
-- name: "JOB | {{ job.issue_key }} | Set per-job full paths"
-  ansible.builtin.set_fact:
-    job_dump_path: "{{ datapump_dir }}/{{ job_dump }}"
-    job_exp_log_path: "{{ datapump_dir }}/{{ job_exp_log }}"
-    job_imp_log_path: "{{ datapump_dir }}/{{ job_imp_log }}"
+- name: "JOB | {{ job.issue_key }} | Ensure working directory exists on target host"
+  ansible.builtin.file:
+    path: "/tmp/snow_ref_run"
+    state: directory
+    mode: '0777'
+  delegate_to: "{{ job.target_host }}"
+  become: true
 
-# -- ITIL classification (CI link, risk/impact, change schedule) --------
-# CI is the TARGET service, since that's what's actually being
-# overwritten by the refresh.
-- name: "JOB | {{ job.issue_key }} | ITIL: classify this refresh (CI link, risk, impact, schedule)"
-  ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
-  vars:
-    itil_primary_key: "{{ job.issue_key }}"
-    itil_sys_id: "{{ job.sys_id }}"
-    itil_ci_name: "{{ job.target_service }}"
-    itil_risk: "low"
-    itil_impact: "low"
-    itil_planned_duration_hours: 4
-# -- END ITIL classification ----------------------------------------------
-
-- name: "JOB | {{ job.issue_key }} | Pre-flight: confirm source schema exists in {{ job.source_service }}"
+# -- Pre-flight: confirm the source schema genuinely exists, checked FROM
+#    the target host, over the not-yet-created link's eventual path - we
+#    check this by connecting directly to source first, simpler and
+#    avoids creating a link just to find out the schema does not exist.
+- name: "JOB | {{ job.issue_key }} | Pre-flight: confirm source schema exists"
   ansible.builtin.shell:
     cmd: |
-      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      export ORACLE_HOME={{ ref_src_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
       CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.source_service }}
       SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
       SELECT COUNT(*) FROM dba_users WHERE username = UPPER('{{ job.source_schema }}');
       EXIT;
       EOF
-  environment: "{{ oracle_env }}"
-  register: job_src_check
+  delegate_to: "{{ job.source_host }}"
+  become: true
+  become_user: "{{ ref_src_user }}"
+  register: ref_src_check
   no_log: true
   changed_when: false
 
-- name: "JOB | {{ job.issue_key }} | Fail if source schema does not exist"
-  ansible.builtin.fail:
-    msg: >-
-      Schema '{{ job.source_schema }}' does not exist in {{ job.source_service }}. Aborting refresh for {{ job.issue_key }}.
-  when: (job_src_check.stdout | trim) == '0'
+- name: "JOB | {{ job.issue_key }} | Fail cleanly if source schema does not exist"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "Schema '{{ job.source_schema }}' does not exist in {{ job.source_host }}:{{ job.source_service }}."
+  when: (ref_src_check.stdout | default('') | trim) == '0'
 
-# -- Export ------------------------------------------------------------------
-
-- name: "JOB | {{ job.issue_key }} | Export {{ job.source_schema }}@{{ job.source_service }}"
-  ansible.builtin.shell:
-    cmd: >-
-      {{ oracle_home }}/bin/expdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.source_service }} SCHEMAS={{ job.source_schema }} DIRECTORY=REFRESH DUMPFILE={{ job_dump }} LOGFILE={{ job_exp_log }} PARALLEL={{ datapump_parallel }} COMPRESSION={{ datapump_compression }} REUSE_DUMPFILES=YES
-  environment: "{{ oracle_env }}"
-  register: job_expdp
-  async: 14400
-  poll: 30
-
-- name: "JOB | {{ job.issue_key }} | Show export status"
-  ansible.builtin.debug:
-    msg: >-
-      Export {{ 'OK' if job_expdp.rc == 0 else 'FAILED (rc=' + (job_expdp.rc | string) + ')' }} | log: {{ job_exp_log_path }}
-
-- name: "JOB | {{ job.issue_key }} | Fail if export failed"
-  ansible.builtin.fail:
-    msg: "expdp failed (rc={{ job_expdp.rc }}). Review {{ job_exp_log_path }}."
-  when: job_expdp.rc != 0
-
-# -- Drop target schema before import -----------------------------------------
-# Uses a PL/SQL block so the task is idempotent -- if the user does not exist
-# the DROP is skipped silently rather than raising ORA-01918.
-# All variables reference job.* so they are resolved from the Jira issue
-# customfield_10456 value, not from vars/main.yml (which does not contain
-# per-job target_service / target_schema since they vary per issue).
-
-- name: "JOB | {{ job.issue_key }} | Drop target schema {{ job.target_schema }} from {{ job.target_service }} (idempotent)"
+# -- Pre-flight: confirm the REFRESH directory exists on BOTH source and
+#    target PDBs before attempting anything further. This is checked
+#    explicitly because the NETWORK_LINK import needs this same named
+#    directory present on BOTH ends for its own internal worker
+#    coordination, even though no dump file is ever actually written -
+#    without it on either side, a real run was observed to fail
+#    completely silently (job reports "successfully completed" with a
+#    plausible-looking row count, but nothing actually persists). This
+#    check exists specifically so a missing directory fails loudly and
+#    immediately here, instead of costing another full debugging round.
+- name: "JOB | {{ job.issue_key }} | Pre-flight: confirm REFRESH directory exists on source"
   ansible.builtin.shell:
     cmd: |
-      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      export ORACLE_HOME={{ ref_src_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.source_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT COUNT(*) FROM dba_directories WHERE directory_name = 'REFRESH';
+      EXIT;
+      EOF
+  delegate_to: "{{ job.source_host }}"
+  become: true
+  become_user: "{{ ref_src_user }}"
+  register: ref_src_dir_check
+  no_log: true
+  changed_when: false
+  when: ref_success
+
+- name: "JOB | {{ job.issue_key }} | Fail cleanly if REFRESH directory is missing on source"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "REFRESH directory does not exist on {{ job.source_host }}:{{ job.source_service }} - required on both source and target for NETWORK_LINK imports even though no dump file is written. Create it: ALTER SESSION SET CONTAINER = {{ job.source_service }}; CREATE OR REPLACE DIRECTORY REFRESH AS '<path>'; GRANT READ, WRITE ON DIRECTORY REFRESH TO PUBLIC;"
+  when:
+  - ref_success
+  - (ref_src_dir_check.stdout | default('') | trim) == '0'
+
+- name: "JOB | {{ job.issue_key }} | Pre-flight: confirm REFRESH directory exists on target"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF
+      SELECT COUNT(*) FROM dba_directories WHERE directory_name = 'REFRESH';
+      EXIT;
+      EOF
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_tgt_dir_check
+  no_log: true
+  changed_when: false
+  when: ref_success
+
+- name: "JOB | {{ job.issue_key }} | Fail cleanly if REFRESH directory is missing on target"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "REFRESH directory does not exist on {{ job.target_host }}:{{ job.target_service }} - required on both source and target for NETWORK_LINK imports even though no dump file is written. Create it: ALTER SESSION SET CONTAINER = {{ job.target_service }}; CREATE OR REPLACE DIRECTORY REFRESH AS '<path>'; GRANT READ, WRITE ON DIRECTORY REFRESH TO PUBLIC;"
+  when:
+  - ref_success
+  - (ref_tgt_dir_check.stdout | default('') | trim) == '0'
+
+# -- Drop target schema before import (idempotent, same logic as before,
+#    now delegated to target_host specifically) --------------------------
+- name: "JOB | {{ job.issue_key }} | Drop target schema {{ job.target_schema }} (idempotent)"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
       CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
       SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
       SET SERVEROUTPUT ON
@@ -115,37 +154,97 @@
       /
       EXIT;
       EOF
-  environment: "{{ oracle_env }}"
-  register: drop_user_target
-  changed_when: "'Dropped user' in drop_user_target.stdout"
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_drop_user
+  changed_when: "'Dropped user' in ref_drop_user.stdout"
+  when: ref_success
 
-- name: "JOB | {{ job.issue_key }} | Show drop user result"
-  ansible.builtin.debug:
-    msg: "{{ drop_user_target.stdout_lines | default(['(no output)']) }}"
+# -- Create the database link on the TARGET, pointing back at SOURCE ------
+# Named uniquely per issue to avoid any collision - dropped again below
+# regardless of outcome, so it never lingers.
+- name: "JOB | {{ job.issue_key }} | Create database link {{ ref_link_name }} on target, pointing to source"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      WHENEVER SQLERROR EXIT SQL.SQLCODE
+      CREATE DATABASE LINK {{ ref_link_name }}
+        CONNECT TO {{ oracle_dba_user }} IDENTIFIED BY "{{ oracle_dba_pass }}"
+        USING '{{ job.source_service }}';
+      EXIT;
+      EOF
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_link_create
+  no_log: true
+  changed_when: ref_link_create.rc == 0
+  when: ref_success
 
-# -- Import ------------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Fail cleanly if the database link could not be created"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "Could not create database link {{ ref_link_name }} on {{ job.target_host }} pointing to {{ job.source_host }}:{{ job.source_service }} (rc={{ ref_link_create.rc | default('n/a') }})."
+  when: ref_success and ref_link_create.rc | default(1) != 0
 
-- name: "JOB | {{ job.issue_key }} | Import {{ job.target_schema }}@{{ job.target_service }}"
+# -- The actual refresh: ONE network-link import, no dump file, no expdp -
+- name: "JOB | {{ job.issue_key }} | Import {{ job.target_schema }} via NETWORK_LINK from {{ job.source_host }}"
   ansible.builtin.shell:
     cmd: >-
-      {{ oracle_home }}/bin/impdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }} SCHEMAS={{ job.source_schema }} REMAP_SCHEMA={{ job.source_schema }}:{{ job.target_schema }} DIRECTORY=REFRESH DUMPFILE={{ job_dump }} LOGFILE={{ job_imp_log }} PARALLEL={{ datapump_parallel }} TABLE_EXISTS_ACTION=REPLACE
-  environment: "{{ oracle_env }}"
-  register: job_impdp
+      export ORACLE_HOME={{ ref_tgt_home }} && export PATH=$ORACLE_HOME/bin:$PATH && impdp {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }} NETWORK_LINK={{ ref_link_name }} SCHEMAS={{ job.source_schema }} REMAP_SCHEMA={{ job.source_schema }}:{{ job.target_schema }} LOGFILE=ref_{{ job.issue_key }}_{{ ref_job_ts }}.log DIRECTORY=REFRESH PARALLEL={{ datapump_parallel | default(2) }} TABLE_EXISTS_ACTION=REPLACE
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_impdp
   async: 14400
   poll: 30
+  no_log: true
+  when: ref_success
   ignore_errors: true
 
 - name: "JOB | {{ job.issue_key }} | Show import status"
   ansible.builtin.debug:
     msg: >-
-      Import {{ 'OK' if job_impdp.rc == 0 else 'FAILED (rc=' + (job_impdp.rc | string) + ')' }} | log: {{ job_imp_log_path }}
+      Import {{ 'OK' if (ref_impdp.rc | default(1)) == 0 else 'FAILED (rc=' + (ref_impdp.rc | default('n/a') | string) + ')' }}
+  when: ref_success
 
-# -- Verify ------------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Mark failed if import did not succeed"
+  ansible.builtin.set_fact:
+    ref_success: false
+    ref_fail_reason: "impdp NETWORK_LINK import failed (rc={{ ref_impdp.rc | default('n/a') }})."
+  when: ref_success and ref_impdp.rc | default(1) != 0
 
-- name: "JOB | {{ job.issue_key }} | Count objects in {{ job.target_schema }}@{{ job.target_service }}"
+# -- Drop the database link - ALWAYS, whether the import succeeded or not,
+#    so it never lingers on the target instance regardless of outcome ----
+- name: "JOB | {{ job.issue_key }} | Drop database link {{ ref_link_name }} (cleanup, runs regardless of outcome)"
   ansible.builtin.shell:
     cmd: |
-      {{ oracle_home }}/bin/sqlplus -S /nolog << 'EOF'
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
+      CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
+      WHENEVER SQLERROR CONTINUE
+      DROP DATABASE LINK {{ ref_link_name }};
+      EXIT;
+      EOF
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  no_log: true
+  failed_when: false
+  when: ref_link_create is defined and ref_link_create.rc | default(1) == 0
+
+# -- Verify: count objects in target schema (only meaningful on success) -
+- name: "JOB | {{ job.issue_key }} | Count objects in target schema"
+  ansible.builtin.shell:
+    cmd: |
+      export ORACLE_HOME={{ ref_tgt_home }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      sqlplus -S /nolog << 'EOF'
       CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@{{ job.target_service }}
       SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF LINESIZE 200
       SELECT object_type || ':' || COUNT(*)
@@ -155,23 +254,16 @@
       ORDER BY object_type;
       EXIT;
       EOF
-  environment: "{{ oracle_env }}"
-  register: job_verify
+  delegate_to: "{{ job.target_host }}"
+  become: true
+  become_user: "{{ ref_tgt_user }}"
+  register: ref_verify
   no_log: true
   changed_when: false
+  when: ref_success
 
-- name: "JOB | {{ job.issue_key }} | Show object counts"
-  ansible.builtin.debug:
-    msg: "{{ job_verify.stdout_lines | default(['(no output)']) }}"
-
-# -- Post refresh summary to Jira worklog -------------------------------------
-# One compact worklog entry per refresh job (original summary format):
-# spec, source/target, export/import status, object-type count, result.
-# Posted BEFORE cleanup so it reflects final state. Full datapump logs remain
-# on the DB host at {{ datapump_dir }} when a job fails (cleanup is gated on
-# import success), so detail is still recoverable when it matters.
-
-- name: "JOB | {{ job.issue_key }} | Post export/import results as a ServiceNow work note"
+# -- Post refresh summary to ServiceNow work note --------------------------
+- name: "JOB | {{ job.issue_key }} | Post refresh results as a ServiceNow work note"
   ansible.builtin.uri:
     url: "{{ sn_instance }}/api/now/table/change_request/{{ job.sys_id }}"
     method: PATCH
@@ -185,12 +277,11 @@
         Automated Oracle Schema Refresh - {{ ansible_date_time.iso8601 }}
 
         Spec:           {{ job.raw_spec }}
-        Source:         {{ job.source_schema }}@{{ job.source_service }}
-        Target:         {{ job.target_schema }}@{{ job.target_service }}
-        Export status:  {{ 'OK' if job_expdp.rc == 0 else 'FAILED (rc=' + (job_expdp.rc | string) + ')' }}
-        Import status:  {{ 'OK' if job_impdp.rc == 0 else 'FAILED (rc=' + (job_impdp.rc | string) + ')' }}
-        Objects found:  {{ job_verify.stdout_lines | default([]) | length }} object type(s) in target schema
-        Overall result: {{ 'DONE' if job_impdp.rc == 0 else 'FAILED' }}
+        Source:         {{ job.source_host }}:{{ job.source_schema }}@{{ job.source_service }}
+        Target:         {{ job.target_host }}:{{ job.target_schema }}@{{ job.target_service }}
+        {{ 'CROSS-HOST refresh (via NETWORK_LINK, no dump file)' if job.source_host != job.target_host else 'Same-host refresh (via NETWORK_LINK)' }}
+        Objects found:  {{ ref_verify.stdout_lines | default([]) | length }} object type(s) in target schema
+        Overall result: {{ 'DONE' if ref_success else 'FAILED - ' + ref_fail_reason }}
         Performed by:   {{ sn_username }} (Ansible automation)
         Timestamp:      {{ ansible_date_time.iso8601 }}
 
@@ -199,31 +290,7 @@
   become: false
   ignore_errors: true
 
-# -- Cleanup ------------------------------------------------------------------
-# Only runs when the import succeeded, so failed refreshes preserve their
-# dump and log files for diagnosis.
-
-- name: "JOB | {{ job.issue_key }} | Remove dump and log files (success only)"
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-  - "{{ job_dump_path }}"
-  - "{{ job_exp_log_path }}"
-  - "{{ job_imp_log_path }}"
-  loop_control:
-    label: "{{ item | basename }}"
-  when:
-  - cleanup_dump_files | default(true) | bool
-  - job_impdp.rc | default(1) == 0
-
-# -- Write outcome for PLAY 3 -------------------------------------------------
-
-# -- Preserve failure evidence on the controller (failed jobs only) ----------
-# The expdp/impdp stdout is written to {{ followup_log_dir }} so PLAY 3 can
-# attach it to the DBA repair follow-up task. The full datapump logs also
-# remain on the DB host (cleanup is gated on import success).
-
+# -- Preserve failure evidence on the controller (failed jobs only) -------
 - name: "JOB | {{ job.issue_key }} | Ensure follow-up log dir exists on controller (failed only)"
   ansible.builtin.file:
     path: "{{ followup_log_dir }}"
@@ -231,31 +298,27 @@
     mode: "0750"
   delegate_to: localhost
   become: false
-  when: job_impdp.rc != 0
+  when: not ref_success
 
-- name: "JOB | {{ job.issue_key }} | Preserve export/import output on controller (failed only)"
+- name: "JOB | {{ job.issue_key }} | Preserve failure details on controller (failed only)"
   ansible.builtin.copy:
     content: |
       Automated Oracle Schema Refresh FAILURE LOG - {{ ansible_date_time.iso8601 }}
       Issue   : {{ job.issue_key }}
       Spec    : {{ job.raw_spec }}
-      Source  : {{ job.source_schema }}@{{ job.source_service }}
-      Target  : {{ job.target_schema }}@{{ job.target_service }}
-      Export  : rc={{ job_expdp.rc }}
-      Import  : rc={{ job_impdp.rc }}
-      Datapump logs on {{ oracle_host }}: {{ job_exp_log_path }} / {{ job_imp_log_path }}
+      Source  : {{ job.source_host }}:{{ job.source_schema }}@{{ job.source_service }}
+      Target  : {{ job.target_host }}:{{ job.target_schema }}@{{ job.target_service }}
+      Reason  : {{ ref_fail_reason }}
 
-      ====== expdp output ==========================================
-      {{ job_expdp.stdout | default('(no output)') }}
-
-      ====== impdp output ==========================================
-      {{ job_impdp.stdout | default('(no output)') }}
-    dest: "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
+      Import log remains on {{ job.target_host }} at DIRECTORY=REFRESH
+      (ref_{{ job.issue_key }}_{{ ref_job_ts }}.log) for diagnosis.
+    dest: "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ ref_job_ts }}.log"
     mode: "0640"
   delegate_to: localhost
   become: false
-  when: job_impdp.rc != 0
+  when: not ref_success
 
+# -- Write outcome for PLAY 3 ----------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Write outcome to controller temp file"
   ansible.builtin.shell:
     cmd: |
@@ -272,22 +335,23 @@
           "issue_key":      "{{ job.issue_key }}",
           "sys_id":         "{{ job.sys_id }}",
           "raw_spec":       "{{ job.raw_spec }}",
+          "source_host":    "{{ job.source_host }}",
           "source_service": "{{ job.source_service }}",
           "source_schema":  "{{ job.source_schema }}",
+          "target_host":    "{{ job.target_host }}",
           "target_service": "{{ job.target_service }}",
           "target_schema":  "{{ job.target_schema }}",
-          "status":         "done" if {{ job_impdp.rc }} == 0 else "failed",
-          "export_rc":      {{ job_expdp.rc }},
-          "import_rc":      {{ job_impdp.rc }},
-          "object_count":   {{ job_verify.stdout_lines | length }},
-          "error":          "" if {{ job_impdp.rc }} == 0 else "impdp rc={{ job_impdp.rc }}",
-          "failure_log":    "" if {{ job_impdp.rc }} == 0 else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ job_ts }}.log"
+          "status":         "done" if {{ ref_success }} else "failed",
+          "import_rc":      {{ ref_impdp.rc | default(-1) }},
+          "object_count":   {{ ref_verify.stdout_lines | default([]) | length }},
+          "error":          "{{ ref_fail_reason }}",
+          "failure_log":    "" if {{ ref_success }} else "{{ followup_log_dir }}/REF_{{ job.issue_key }}_failure_{{ ref_job_ts }}.log"
       })
 
       with open(outfile, "w") as f:
           json.dump(outcomes, f)
 
-      print(f"Outcome written for {{ job.issue_key }}: {'done' if {{ job_impdp.rc }} == 0 else 'failed'}")
+      print(f"Outcome written for {{ job.issue_key }}: {'done' if {{ ref_success }} else 'failed'}")
       PYEOF
   delegate_to: localhost
   become: false

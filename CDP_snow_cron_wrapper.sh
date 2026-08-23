@@ -39,7 +39,7 @@ set -euo pipefail
 # -- Configuration -------------------------------------------------------------
 
 PLAYBOOK_DIR="/etc/ansible"
-PLAYBOOK="SNOW_CDP_reset_own_oracle_password.yml"
+PLAYBOOK="SNOW_CDP_reset_oracle_password.yml"
 VAULT_PASS_FILE="/etc/ansible/.vault_pass"     # file containing the vault password
 
 BASE_DIR="${HOME}/snow_cdp"                  # user-owned; survives reboots

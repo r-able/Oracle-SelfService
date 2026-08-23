@@ -52,9 +52,11 @@
 ## green.example.com
 ## blue.example.com
 
-[localhost]
+#[localhost]
 #localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3.12
-localhost ansible_host=localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3.12
+#localhost ansible_host=localhost ansible_connection=local ansible_python_interpreter=/usr/bin/python3.12
+localhost ansible_host=localhost ansible_connection=local 
 
 [db_servers]
-lnx001  ansible_host=192.168.1.107 ansible_become_password=oracle 
+lnx001  ansible_host=192.168.1.107 ansible_become_password=oracle
+lnx002  ansible_host=192.168.1.246 ansible_become_password=oracle

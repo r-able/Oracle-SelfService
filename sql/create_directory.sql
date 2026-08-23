@@ -20,23 +20,90 @@ alter pluggable database UAT save state;
 alter pluggable database STG save state;
 alter pluggable database PRO save state;
 alter pluggable database CER save state;
-alter session set container=ORCLPDB;
+alter session set container=OLTP1_PERF;
 create directory REFRESH as '/refresh";
-alter session set container=UAT;
-create directory REFRESH as '/refresh";
-grant read, write on directory REFRESH to PUBLIC;
-alter session set container=SIT;
+
+connect / as sysdba
+alter session set container=OLTP1_PERF;
 create directory REFRESH as '/refresh';
 grant read, write on directory REFRESH to PUBLIC;
-alter session set container=CER;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@OLTP1_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+connect / as sysdba
+alter session set container=OLTP2_PERF;
 create directory REFRESH as '/refresh';
 grant read, write on directory REFRESH to PUBLIC;
-alter session set container=STG;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@OLTP2_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+connect / as sysdba
+alter session set container=OLTP3_PERF;
 create directory REFRESH as '/refresh';
 grant read, write on directory REFRESH to PUBLIC;
-alter session set container=PRO;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@OLTP3_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+connect / as sysdba
+
+alter session set container=OLTP4_PERF;
 create directory REFRESH as '/refresh';
 grant read, write on directory REFRESH to PUBLIC;
-alter session set container=DEV;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@OLTP4_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+connect / as sysdba
+
+alter session set container=DW1_PERF;
 create directory REFRESH as '/refresh';
 grant read, write on directory REFRESH to PUBLIC;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@DW1_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+
+connect / as sysdba
+alter session set container=DW2_PERF;
+create directory REFRESH as '/refresh';
+grant read, write on directory REFRESH to PUBLIC;
+create user source identified by oracle;
+grant resource, connect, sysdba to source;
+connect source/oracle@DW2_PERF;
+create table data (data number(20));
+insert into data values (1);
+insert into data values (2);
+insert into data values (4);
+select * from source.data;
+commit;
+
+
+

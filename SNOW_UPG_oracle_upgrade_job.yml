@@ -259,49 +259,7 @@
           instance in OPEN state (even after any STARTUP attempt). Manual DBA
           review required. Last check: {{ source_db_check.stdout | default('(no output -- database may be down)') }}
 
-    # -- BUDGET GATE ---------------------------------------------------------
-    # Out-of-place upgrades clone the existing Oracle home to a new mount
-    # point before upgrading it - a real, almost-always-nontrivial storage
-    # cost. Estimate it and gate on budget approval before any disk work
-    # begins, same "create on first encounter, poll for approval" shape as
-    # the orchestration core's own gate check.
-    - name: "JOB | {{ job.issue_key }} | Estimate the out-of-place clone's storage cost"
-      ansible.builtin.set_fact:
-        upg_clone_size_gb: "{{ upg_clone_size_gb_estimate | default(300) }}"
-        upg_clone_cost: "{{ (upg_clone_size_gb_estimate | default(300) | float) * (cost_storage_per_gb_onetime | default(0.10) | float) }}"
 
-    - name: "JOB | {{ job.issue_key }} | Budget gate: check/request cost approval for the clone"
-      ansible.builtin.include_tasks: COMMON_snow_cost_check.yml
-      vars:
-        cost_primary_key: "{{ job.issue_key }}"
-        cost_project_tag: "UPG"
-        cost_description: >-
-          Out-of-place upgrade clone: additional {{ upg_clone_size_gb }}GB
-          mount point for {{ job.oracle_sid }} on {{ oracle_host }}
-        cost_onetime: "{{ upg_clone_cost }}"
-        cost_monthly: 0
-        cost_duration_months: 0
-
-    - name: "JOB | {{ job.issue_key }} | Budget not yet approved - stop here for this issue, retry next pass"
-      ansible.builtin.meta: end_host
-      when: not cost_gate_clear
-    # -- END BUDGET GATE ------------------------------------------------------
-
-    # -- ITIL classification (CI link, risk/impact, change schedule) --------
-    - name: "JOB | {{ job.issue_key }} | ITIL: classify this upgrade (CI link, risk, impact, schedule)"
-      ansible.builtin.include_tasks: COMMON_snow_itil_classify.yml
-      vars:
-        itil_primary_key: "{{ job.issue_key }}"
-        itil_sys_id: "{{ job.sys_id }}"
-        itil_ci_name: "{{ job.target_host }}:{{ job.oracle_sid }}"
-        itil_risk: "high"
-        itil_impact: "high"
-        itil_planned_duration_hours: 6
-    # -- END ITIL classification ----------------------------------------------
-
-    # =========================================================================
-    # 3. Create per-issue AutoUpgrade config
-    #    Parameters per the oracle-base 26ai article. Recovery/log state is
 
 
     # =========================================================================
