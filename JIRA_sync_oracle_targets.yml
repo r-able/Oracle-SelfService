@@ -1,0 +1,240 @@
+---
+# =============================================================================
+# JIRA_sync_oracle_targets.yml
+#
+# Syncs the ACTUAL PLUGGABLE DATABASES (PDBs) on each host in
+# oracle_instance_map into the options list of the Jira "Database"
+# custom field, so the DCR form's dropdown always shows real, currently-known
+# host:PDB combinations - the same "lnx001:DEV" label format used by the
+# ServiceNow side's u_u_oracle_target table (see SNOW_sync_oracle_targets.yml,
+# which this playbook mirrors task-for-task on the PDB-discovery side).
+#
+# WHY THIS WAS NEEDED: after the HPsuperdome snapshot restore, every JIRA
+# project's "Database" field existed on the form but was never wired
+# up to real data OR read by any playbook - JIRA_DCR_data_change.yml ran
+# every script against a single fixed ORCLPDB connection regardless of what
+# (if anything) was selected. This playbook is step 1 of the fix: keep the
+# dropdown's OPTIONS current. JIRA_DCR_data_change.yml is step 2: actually
+# read the selected option and connect to that host:PDB.
+#
+# Jira Cloud custom-field options are managed per CONTEXT, not directly on
+# the field - see COMMON_jira_resolve_field.yml for the field-ID lookup and
+# COMMON_jira_sync_field_options.yml for the per-field context/option sync
+# logic (shared with JIRA_sync_oracle_schemas.yml, since both need to write
+# the same kind of live-label set into more than one field).
+#
+# MULTIPLE FIELDS, ONE DATA SET: DCR's "Database Instance", CDP's
+# "Server:database", and CAU's "Target Databases" (a multi-select, unlike
+# the other two which are single-select) all feed off this exact same live
+# host:PDB data. Add more names to jira_target_field_names below if
+# another project needs the same live host:PDB picker later - no other
+# change needed, COMMON_jira_sync_field_options.yml handles each field
+# independently regardless of whether it's single- or multi-select (the
+# Field Context Option API is the same shape either way).
+#
+# IDEMPOTENT: matches existing options by their "value" text (the
+# "lnx001:DEV" label IS the option - Jira context options have no separate
+# host/sid columns like ServiceNow's table, so there is nothing to "drift"
+# and update, only create-if-missing.
+# STALE OPTIONS ARE DISABLED, NOT DELETED: a PDB that no longer exists gets
+# its option set disabled:true rather than removed, so issues that already
+# recorded that value keep displaying it correctly in their history - it just
+# disappears from the picker for NEW issues. Delete manually if a hard remove
+# is ever actually wanted.
+#
+# EXCLUDED: PDB$SEED is always excluded - it is a read-only template PDB,
+# never a valid target. ORCLPDB is currently INCLUDED (matches the
+# ServiceNow sync's default - tell me if it should be excluded on either
+# side).
+#
+# Required vars (vars/main.yml):
+#   jira_target_field_names : ["Database Instance", "Server:database", "Target Databases"]
+#                              # every Jira field that should show this live host:PDB list
+#   oracle_instance_map     : (already defined - host -> oracle_home/sid/user)
+#
+# Usage:
+#   ansible-playbook JIRA_sync_oracle_targets.yml --ask-vault-pass
+# =============================================================================
+
+- name: Sync live PDBs into every configured Jira target-picker field
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # -----------------------------------------------------------------
+  # Discover the real PDBs on each host in oracle_instance_map via
+  # v$pdbs (identical approach to SNOW_sync_oracle_targets.yml).
+  # -----------------------------------------------------------------
+  - name: "Ensure temp working dir exists on each host"
+    ansible.builtin.file:
+      path: "/tmp/jira_sync_oracle_targets"
+      state: directory
+      mode: '0777'
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Write PDB discovery SQL for each host"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_targets/list_pdbs.sql"
+      mode: '0644'
+      content: |
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SELECT name FROM v$pdbs
+        WHERE name != 'PDB$SEED'
+          AND open_mode = 'READ WRITE'
+        ORDER BY name;
+        EXIT;
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Write execution wrapper for each host"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_targets/run_list_pdbs.sh"
+      mode: '0755'
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ oracle_instance_map[item].oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[item].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @/tmp/jira_sync_oracle_targets/list_pdbs.sql
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Run PDB discovery on each host as oracle"
+    ansible.builtin.command: "bash /tmp/jira_sync_oracle_targets/run_list_pdbs.sh"
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    become: true
+    become_user: "{{ oracle_instance_map[item].oracle_user }}"
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+    register: sync_pdb_exec
+    failed_when: false
+    changed_when: false
+
+  - name: "Clean discovered PDB names (drop any blank/invalid lines)"
+    ansible.builtin.set_fact:
+      sync_pdb_clean: >-
+        {{ sync_pdb_clean | default([]) + [ {
+             'item': item.item,
+             'stdout_lines': item.stdout_lines | default([]) | select('match', '^[A-Za-z0-9_$]+$') | list
+           } ] }}
+    loop: "{{ sync_pdb_exec.results }}"
+    loop_control:
+      label: "{{ item.item }}"
+
+  - name: "Build sync_targets from discovered PDBs (one label per host:PDB)"
+    ansible.builtin.set_fact:
+      sync_targets: >-
+        {{ sync_targets | default([]) + [ {
+             'host': item.0.item,
+             'sid': item.1,
+             'label': item.0.item ~ ':' ~ item.1
+           } ] }}
+    loop: "{{ sync_pdb_clean | subelements('stdout_lines', skip_missing=True) }}"
+    loop_control:
+      label: "{{ item.0.item }}:{{ item.1 }}"
+
+  - name: "Build list of successfully-scanned hosts (safe to disable stale options for)"
+    ansible.builtin.set_fact:
+      sync_scanned_hosts: >-
+        {{
+          sync_pdb_exec.results
+          | selectattr('unreachable', 'undefined')
+          | selectattr('rc', 'defined')
+          | selectattr('rc', 'equalto', 0)
+          | map(attribute='item') | list
+        }}
+
+  - name: "WARN about any host where PDB discovery failed or was unreachable"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: could not list PDBs on {{ item.item }}
+        ({{ 'unreachable' if item.unreachable | default(false) else 'rc=' + (item.rc | default('n/a') | string) }}).
+        That host contributes ZERO targets this run - its existing dropdown
+        options are left untouched (only options for hosts in {{ sync_scanned_hosts }} are eligible to be disabled as stale below).
+        stderr: {{ item.stderr | default('') | truncate(300) }}
+    loop: "{{ sync_pdb_exec.results }}"
+    loop_control:
+      label: "{{ item.item }}"
+    when: item.unreachable | default(false) or item.rc | default(1) != 0
+
+  - name: Show targets to sync
+    ansible.builtin.debug:
+      msg: "{{ sync_targets | default([]) | map(attribute='label') | list }}"
+
+  - name: Nothing to sync
+    ansible.builtin.meta: end_play
+    when: sync_targets | default([]) | length == 0
+
+  # -----------------------------------------------------------------
+  # Sync the same live host:PDB label set into every field that needs it -
+  # currently just DCR's "Database Instance". sync_eligible_prefixes/
+  # sync_scanned_prefixes use "host:" (with the trailing colon) so
+  # COMMON_jira_sync_field_options.yml's substring-based eligibility check
+  # only matches a real host prefix, not a coincidental partial name.
+  # -----------------------------------------------------------------
+  - name: "Sync live targets into every configured target-picker field"
+    ansible.builtin.include_tasks: COMMON_jira_sync_field_options.yml
+    loop: "{{ jira_target_field_names }}"
+    loop_control:
+      loop_var: sync_field_name
+    vars:
+      sync_live_labels: "{{ sync_targets | map(attribute='label') | list }}"
+      sync_eligible_prefixes: "{{ oracle_instance_map.keys() | list | map('regex_replace', '$', ':') | list }}"
+      sync_scanned_prefixes: "{{ sync_scanned_hosts | map('regex_replace', '$', ':') | list }}"
+
+  - name: Clean up temp files on each host
+    ansible.builtin.file:
+      path: "/tmp/jira_sync_oracle_targets"
+      state: absent
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+    failed_when: false
+
+  - name: Final summary
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira oracle_targets sync summary"
+      - "======================================================"
+      - "  Fields synced               : {{ jira_target_field_names | join(', ') }}"
+      - "  Hosts scanned successfully  : {{ sync_scanned_hosts | join(', ') | default('none', true) }}"
+      - "  Hosts unreachable/failed    : {{ oracle_instance_map.keys() | list | difference(sync_scanned_hosts) | join(', ') | default('none', true) }}"
+      - "  PDB targets discovered      : {{ sync_targets | length }}"
+      - "  (per-field created/present/disabled counts are printed above, per field)"
+      - "======================================================"

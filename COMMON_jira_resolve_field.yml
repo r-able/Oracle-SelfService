@@ -1,0 +1,81 @@
+---
+# COMMON_jira_resolve_field.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <>
+#
+# Reusable include: resolves a Jira custom field's real customfield_XXXXX ID
+# by its human-readable field NAME (e.g. "Database"), instead of a
+# hardcoded ID that breaks silently whenever a project's form is re-created
+# (the same class of problem already hit CAU/PAT/CDP/REF field IDs after the
+# July 2026 Jira project re-creation).
+#
+# WHY resolve by name every run instead of caching an ID in vars/main.yml:
+#   community.general.jira has no field-listing operation, but
+#   GET /rest/api/2/field returns every field (system + custom) with both its
+#   id and its current display name. Matching on name means a form rebuild
+#   that keeps the same field label needs ZERO playbook/vars changes.
+#
+# Interface:
+#   Input  (set by the caller via `vars:` on the include_tasks task):
+#     resolve_field_name : the exact display name to look up, e.g. "Database"
+#   Output (fact set for the caller to use afterward):
+#     resolved_field_id  : "customfield_XXXXX" (or the system field id, rare)
+#
+# On failure (name not found, or matched more than once), this include FAILS
+# the play with a dump of every field name actually present, so the real name
+# can be copy-pasted into the caller's vars rather than guessed at.
+#
+# Usage:
+#   - name: "Resolve the 'Database' field"
+#     ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+#     vars:
+#       resolve_field_name: "{{ jira_dcr_host_db_field_name }}"
+#   - debug: msg="{{ resolved_field_id }}"
+
+- name: "RESOLVE FIELD | List all Jira fields"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/field"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: resolve_field_list
+
+- name: "RESOLVE FIELD | Match '{{ resolve_field_name }}' (case-insensitive, exact)"
+  ansible.builtin.set_fact:
+    resolve_field_matches: >-
+      {{
+        resolve_field_list.json
+        | selectattr('name', 'defined')
+        | selectattr('name', 'equalto', resolve_field_name)
+        | list
+      }}
+
+# Jira technically allows two fields with the same display name (rare, but
+# real on instances with a long field-recreation history). Treat that the
+# same as "not found" rather than silently picking one - guessing wrong here
+# means writing dropdown options onto, or reading a value from, the wrong
+# field entirely.
+- name: "RESOLVE FIELD | FAIL with a full field dump if not found or ambiguous"
+  ansible.builtin.fail:
+    msg: >-
+      {{
+        'No Jira field named exactly "' + resolve_field_name + '" was found.'
+        if (resolve_field_matches | length == 0)
+        else
+        (resolve_field_matches | length | string) + ' Jira fields are named exactly "'
+        + resolve_field_name + '" (ambiguous: ' + (resolve_field_matches | map(attribute='id') | list | join(', ')) + ').'
+      }}
+
+      If the form field was renamed or re-created, update the *_field_name
+      var in vars/main.yml to match one of the real field names below, then
+      re-run.
+
+      All fields currently on this Jira instance:
+      {{ resolve_field_list.json | map(attribute='name') | sort | join(' | ') }}
+  when: resolve_field_matches | length != 1
+
+- name: "RESOLVE FIELD | Set resolved_field_id"
+  ansible.builtin.set_fact:
+    resolved_field_id: "{{ resolve_field_matches[0].id }}"

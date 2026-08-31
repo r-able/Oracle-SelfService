@@ -1,0 +1,600 @@
+---
+# JIRA_REF_oracle_schema_refresh.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# REWRITTEN (Aug 2026) for genuine cross-host, any-environment-to-any-
+# environment refreshes - the old version assumed PROD was always the
+# source and lnx001 was the only host (`hosts: "{{ oracle_host }}"` at the
+# PLAY 2 level, one fixed spec field). Also SIMPLIFIED from an initial
+# 4-field design (separate Database + Schema pickers per side) down to 2
+# fields, after seeing the 4-field form live: Jira's plain select fields
+# can't cascade off each other, so a person could pick a Database and a
+# Schema that didn't actually belong together. Since each fully-qualified
+# schema label ("lnx001:PRO:HR") already encodes its own host and PDB, the
+# separate Database fields were redundant - removing them removes the
+# mismatch possibility entirely instead of just detecting it after the
+# fact. Mirrors ServiceNow REF's proven design where it matters (genuine
+# cross-host NETWORK_LINK import, no dump file), diverges from it here
+# (ServiceNow's Reference-field cascading isn't available in Jira, so 2
+# fields is the closest equivalent rather than replicating its 4-field
+# layout). See SNOW_REF_oracle_schema_refresh.yml /
+# SNOW_REF_oracle_schema_refresh_job.yml for the reference implementation
+# this was ported from - the Oracle-side logic (link creation, NETWORK_LINK
+# import, rollback export, verification) is copied essentially verbatim,
+# since none of that cares which ticketing system originated the request.
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   0b. Resolve    : the 2 field IDs (Source Schema, Target Schema)
+#   1. Search      : find all open REF issues matching the configured JQL
+#   2. Fetch       : retrieve each issue and parse both fields (each value
+#                    is "host:PDB:schema" - one field IS the full target
+#                    spec on its own); drop issues with missing fields,
+#                    malformed values, or unknown hosts
+#   3. Pre-flight  : per job - confirm source schema exists, confirm the
+#                    REFRESH directory exists on BOTH source and target
+#   4. Backup      : expdp the EXISTING target schema first (rollback net) -
+#                    only if it already exists; skipped for a fresh target
+#   5. Refresh     : create a database link on the target pointing at the
+#                    source, then ONE `impdp ... NETWORK_LINK=...` pulls
+#                    data directly over the network - no dump file, no
+#                    separate expdp step for the actual refresh
+#   6. Verify      : count objects in target schema to confirm import;
+#                    drop the database link regardless of outcome
+#   7. Comment     : posted per job by JIRA_REF_oracle_schema_refresh_job.yml
+#                    with full NETWORK_LINK import output
+#   8. Transition  : move issue to "Done" on success, "Failed" on error
+#                    ("Failed" also opens a DBA repair follow-up task)
+#   9. Summary     : print final outcome table
+#
+# TWO FIELDS, NOT FOUR: "Source Schema" and "Target Schema" are each a
+# single fully-qualified "host:PDB:schema" value (e.g. "lnx001:PRO:HR") -
+# there is no separate "Source Host:Database"/"Target Host:Database" field
+# to keep in sync with it, so there is nothing that CAN mismatch. An
+# earlier version of this form had 4 separate fields and relied on a
+# post-submit consistency check to catch a picked-Database vs.
+# picked-Schema mismatch - that check is no longer needed and has been
+# removed, since the 2-field design makes the mismatch impossible rather
+# than just detected. See JIRA_sync_oracle_schemas.yml for how these
+# options are kept live.
+#
+# NEW FIELD FORMAT (replaces both the old free-text spec field AND the
+# short-lived 4-field version entirely):
+#   Source Schema : "lnx001:PRO:HR"           (from JIRA_sync_oracle_schemas.yml)
+#   Target Schema : "lnx002:OLTP1_PERF:HR_COPY" (from JIRA_sync_oracle_schemas.yml)
+#   Both hosts (parsed from each field's own value) must be present in
+#   oracle_instance_map. Host names are also used to resolve each side's
+#   real oracle_home/oracle_user, since the two hosts are not assumed to
+#   share identical paths.
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   # Jira
+#   jira_url, jira_user, jira_api_token
+#   jira_jql_ref, jira_max_results, jira_cloud
+#   jira_status_done, jira_status_failed, jira_status_in_progress
+#   jira_ref_source_schema_field_name : "Source Schema"
+#   jira_ref_target_schema_field_name : "Target Schema"
+#
+#   # Oracle (per-host, not a single fixed host anymore)
+#   oracle_instance_map : { <host>: { oracle_sid, oracle_home, oracle_user }, ... }
+#   oracle_dba_user, oracle_dba_pass
+#   followup_log_dir
+#
+#   # Datapump tuning (only used for the pre-drop rollback backup now, not
+#   # the refresh itself)
+#   datapump_parallel    : 4
+#
+# NEEDS VALIDATION before trusting this against a real cross-host run - not
+# yet live-tested end-to-end on the JIRA side (the ServiceNow version this
+# was ported from IS confirmed working cross-host, lnx001<->lnx002).
+#
+# Usage:
+#   ansible-playbook JIRA_REF_oracle_schema_refresh.yml --ask-vault-pass
+
+# -- PLAY 1: Ansible controller -- fetch Jira issues --------------------------
+- name: "PLAY 1 | Fetch Jira refresh tasks and parse the host-qualified fields"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  - name: "PRE-FLIGHT | Remove stale outcomes file from any aborted previous run"
+    ansible.builtin.file:
+      path: "/tmp/jira_refresh_outcomes.json"
+      state: absent
+
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd REF intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "REF"
+
+  - name: "1 | Search for open Jira refresh issues matching JQL"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: search
+      jql: "{{ jira_jql_ref }}"
+      maxresults: "{{ jira_max_results }}"
+      cloud: "{{ jira_cloud }}"
+    register: jira_search
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: >-
+        No Tasks Found -- no Jira issues currently match JQL: {{ jira_jql_ref }}. Nothing to process; exiting cleanly.
+    when: jira_search.meta.issues | length == 0
+
+  - name: "1 | End play gracefully when no issues are found"
+    ansible.builtin.meta: end_play
+    when: jira_search.meta.issues | length == 0
+
+  - name: "1 | Show issues found"
+    ansible.builtin.debug:
+      msg: >-
+        Found {{ jira_search.meta.issues | length }} refresh issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}
+
+  - name: "2 | Fetch full details for each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: fetch
+      issue: "{{ item.key }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ jira_search.meta.issues }}"
+    loop_control:
+      label: "{{ item.key }}"
+    register: jira_issue_details
+
+  # -- REBUILT (Aug 2026) for genuine cross-host, any-environment-to-any-
+  #    environment refreshes, replacing the old single free-text spec field
+  #    (which assumed PROD as the only source and lnx001 as the only host).
+  #
+  # Reads FOUR discrete fields instead of parsing one spec string, matching
+  # the rebuilt intake form (mirrors ServiceNow REF's 4-field layout):
+  #   "Source Host:Database" -> host:PDB,   e.g. "lnx001:PRO"
+  #   "Source Schema"        -> host:PDB:schema (flat, non-cascading -
+  #                             see JIRA_sync_oracle_schemas.yml header for
+  #                             why), e.g. "lnx001:PRO:HR"
+  #   "Target Host:Database" -> host:PDB,   e.g. "lnx002:OLTP1_PERF"
+  #   "Target Schema"        -> host:PDB:schema, e.g. "lnx002:OLTP1_PERF:HR_COPY"
+  #
+  # Because the Schema dropdowns are flat (not filtered by the chosen
+  # Database field - Jira has no native cascading for plain select fields),
+  # a person COULD pick a schema whose host:PDB prefix doesn't match the
+  # Database field they also picked. This is checked explicitly below and
+  # skipped with a clear warning rather than silently refreshing the wrong
+  # database.
+
+  - name: "0b | Resolve 'Source Schema' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_ref_source_schema_field_name }}"
+
+  - name: "0b | Set jira_ref_source_schema_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_ref_source_schema_field: "{{ resolved_field_id }}"
+
+  - name: "0b | Resolve 'Target Schema' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_ref_target_schema_field_name }}"
+
+  - name: "0b | Set jira_ref_target_schema_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_ref_target_schema_field: "{{ resolved_field_id }}"
+
+  - name: "2 | WARN on issues missing either required field"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} is missing one or both required fields
+        (Source Schema: '{{ src_schema }}', Target Schema: '{{ tgt_schema }}')
+        -- skipping this issue.
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      src_schema: "{{ (item.meta.fields[jira_ref_source_schema_field] | default({})).value | default('') }}"
+      tgt_schema: "{{ (item.meta.fields[jira_ref_target_schema_field] | default({})).value | default('') }}"
+    when: src_schema | length == 0 or tgt_schema | length == 0
+
+  - name: "2 | Parse the two fields into refresh_jobs (issues with both fields present)"
+    ansible.builtin.set_fact:
+      refresh_jobs: >-
+        {{
+          refresh_jobs | default([]) + [{
+            'issue_key':      item.meta.key,
+            'raw_spec':       src_schema ~ ' => ' ~ tgt_schema,
+            'source_host':    src_schema.split(':')[0] | trim,
+            'source_service': src_schema.split(':')[1] | trim | upper,
+            'source_schema':  src_schema.split(':')[2] | trim | upper,
+            'target_host':    tgt_schema.split(':')[0] | trim,
+            'target_service': tgt_schema.split(':')[1] | trim | upper,
+            'target_schema':  tgt_schema.split(':')[2] | trim | upper
+          }]
+        }}
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      src_schema: "{{ (item.meta.fields[jira_ref_source_schema_field] | default({})).value | default('') }}"
+      tgt_schema: "{{ (item.meta.fields[jira_ref_target_schema_field] | default({})).value | default('') }}"
+    when: >-
+      src_schema | length > 0 and tgt_schema | length > 0
+      and src_schema.split(':') | length == 3
+      and tgt_schema.split(':') | length == 3
+
+  - name: "2 | WARN and drop issues whose field value isn't the expected host:PDB:schema format"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.meta.key }} has a Source/Target Schema value that
+        isn't in 'host:PDB:schema' format (Source: '{{ src_schema }}',
+        Target: '{{ tgt_schema }}') -- skipping. Re-pick from the dropdown
+        (repopulated by JIRA_sync_oracle_schemas.yml) and re-run.
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      src_schema: "{{ (item.meta.fields[jira_ref_source_schema_field] | default({})).value | default('') }}"
+      tgt_schema: "{{ (item.meta.fields[jira_ref_target_schema_field] | default({})).value | default('') }}"
+    when: >-
+      src_schema | length > 0 and tgt_schema | length > 0
+      and (src_schema.split(':') | length != 3 or tgt_schema.split(':') | length != 3)
+
+  - name: "2 | WARN and drop jobs referencing an unknown host"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.issue_key }} references a host not in
+        oracle_instance_map (known: {{ oracle_instance_map.keys() | list | join(', ') }}).
+        source_host={{ item.source_host }} target_host={{ item.target_host }} -- skipping.
+    loop: "{{ refresh_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: >-
+      item.source_host not in oracle_instance_map.keys()
+      or item.target_host not in oracle_instance_map.keys()
+
+  - name: "2 | Keep only jobs referencing known hosts"
+    ansible.builtin.set_fact:
+      refresh_jobs: >-
+        {{
+          refresh_jobs | default([])
+          | selectattr('source_host', 'in', oracle_instance_map.keys() | list) | list
+          | selectattr('target_host', 'in', oracle_instance_map.keys() | list) | list
+        }}
+
+  - name: "2 | Show parsed refresh jobs"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} -- {{ item.source_host }}:{{ item.source_schema }}@{{ item.source_service }}
+        -> {{ item.target_host }}:{{ item.target_schema }}@{{ item.target_service }}
+        {{ '(CROSS-HOST)' if item.source_host != item.target_host else '(same host)' }}
+    loop: "{{ refresh_jobs | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "2 | Nothing valid to process"
+    ansible.builtin.meta: end_play
+    when: refresh_jobs | default([]) | length == 0
+
+  # Persist refresh_jobs into a temp file so PLAY 2 (which now dispatches
+  # each job to its OWN target host via delegate_to) can access it.
+  - name: "2 | Write refresh job list to temp file for PLAY 2"
+    ansible.builtin.copy:
+      content: "{{ refresh_jobs | to_json }}"
+      dest: "/tmp/jira_refresh_jobs.json"
+      mode: '0600'
+    no_log: true
+
+# -- PLAY 2: runs once, on the controller, dispatching each job to its own
+#    target host via delegate_to (each job's target host can genuinely
+#    differ now - this was previously `hosts: "{{ oracle_host }}"`, a
+#    single fixed host, which is exactly what made cross-host and
+#    lower-to-lower refreshes impossible before this rebuild) -----------
+- name: "PLAY 2 | Run each refresh job, on its own target host, via NETWORK_LINK"
+  hosts: localhost
+  gather_facts: true
+  become: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY2-INIT | Read refresh job list from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_refresh_jobs.json"
+    register: refresh_jobs_raw
+
+  - name: "PLAY2-INIT | Decode refresh job list"
+    ansible.builtin.set_fact:
+      refresh_jobs: "{{ refresh_jobs_raw.content | b64decode | from_json }}"
+
+  # -- Run each refresh job sequentially ------------------------------------
+  # Using include_tasks with loop so variables are scoped per job cleanly.
+  # NOTE: each job posts its own comment with detailed export/import output
+  # (with tables and row counts) from inside the included task file, and
+  # runs its own Oracle-side tasks delegated to job.source_host /
+  # job.target_host as appropriate - nothing in this play runs Oracle
+  # commands directly.
+
+  - name: "3-6 | Execute each refresh job on its own target host"
+    ansible.builtin.include_tasks: JIRA_REF_oracle_schema_refresh_job.yml
+    loop: "{{ refresh_jobs }}"
+    loop_control:
+      loop_var: job
+      label: >-
+        {{ job.issue_key }} | {{ job.source_host }}:{{ job.source_schema }}@{{ job.source_service }}
+        => {{ job.target_host }}:{{ job.target_schema }}@{{ job.target_service }}
+
+# -- PLAY 3: Ansible controller -- transition issues ---------------------------
+- name: "PLAY 3 | Transition issues based on refresh outcomes"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PLAY3-INIT | Read job outcomes from controller temp file"
+    ansible.builtin.slurp:
+      src: "/tmp/jira_refresh_outcomes.json"
+    register: outcomes_raw
+
+  - name: "PLAY3-INIT | Decode job outcomes"
+    ansible.builtin.set_fact:
+      refresh_outcomes: "{{ outcomes_raw.content | b64decode | from_json }}"
+
+  - name: "7 | Show outcome per issue"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} | {{ item.source_host }}:{{ item.source_schema }}@{{ item.source_service }} => {{ item.target_host }}:{{ item.target_schema }}@{{ item.target_service }} : {{ item.status | upper }}
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  # Transitions are done via the REST API directly instead of the jira
+  # module: the re-created (team-managed) projects don't reliably expose a
+  # transition literally named "Done"/"Failed", so we fetch each issue's
+  # available transitions and match on the TARGET status (to.name) first,
+  # falling back to the transition name. When nothing matches, a WARNING
+  # lists what the workflow actually offers instead of failing silently.
+
+  - name: "8 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'done'
+    register: done_transitions
+    failed_when: false
+
+  - name: "8 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  - name: "8 | Post failure comment for FAILED issues"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.issue_key }}"
+      comment: |
+        Automated schema refresh FAILED.
+
+        Spec: {{ item.raw_spec }}
+        Error: {{ item.error | default('See Ansible controller logs for details.') }}
+        Timestamp: {{ ansible_date_time.iso8601 }}
+
+        See the earlier comment on this issue for the full NETWORK_LINK import output.
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    ignore_errors: true
+
+  - name: "8 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.status == 'failed'
+    register: failed_ref_transitions
+    failed_when: false
+
+  - name: "8 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ failed_ref_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
+    loop: "{{ failed_ref_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 8b. Create DBA repair follow-up task per FAILED issue -----------------
+  # One follow-up per failed refresh, in the same project, in "To Do", for
+  # the Database Administrators, with the preserved expdp/impdp output
+  # attached (written by the job file to {{ followup_log_dir }}).
+
+  - name: "8b | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ refresh_outcomes }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.status == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.issue_key }}"
+      fu_summary: "DBA repair required: schema refresh failed for {{ fu_item.issue_key }} ({{ fu_item.source_host }}:{{ fu_item.source_schema }}@{{ fu_item.source_service }} => {{ fu_item.target_host }}:{{ fu_item.target_schema }}@{{ fu_item.target_service }})"
+      fu_description: |-
+        Automated Oracle schema refresh FAILED and the original issue has been
+        transitioned to "{{ jira_status_failed }}". Please investigate and repair.
+
+        Spec           : {{ fu_item.raw_spec }}
+        Source         : {{ fu_item.source_host }}:{{ fu_item.source_schema }}@{{ fu_item.source_service }}
+        Target         : {{ fu_item.target_host }}:{{ fu_item.target_schema }}@{{ fu_item.target_service }}
+        {{ 'CROSS-HOST refresh (via NETWORK_LINK, no dump file)' if fu_item.source_host != fu_item.target_host else 'Same-host refresh (via NETWORK_LINK)' }}
+        Import rc      : {{ fu_item.import_rc | default('n/a') }}
+        Error          : {{ fu_item.error | default('See attached log and Ansible controller logs.') }}
+
+        Rollback/import log files were preserved on {{ fu_item.target_host }} in
+        the REFRESH directory for diagnosis (failed jobs are never cleaned up).
+      fu_attach_files: "{{ [fu_item.failure_log | default('')] | select() | list }}"
+
+  - name: "9 | Print final summary"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: >-
+      {{
+        [
+          '======================================================',
+          '  Jira Oracle Schema Refresh Summary',
+          '======================================================',
+          '  Run timestamp : ' + ansible_date_time.iso8601,
+          '  Issues found  : ' + (refresh_outcomes | length | string),
+          '  Succeeded     : ' + (refresh_outcomes | selectattr('status','equalto','done')   | list | length | string),
+          '  Failed        : ' + (refresh_outcomes | selectattr('status','equalto','failed') | list | length | string),
+          '  --------------------------------------------------'
+        ]
+        + (refresh_outcomes | map(attribute='issue_key') | zip(
+             refresh_outcomes | map(attribute='status')
+           ) | map('join', '   ->   ') | map('regex_replace', '^', '  ') | list)
+        + ['======================================================']
+      }}
+    loop_control:
+      label: "summary"
+
+  - name: "9 | Clean up temp files on controller"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "/tmp/jira_refresh_jobs.json"
+    - "/tmp/jira_refresh_outcomes.json"
+    loop_control:
+      label: "{{ item | basename }}"

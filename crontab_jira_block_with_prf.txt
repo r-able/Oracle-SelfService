@@ -1,0 +1,20 @@
+############################JIRA############################################
+# Data Change Request (DCR) polling JIRA for new tasks every 5 minutes
+*/1 * * * * /etc/ansible/JIRA_DCR_cron_wrapper.sh >> /tmp/cron.JIRA.DCR.log 2>&1
+# CAU Create New Database User polling JIRA every 5 minutes
+*/1 * * * * /etc/ansible/JIRA_CAU_cron_wrapper.sh >> /tmp/cron.JIRA.CAU.log 2>&1
+# CDP Reset Own Oracle Password polling JIRA every 5 minutes
+*/1 * * * * /etc/ansible/JIRA_CDP_cron_wrapper.sh >> /tmp/cron.JIRA.CDP.log 2>&1
+# REF Refresh Oracle Databases polling JIRA every 5 minutes
+*/1 * * * * /etc/ansible/JIRA_REF_cron_wrapper.sh >> /tmp/cron.JIRA.REF.log 2>&1
+# PAT Patch Oracle Database polling JIRA every hour
+0 * * * * /etc/ansible/JIRA_PAT_cron_wrapper.sh >> /tmp/cron.JIRA.PAT.log 2>&1
+# UPG Upgrade Oracle the Requested Oracle Databases polling JIRA every midnight
+0 0 * * * /etc/ansible/JIRA_UPG_cron_wrapper.sh  >> /tmp/cron.JIRA.UPG.log 2>&1
+# PDB Create New Database User polling JIRA every 1 minutes
+*/1 * * * * /etc/ansible/JIRA_PDB_cron_wrapper.sh >> /tmp/cron.JIRA.PDB.log 2>&1
+# DDP Drop Pluggable Database polling JIRA every 1 minute
+*/1 * * * * /etc/ansible/JIRA_DDP_cron_wrapper.sh >> /tmp/cron.JIRA.DDP.log 2>&1
+# PRF AWR Performance Analysis polling JIRA every 1 minute
+*/1 * * * * /etc/ansible/JIRA_PRF_cron_wrapper.sh >> /tmp/cron.JIRA.PRF.log 2>&1
+###########################END OF JIRA######################################

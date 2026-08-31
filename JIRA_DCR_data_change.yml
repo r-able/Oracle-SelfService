@@ -1,0 +1,1001 @@
+---
+# JIRA_DCR_data_change.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# Workflow:
+#   0. Pre-flight: validate Jira API token via /rest/api/2/myself (catches
+#      expired tokens that community.general.jira silently swallows as empty
+#      search results)
+#   0b. Resolve the "Database" field's real customfield_XXXXX ID
+#   1. Search Jira for all open issues matching the configured JQL
+#   2. Fetch each issue to retrieve attachment metadata AND its selected
+#      "Database" value (format "HOST:PDB", e.g. "lnx001:DEV")
+#   3. Download every attachment to /tmp/<ISSUE_KEY>/
+#   4. Rename any downloaded .sql attachments to .ssh
+#   5. Execute each attachment as a Linux shell script, connected to the
+#      SPECIFIC host:PDB chosen on the issue (network auth via
+#      oracle_dba_user/oracle_dba_pass against oracle_instance_map[host]) -
+#      NOT a fixed ORCLPDB connection
+#   6. Transition the Jira issue to "Done"   if ALL scripts succeeded (rc == 0)
+#   7. Transition the Jira issue to "Failed" if ANY script failed   (rc != 0)
+#
+# REDESIGNED (Aug 2026, post-HPsuperdome-restore): previously every script
+# ran against the same fixed dcr_connect_credentials/dcr_oracle_home
+# (ORCLPDB) regardless of what the issue's "Database" field said - in
+# fact that field existed on the form but was never read at all. The field's
+# dropdown OPTIONS are also now kept current by a separate playbook,
+# JIRA_sync_oracle_targets.yml, which syncs real host:PDB combinations from
+# oracle_instance_map into the field (same "lnx001:DEV" label format the
+# ServiceNow side already uses in u_oracle_target). dcr_connect_credentials/
+# dcr_oracle_home themselves are UNCHANGED and still used elsewhere (e.g.
+# JIRA_DDP_drop_pluggable_database.yml reuses dcr_connect_credentials) - only
+# this playbook has stopped using them.
+#
+# Required vars (vars/main.yml), in addition to the existing DCR ones:
+#   jira_dcr_host_db_field_name : "Database"   # exact Jira field label
+#   oracle_dba_user / oracle_dba_pass                 # network-auth account
+#                                                        (same as CAU/REF/CDP)
+#   oracle_port                                        # e.g. 1521
+#
+# Usage:
+#   ansible-playbook JIRA_DCR_data_change.yml --ask-vault-pass
+#
+# Requirements:
+#   ansible-galaxy collection install community.general
+
+- name: Jira -> Download attachments -> Execute -> Transition issues
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    # -- working directory under /tmp -----------------------------------------
+    #    work_dir: "/tmp/jira_dcr_{{ ansible_date_time.epoch }}"
+
+    # -- built at runtime; do not edit ----------------------------------------
+    issue_outcomes: {} # { "DCR-1234": "done" | "failed" }
+    script_errors: {} # { "DCR-1234/script.ssh": ["ORA-00942: ...", ...] }
+
+  # ===========================================================================
+  tasks:
+
+  # -- PRE-FLIGHT: validate API token ---------------------------------------
+  #
+  # community.general.jira does NOT surface Jira auth errors -- an expired or
+  # invalid token causes it to silently return zero search results, making it
+  # look as if no issues matched the JQL when in fact auth failed.
+  #
+  # Hitting /rest/api/2/myself with ansible.builtin.uri gives us an explicit
+  # HTTP 401 and a clear error message before we waste any further tasks.
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true # keeps the token out of the Ansible log
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # -- 0a. Resolve the "Database" field's real ID ---------------------
+  #
+  # Resolved by NAME every run (see COMMON_jira_resolve_field.yml) rather
+  # than a hardcoded customfield_XXXXX, since the July 2026 Jira project
+  # re-creation already broke several hardcoded field IDs elsewhere in this
+  # suite (CAU/PAT/CDP/REF). Fails loudly with a full field-name dump if the
+  # form's field was ever renamed.
+
+  - name: "0a | Resolve the '{{ jira_dcr_host_db_field_name }}' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_dcr_host_db_field_name }}"
+
+  - name: "0a | Set jira_dcr_host_db_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_dcr_host_db_field: "{{ resolved_field_id }}"
+
+  # -- 0. Prepare working directory -----------------------------------------
+
+  - name: "0 | Create timestamped working directory"
+    ansible.builtin.file:
+      path: "{{ work_dir }}"
+      state: directory
+      mode: '0755'
+
+  # -- 1. Search Jira -------------------------------------------------------
+  #
+  # NOTE: the community.general.jira module's `fields` parameter expects a
+  # dict, not a list. Omit it entirely -- the module returns all fields by
+  # default, and Task 2 does a dedicated per-issue fetch anyway.
+
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd DCR intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "DCR"
+
+  - name: "1 | Search for open Jira issues matching JQL"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: search
+      jql: "{{ jira_jql_dcr }}"
+      maxresults: "{{ jira_max_results }}"
+      cloud: "{{ jira_cloud }}"
+    register: jira_search
+
+  - name: "1 | Abort if no issues found"
+    ansible.builtin.fail:
+      msg: >-
+        No Jira issues matched JQL: {{ jira_jql_dcr }}
+
+        API token is VALID (pre-flight passed as {{ jira_auth_check.json.displayName }}), so this is a genuine JQL/data issue -- not an auth problem.
+
+        Things to check:
+          1. Project key casing  -> use: project = DCR  (no quotes around the key)
+          2. Status names        -> verify exact names at:
+               {{ jira_url }}/rest/api/2/project/{{ jira_jql_dcr | regex_search('[A-Z]+') }}/statuses
+          3. Permissions         -> confirm {{ jira_auth_check.json.emailAddress }}
+                                   has Browse access to the project
+    when: jira_search.meta.issues | length == 0
+
+  - name: "1 | Show issues found"
+    ansible.builtin.debug:
+      msg: >-
+        Found {{ jira_search.meta.issues | length }} issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}
+
+  # -- 2. Fetch full issue data (attachments list) --------------------------
+
+  - name: "2 | Fetch full details for each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: fetch
+      issue: "{{ item.key }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ jira_search.meta.issues }}"
+    loop_control:
+      label: "{{ item.key }}"
+    register: jira_issue_details
+
+  # -- 2b. Parse the selected "Database" value per issue --------------
+  #
+  # jira_dcr_host_db_field holds a single-select option object:
+  #   { "self": "...", "value": "lnx001:DEV", "id": "10029" }
+  # .value is exactly the "HOST:PDB" label synced by
+  # JIRA_sync_oracle_targets.yml (same format ServiceNow's u_oracle_target
+  # already uses), so it only needs a single split(':').
+
+  - name: "2b | WARN on issues with no '{{ jira_dcr_host_db_field_name }}' selected (form field IDs may have changed)"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} has no value in {{ jira_dcr_host_db_field }} ({{ jira_dcr_host_db_field_name }}) -- every script on this issue will be SKIPPED at connection time. If the DCR form changed, update jira_dcr_host_db_field_name in vars/main.yml using the field dump below.
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    when: item.meta.fields[jira_dcr_host_db_field] | default(none) is none
+
+  - name: "2b | Build issue_key -> host/sid lookup from the selected database"
+    ansible.builtin.set_fact:
+      dcr_target_by_key: >-
+        {{
+          dcr_target_by_key | default({}) | combine({
+            item.meta.key: {
+              'host': (item.meta.fields[jira_dcr_host_db_field].value | default('') | trim | split(':') | first | default('')),
+              'sid':  ((item.meta.fields[jira_dcr_host_db_field].value | default('') | trim | split(':') | length > 1) | ternary((item.meta.fields[jira_dcr_host_db_field].value | default('') | trim | split(':'))[1], ''))
+            }
+          })
+        }}
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    when: item.meta.fields[jira_dcr_host_db_field] | default(none) is not none
+
+  - name: "2b | WARN on issues whose selected value isn't 'HOST:PDB'"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.key }} selected '{{ item.value.host }}{{ (':' + item.value.sid) if item.value.sid else '' }}' in {{ jira_dcr_host_db_field_name }}, which isn't a valid 'HOST:PDB' value -- every script on this issue will be SKIPPED at connection time. Re-select a value from the dropdown (repopulated by JIRA_sync_oracle_targets.yml) and re-run.
+    loop: "{{ dcr_target_by_key | default({}) | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value.host | length == 0 or item.value.sid | length == 0
+
+  - name: "2b | WARN on issues whose selected host isn't in oracle_instance_map"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.key }} targets host '{{ item.value.host }}', which is not in oracle_instance_map -- every script on this issue will be SKIPPED at connection time. Either the sync job hasn't run for this host yet or oracle_instance_map is missing an entry.
+    loop: "{{ dcr_target_by_key | default({}) | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when:
+    - item.value.host | length > 0
+    - item.value.host not in oracle_instance_map
+
+  # -- 3. Create a per-issue subdirectory -----------------------------------
+
+  - name: "3 | Create per-issue subdirectory in {{ work_dir }}"
+    ansible.builtin.file:
+      path: "{{ work_dir }}/{{ item.meta.key }}"
+      state: directory
+      mode: '0755'
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+
+  # -- 4. Download attachments ----------------------------------------------
+  #
+  # subelements flattens:  result -> attachment list
+  # item.0 = issue result, item.1 = one attachment object
+  #
+  # Jira attachment object fields used:
+  #   item.1.content  -> direct download URL
+  #   item.1.filename -> original filename
+  #
+  # Only .sql attachments are downloaded (case-insensitive: .sql / .SQL /
+  # .sQL etc). The filename is lowercased before the regex test so any mix
+  # of upper/lower case in the extension is caught by a single pattern.
+  # Non-.sql attachments are silently skipped.
+  #
+  # FIX: regex_search returns a string or None -- use "is not none" instead of
+  # "| bool" to get a guaranteed boolean result in all Ansible versions.
+
+  - name: "4 | Download .sql attachments from Jira (case-insensitive)"
+    ansible.builtin.get_url:
+      url: "{{ item.1.content }}"
+      dest: "{{ work_dir }}/{{ item.0.meta.key }}/{{ item.1.filename }}"
+      url_username: "{{ jira_user }}"
+      url_password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      mode: '0755' # executable from the start
+    loop: >-
+      {{
+        jira_issue_details.results
+        | subelements('meta.fields.attachment', skip_missing=True)
+      }}
+    loop_control:
+      label: "{{ item.0.meta.key }} / {{ item.1.filename }}"
+    when: item.1.filename | lower | regex_search('\.sql$') is not none
+    register: download_results
+    ignore_errors: true
+
+  # -- 4b. Rename .sql attachments to .ssh ----------------------------------
+  #
+  # Only renames files that:
+  #   a) downloaded successfully  (not item.failed)
+  #   b) have a .sql extension    (regex_search check on original filename)
+  #
+  # item.dest  -> e.g. /tmp/jira_dcr_.../DCR-5569/script.sql
+  # renamed    -> e.g. /tmp/jira_dcr_.../DCR-5569/script.ssh
+  #
+  # FIX: same "is not none" fix applied here.
+
+  - name: "4b | Rename downloaded .sql attachments to .ssh"
+    # Use bash parameter expansion  ${f%.*}  to strip the extension regardless
+    # of case (.sql / .SQL / .Sql all work), then append .ssh.
+    # This avoids the regex_replace case-sensitivity bug where .SQL filenames
+    # produced identical source/dest paths and caused mv to fail.
+    ansible.builtin.shell:
+      cmd: >-
+        f="{{ item.dest }}"; mv "$f" "${f%.*}.ssh"
+    loop: "{{ download_results.results }}"
+    loop_control:
+      label: "{{ item.item.0.meta.key }} / {{ item.item.1.filename }} -> {{ item.item.1.filename | regex_replace('(?i)\\.sql$', '.ssh') }}"
+    when:
+    - not (item.failed | default(false))
+    - item.dest is defined
+    - item.item.1.filename | lower | regex_search('\.sql$') is not none
+    register: rename_results
+
+  - name: "4b | Show rename results"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.item.item.0.meta.key }} / {{ item.item.item.1.filename }} -> {{ item.item.item.1.filename | regex_replace('(?i)\\.sql$', '.ssh') }} ({{ 'renamed OK' if not (item.failed | default(false)) else 'FAILED to rename' }})
+    loop: "{{ rename_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.item.0.meta.key }}"
+    when: rename_results.results is defined
+
+  # -- 5. Gather downloaded scripts per issue -------------------------------
+  #
+  # Build a flat list of dicts: { issue_key, script_path }
+  # For .sql files the path is updated to the renamed .ssh path.
+  # Only includes files whose download succeeded (failed=false).
+  #
+  # FIX: regex_search inside a Jinja2 expression (the inline `if`) also needs
+  # "is not none" -- "| bool" has no effect inside Jinja2 string expressions.
+
+  - name: "5 | Build list of successfully downloaded scripts"
+    ansible.builtin.set_fact:
+      scripts_to_run: >-
+        {{
+          scripts_to_run | default([]) + [{
+            'issue_key': item.item.0.meta.key,
+            'host': dcr_target_by_key.get(item.item.0.meta.key, {}).get('host', ''),
+            'sid':  dcr_target_by_key.get(item.item.0.meta.key, {}).get('sid', ''),
+            'script_path': (
+              item.dest | regex_replace('\.sql$', '.ssh')
+              if item.item.1.filename | lower | regex_search('\.sql$') is not none
+              else item.dest
+            )
+          }]
+        }}
+    loop: "{{ download_results.results }}"
+    loop_control:
+      label: "{{ item.item.0.meta.key }} / {{ item.item.1.filename }}"
+    when:
+    - not (item.failed | default(false))
+    - item.dest is defined
+
+  - name: "5 | Warn if no scripts were downloaded"
+    ansible.builtin.debug:
+      msg: "WARNING: No attachments were downloaded successfully. Nothing to execute."
+    when: scripts_to_run | default([]) | length == 0
+
+  # -- 5b/5c. Wrap each script with a DYNAMIC per-issue connection header ----
+  #
+  # REDESIGNED: previously every script was wrapped with the SAME fixed
+  # dcr_connect_credentials/dcr_oracle_home (ORCLPDB) regardless of what the
+  # issue's "Database" field said - that field was never read at all.
+  # Now each script connects to the specific host:PDB chosen on the issue.
+  #
+  # Connects via network auth (oracle_dba_user/oracle_dba_pass), the same
+  # model CAU/REF/CDP already use for PDB-level work, since we're targeting
+  # a specific host+PDB per issue rather than always running locally against
+  # one fixed database.
+  #
+  # `when: item.host in oracle_instance_map` intentionally leaves a script
+  # UNWRAPPED (no CONNECT line, no ORACLE_HOME export) when the selected
+  # host is missing or unknown - see the 2b WARN tasks above, which already
+  # flagged this. The script still runs at step 6 and fails there with a
+  # clear "no sqlplus session" error rather than being silently skipped.
+  #
+  # insertbefore: BOF stacks in REVERSE of desired final order - inserting
+  # CONNECT first (5b) and the ORACLE_HOME export/sqlplus opener second (5c)
+  # yields the correct final top-to-bottom order: [oracle_home_export,
+  # CONNECT, ...script...].
+
+  - name: "5b | Insert CONNECT line (network auth, per-issue host:PDB) at top of each script"
+    ansible.builtin.lineinfile:
+      path: "{{ item.script_path }}"
+      line: "CONNECT {{ oracle_dba_user }}/{{ oracle_dba_pass }}@//{{ item.host }}:{{ oracle_port }}/{{ item.sid }}"
+      insertbefore: BOF
+      backup: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+    when: item.host in oracle_instance_map
+
+  - name: "5c | Insert ORACLE_HOME export + sqlplus opener at top of each script"
+    ansible.builtin.lineinfile:
+      path: "{{ item.script_path }}"
+      line: "export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}; export PATH=$ORACLE_HOME/bin:$PATH; sqlplus -s /nolog <<EOF"
+      insertbefore: BOF
+      backup: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+    when: item.host in oracle_instance_map
+
+  - name: "5d | Append EOF footer at bottom of each script"
+    ansible.builtin.lineinfile:
+      path: "{{ item.script_path }}"
+      line: "EOF"
+      insertafter: EOF
+      backup: false
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.script_path | basename }}"
+
+  # -- 6. Execute each script -----------------------------------------------
+  #
+  # stdout and stderr are captured natively by Ansible (no shell redirect).
+  # A follow-up task writes the combined log file explicitly so we still get
+  # the .log artifact on disk for upload to Jira in Task 10.
+  # ignore_errors: true so the playbook continues even when a script fails.
+
+  - name: "6 | Execute shell scripts"
+    ansible.builtin.shell:
+      cmd: "bash {{ item.script_path | quote }}"
+      chdir: "{{ work_dir }}/{{ item.issue_key }}"
+    loop: "{{ scripts_to_run | default([]) }}"
+    loop_control:
+      label: "{{ item.issue_key }} | {{ item.script_path | basename }}"
+    register: exec_results
+    ignore_errors: true
+    no_log: false
+
+  # -- 6a. Write captured output to .log files ------------------------------
+  #
+  # Now that stdout/stderr are captured by Ansible rather than redirected in
+  # the shell command, we write the combined log explicitly so Task 10 can
+  # still upload it to Jira.
+
+  - name: "6a | Write execution output to .log file"
+    ansible.builtin.copy:
+      content: |
+        === STDOUT ===
+        {{ item.stdout | default('(no stdout)') }}
+        === STDERR ===
+        {{ item.stderr | default('(no stderr)') }}
+        === EXIT CODE: {{ item.rc }} ===
+      dest: "{{ item.item.script_path }}.log"
+      mode: '0644'
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }} / {{ item.item.script_path | basename }}.log"
+
+  # -- 6b. Show per-script execution results --------------------------------
+  #
+  # stdout slicing is done in a set_fact first because Jinja2 inside
+  # debug msg strings does not support Python-style [-N:] slice syntax.
+  # The set_fact builds a lookup dict keyed by "ISSUE/script.ssh" so
+  # the debug task can retrieve the pre-sliced tail by key.
+
+  - name: "6b | Build stdout tail lookup (last 10 non-empty lines per script)"
+    ansible.builtin.set_fact:
+      exec_stdout_tails: >-
+        {{
+          exec_stdout_tails | default({}) | combine({
+            item.item.issue_key + '/' + (item.item.script_path | basename): (
+              item.stdout | default('(no stdout)')
+            ).split('\n') | reject('equalto', '') | list | join('\n---\n')
+          })
+        }}
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }} / {{ item.item.script_path | basename }}"
+
+  - name: "6b | Show execution results per script"
+    ansible.builtin.debug:
+      msg:
+      - "--------------------------------------------------------"
+      - "  Issue  : {{ item.item.issue_key }}"
+      - "  Script : {{ item.item.script_path | basename }}"
+      - "  Result : {{ 'SUCCESS' if item.rc == 0 else 'FAILED' }}  (rc={{ item.rc }})"
+      - "  -- stdout ------------------------------------------"
+      - "{{ exec_stdout_tails[item.item.issue_key + '/' + (item.item.script_path | basename)] | default('(no stdout)') | replace('
+
+        ---
+
+        ', '
+
+        ') }}"
+      - "  -- stderr ------------------------------------------"
+      - "{{ item.stderr | default('(none)') | trim }}"
+      - "--------------------------------------------------------"
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }} / {{ item.item.script_path | basename }}"
+
+  # -- 6c. Parse error lines from each log file -----------------------------
+  #
+  # Reads the .log file written in 6a and extracts lines matching common
+  # Oracle / shell error patterns:
+  #   ORA-nnnnn   -> Oracle database errors
+  #   SP2-nnnnn   -> SQL*Plus errors
+  #   ERROR       -> generic shell/script errors
+  #   WARN        -> warnings worth capturing
+  #
+  # Builds script_errors dict:
+  #   { "DCR-1234/script.ssh": { "lines": [...], "count": N } }
+
+  - name: "6c | Read log file for each executed script"
+    ansible.builtin.slurp:
+      src: "{{ item.item.script_path }}.log"
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }} / {{ item.item.script_path | basename }}.log"
+    register: log_contents
+    ignore_errors: true
+
+  - name: "6c | Extract and count error lines from each log"
+    ansible.builtin.set_fact:
+      script_errors: >-
+        {{
+          script_errors | combine({
+            item.item.item.issue_key + '/' + item.item.item.script_path | basename: {
+              'rc': item.item.rc,
+              'error_lines': (
+                (item.content | b64decode).split('\n')
+                | select('search', '(ORA-[0-9]+|SP2-[0-9]+|ERROR|WARN)', ignorecase=True)
+                | list
+              ),
+              'error_count': (
+                (item.content | b64decode).split('\n')
+                | select('search', '(ORA-[0-9]+|SP2-[0-9]+|ERROR|WARN)', ignorecase=True)
+                | list
+                | length
+              )
+            }
+          })
+        }}
+    loop: "{{ log_contents.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.item.issue_key }} / {{ item.item.item.script_path | basename }}"
+    when:
+    - not (item.failed | default(false))
+    - item.content is defined
+
+  # -- 6d. Show detailed error report per failed script ---------------------
+  #
+  # Only fires for scripts that actually failed (rc != 0).
+  # Prints every captured error line with its index so the operator can
+  # locate it quickly in the full .log file.
+
+  - name: "6d | Show detailed error report for failed scripts"
+    ansible.builtin.debug:
+      msg:
+      - "========================================================"
+      - "  ERROR REPORT"
+      - "  Issue  : {{ item.item.item.issue_key }}"
+      - "  Script : {{ item.item.item.script_path | basename }}"
+      - "  rc     : {{ item.item.rc }}"
+      - "  Errors found : {{ script_errors[item.item.item.issue_key + '/' + (item.item.item.script_path | basename)] .error_count | default(0) }}"
+      - "  -- Error lines -------------------------------------"
+      - >-
+        {{
+          script_errors[
+            item.item.item.issue_key + '/' + (item.item.item.script_path | basename)
+          ].error_lines | default(['(no matching error lines found -- check full log)'])
+          | join('\n')
+        }}
+      - "========================================================"
+    loop: "{{ log_contents.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.item.issue_key }} / {{ item.item.item.script_path | basename }}"
+    when:
+    - not (item.failed | default(false))
+    - item.item.rc != 0
+
+  # -- 7. Compute per-issue outcome -----------------------------------------
+  #
+  # An issue is "done"   only if EVERY one of its scripts returned rc == 0.
+  # An issue is "failed" if ANY script returned rc != 0.
+  # We build issue_outcomes = { "DCR-1234": "done", "DCR-1235": "failed", ... }
+
+  - name: "7 | Mark issue as FAILED if any script returned non-zero"
+    ansible.builtin.set_fact:
+      issue_outcomes: >-
+        {{
+          issue_outcomes | combine({ item.item.issue_key: 'failed' })
+        }}
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+    when: item.rc != 0
+
+  - name: "7 | Mark issue as DONE if not already marked failed"
+    ansible.builtin.set_fact:
+      issue_outcomes: >-
+        {{
+          issue_outcomes | combine({ item.item.issue_key: 'done' })
+        }}
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+    when:
+    - item.rc == 0
+    - item.item.issue_key not in issue_outcomes
+
+  - name: "7 | Show final per-issue outcomes"
+    ansible.builtin.debug:
+      msg: "{{ item.key }} -> {{ item.value | upper }}"
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+
+  # -- 7b. Post worklog summary per issue ------------------------------------
+  #
+  # One worklog entry per issue: overall outcome plus per-script result and
+  # a truncated slice of each script's output. Full untruncated output is
+  # already attached as .log files in Task 10, so truncation here only
+  # affects the inline summary, not the audit trail.
+
+  - name: "7b | Post worklog summary per issue"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/worklog"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 201
+      headers:
+        Content-Type: "application/json"
+      body_format: json
+      body:
+        timeSpentSeconds: 60
+        comment: |-
+          Automated DCR execution -- {{ ansible_date_time.iso8601 }}
+          Overall result: {{ item.value | upper }}
+          Executed by: {{ jira_auth_check.json.displayName }}
+          Work dir: {{ work_dir }}
+          Scripts run: {{ exec_results.results | default([])
+                          | selectattr('item.issue_key', 'equalto', item.key)
+                          | list | length }}
+          Scripts failed: {{ exec_results.results | default([])
+                             | selectattr('item.issue_key', 'equalto', item.key)
+                             | selectattr('rc', 'ne', 0)
+                             | list | length }}
+
+          Per-script results:
+          {% for r in exec_results.results | default([])
+                if r.item.issue_key == item.key %}
+          --- {{ r.item.script_path | basename }} : {{ 'SUCCESS' if r.rc == 0 else 'FAILED' }} (rc={{ r.rc }}) ---
+          {{ r.stdout | default('(no stdout)') | trim | truncate(800, True) }}
+          {% if r.rc != 0 %}
+          stderr: {{ r.stderr | default('(none)') | trim | truncate(400, True) }}
+          error lines: {{ script_errors[item.key + '/' + (r.item.script_path | basename)].error_lines
+                          | default(['(none extracted)']) | join(' | ') | truncate(600, True) }}
+          {% endif %}
+          {% endfor %}
+
+          Full output attached as .log files on this issue.
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }} ({{ item.value }})"
+    ignore_errors: true
+
+  # -- 8. Transition issues to "Done" ---------------------------------------
+
+  # Transitions use the REST API directly: the re-created (team-managed)
+  # workflow's path to "Done" is not reliably named "Done", so we fetch each
+  # issue's available transitions and match on the TARGET status (to.name)
+  # first, falling back to the transition name. When nothing matches, a
+  # WARNING lists what the workflow actually offers.
+
+  - name: "8 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'done'
+    register: done_transitions
+    failed_when: false
+
+  - name: "8 | Transition SUCCESSFUL issues to '{{ jira_status_done }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    register: transition_done
+    failed_when: false
+
+  - name: "8 | WARN when no '{{ jira_status_done }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_done }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_done in vars/main.yml to one of the target statuses above.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 9. Transition issues to "Failed" -------------------------------------
+
+  - name: "9 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value == 'failed'
+    register: failed_dcr_transitions
+    failed_when: false
+
+  - name: "9 | Transition FAILED issues to '{{ jira_status_failed }}'"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ tr_match.id }}"
+      status_code: 204
+    loop: "{{ failed_dcr_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is defined
+    register: transition_failed
+    failed_when: false
+
+  - name: "9 | WARN when no '{{ jira_status_failed }}' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.key }} could NOT be transitioned to '{{ jira_status_failed }}' -- the workflow only offers these transitions from the current status: {{ tr_all | map(attribute='name') | list | zip(tr_all | map(attribute='to.name') | list) | map('join', ' -> ') | list | join(', ') | default('(none)', true) }}. Set jira_status_failed in vars/main.yml to one of the target statuses above.
+    loop: "{{ failed_dcr_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.key | default('skipped') }}"
+    vars:
+      tr_all: "{{ item.json.transitions | default([]) }}"
+      tr_match: >-
+        {{
+          ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
+           + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
+          | first | default({})
+        }}
+    when:
+    - item is not skipped
+    - tr_match.id is not defined
+
+  # -- 10. Upload execution logs back to Jira -------------------------------
+  #
+  # Attaches the .log file produced by each script run back onto its issue,
+  # giving you a full audit trail inside Jira itself.
+
+  - name: "10 | Upload execution logs as Jira attachments"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: attach
+      issue: "{{ item.item.issue_key }}"
+      attachment:
+        filename: "{{ item.item.script_path }}.log"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ exec_results.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }} / {{ item.item.script_path | basename }}.log"
+    ignore_errors: true
+
+  # -- 10b. Create DBA repair follow-up task per FAILED issue -----------------
+  #
+  # One follow-up per failed issue, created in the same project, in "To Do",
+  # for the Database Administrators. A consolidated failure report plus the
+  # per-script .log files from this run are attached to the follow-up.
+
+  - name: "10b | Set follow-up run timestamp"
+    ansible.builtin.set_fact:
+      fu_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    when: jira_followup_enabled | default(true) | bool
+
+  - name: "10b | Ensure follow-up log dir exists on controller"
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - issue_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length > 0
+
+  - name: "10b | Write failure report per FAILED issue"
+    ansible.builtin.copy:
+      content: |
+        Automated DCR Execution FAILURE LOG - {{ ansible_date_time.iso8601 }}
+        Issue    : {{ item.key }}
+        Work dir : {{ work_dir }}
+
+        Per-script results:
+        {% for r in exec_results.results | default([]) if r.item.issue_key == item.key %}
+        --- {{ r.item.script_path | basename }} : {{ 'SUCCESS' if r.rc == 0 else 'FAILED' }} (rc={{ r.rc }}) ---
+        {% if r.rc != 0 %}
+        stderr: {{ r.stderr | default('(none)') | trim }}
+        error lines: {{ script_errors[item.key + '/' + (r.item.script_path | basename)].error_lines | default(['(none extracted)']) | join(' | ') }}
+        {% endif %}
+        {% endfor %}
+
+        The full untruncated per-script output is in the attached .log files.
+      dest: "{{ followup_log_dir }}/DCR_{{ item.key }}_failure_{{ fu_run_ts }}.log"
+      mode: "0640"
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - item.value == 'failed'
+
+  - name: "10b | Create DBA follow-up task for FAILED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.key }}"
+    when:
+    - jira_followup_enabled | default(true) | bool
+    - fu_item.value == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.key }}"
+      fu_summary: "DBA repair required: data change scripts failed for {{ fu_item.key }}"
+      fu_description: |-
+        Automated data change (DCR) execution FAILED and the original issue
+        has been transitioned to "{{ jira_status_failed }}". Please investigate
+        and repair.
+
+        Scripts run    : {{ exec_results.results | default([]) | selectattr('item.issue_key', 'equalto', fu_item.key) | list | length }}
+        Scripts failed : {{ exec_results.results | default([]) | selectattr('item.issue_key', 'equalto', fu_item.key) | selectattr('rc', 'ne', 0) | list | length }}
+        Work dir       : {{ work_dir }}
+
+        The failure report and the full execution logs for every script in
+        this run are attached to this task.
+      fu_attach_files: >-
+        {{
+          [followup_log_dir + '/DCR_' + fu_item.key + '_failure_' + fu_run_ts + '.log']
+          + (exec_results.results | default([])
+             | selectattr('item.issue_key', 'equalto', fu_item.key)
+             | map(attribute='item.script_path') | list
+             | map('regex_replace', '$', '.log') | list)
+        }}
+
+  # -- 11. Final summary -----------------------------------------------------
+  #
+  # Builds summary_outcome_lines (one line per issue) and
+  # summary_error_lines (one block per failed script) via set_fact loops,
+  # then prints everything in a single debug task.
+  #
+  # Using set_fact loops is the only reliable way to get Ansible's debug
+  # module to print one item per line -- passing a Jinja2 list expression
+  # causes it to render the entire list as a single inline string.
+
+  - name: "11 | Build per-issue outcome lines for summary"
+    ansible.builtin.set_fact:
+      summary_outcome_lines: >-
+        {{
+          summary_outcome_lines | default([])
+          + ['    ' + item.key + '   ->   ' + (item.value | upper)
+             + (
+                 '  (' + (
+                   script_errors
+                   | dict2items
+                   | selectattr('key', 'search', '^' + item.key + '/')
+                   | map(attribute='value')
+                   | map(attribute='error_count')
+                   | sum
+                   | string
+                 ) + ' error line(s) found)'
+                 if item.value == 'failed'
+                 else ''
+               )
+            ]
+        }}
+    loop: "{{ issue_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+
+  - name: "11 | Build per-script error detail lines for summary"
+    ansible.builtin.set_fact:
+      summary_error_lines: >-
+        {{
+          summary_error_lines | default([])
+          + ['  -- ' + item.key + ' (rc=' + (item.value.rc | string) + ', ' + (item.value.error_count | string) + ' error line(s)) --']
+          + (item.value.error_lines | default(['(no matching error lines)']) | map('regex_replace', '^', '      ') | list)
+        }}
+    loop: "{{ script_errors | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value.rc != 0
+
+  - name: "11 | Build final summary header lines"
+    ansible.builtin.set_fact:
+      summary_header_lines:
+      - "======================================================"
+      - "  Jira DCR Execution Summary"
+      - "======================================================"
+      - "  Run timestamp  : {{ ansible_date_time.iso8601 }}"
+      - "  Work dir       : {{ work_dir }}"
+      - "  Issues found   : {{ jira_search.meta.issues | length }}"
+      - "  Scripts run    : {{ exec_results.results | default([]) | length }}"
+      - "  Scripts failed : {{ exec_results.results | default([]) | selectattr('rc', 'ne', 0) | list | length }}"
+      - "  Total errors   : {{ script_errors.values() | map(attribute='error_count') | sum }}"
+      - "  ----------------------------------------------------"
+      - "  Per-issue outcomes:"
+
+  - name: "11 | Print summary header"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: "{{ summary_header_lines }}"
+    loop_control:
+      label: "header"
+
+  - name: "11 | Print per-issue outcome lines"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: "{{ summary_outcome_lines | default(['    (none)']) }}"
+    loop_control:
+      label: "outcome"
+
+  - name: "11 | Print error detail header"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop:
+    - "  ----------------------------------------------------"
+    - "  Error detail (failed scripts only):"
+    loop_control:
+      label: "error header"
+
+  - name: "11 | Print per-script error detail lines"
+    ansible.builtin.debug:
+      msg: "{{ item }}"
+    loop: "{{ summary_error_lines | default(['    (no errors -- all scripts succeeded)']) }}"
+    loop_control:
+      label: "error detail"
+
+  - name: "11 | Print summary footer"
+    ansible.builtin.debug:
+      msg: "======================================================"
+
+  - name: "12 | Rename {{ work_dir }} to {{ work_dir }}_failed (failed runs only)"
+    ansible.builtin.command:
+      cmd: "mv {{ work_dir }} {{ work_dir }}_failed"
+    when: >-
+      issue_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length > 0
+
+  - name: "12 | Confirm final working directory path"
+    ansible.builtin.debug:
+      msg: >-
+        Working directory: {{
+          work_dir + '_failed'
+          if issue_outcomes | dict2items | selectattr('value', 'equalto', 'failed') | list | length > 0
+          else work_dir
+        }}

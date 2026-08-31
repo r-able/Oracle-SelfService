@@ -1,0 +1,5 @@
+*/1 * * * * /etc/ansible/SNOW_sync_oracle_targets_cron_wrapper.sh >> /tmp/cron.sync_oracle_targets.snow.log 2>&1
+*/15 * * * * /etc/ansible/SNOW_sync_oracle_schemas_cron_wrapper.sh >> /tmp/cron.sync_oracle_schemas.snow.log 2>&1
+*/30 * * * * /etc/ansible/SNOW_sync_oracle_hosts_cron_wrapper.sh >> /tmp/cron.sync_oracle_hosts.snow.log 2>&1
+*/1 * * * * /etc/ansible/JIRA_sync_oracle_targets_cron_wrapper.sh >> /tmp/cron.sync_oracle_targets.jira.log 2>&1
+*/15 * * * * /etc/ansible/JIRA_sync_oracle_schemas_cron_wrapper.sh >> /tmp/cron.sync_oracle_schemas.jira.log 2>&1

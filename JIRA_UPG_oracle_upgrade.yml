@@ -1,0 +1,177 @@
+---
+# =============================================================================
+# JIRA_UPG_oracle_upgrade.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# Jira-driven Oracle 21c -> 26ai upgrade dispatcher (AutoUpgrade).
+#
+# Reference procedure:
+#   https://oracle-base.com/articles/26/multitenant-upgrade-to-26-autoupgrade
+#
+# REWRITTEN (Aug 2026): previously this hardcoded a single oracle_host for
+# every job, silently ignoring the host portion of whatever the requester
+# specified (only the SID was ever parsed, via a regex on the issue
+# summary like "Upgrade CDB1 to 26ai") - the SAME latent bug existed in
+# SNOW_UPG_oracle_upgrade.yml too, just never surfaced because only one
+# 26ai-capable host has existed so far. Now reads "Target Host & Container
+# (CDB)" - the exact same field PDB and PAT already use, since UPG also
+# operates at the whole-CDB level - which gives both host and SID directly
+# from one field, no summary-regex parsing needed at all. The one-time
+# blanket 26ai-install pre-flight check has moved into
+# JIRA_UPG_oracle_upgrade_job.yml, now run PER-JOB against that job's
+# actual target host (see that file's header for why).
+#
+# Flow:
+#   1. Pre-flight Jira API token guard (/rest/api/2/myself) -- an expired
+#      token makes searches silently return empty, so we hard-fail here.
+#   2. Shepherd the intake queue, then find open issues in the UPG project.
+#   3. For each issue, include JIRA_UPG_oracle_upgrade_job.yml which runs
+#      the full 26ai pre-flight -> analyze -> deploy -> verify cycle and
+#      transitions the issue.
+#
+# FIELD FORMAT:
+#   Target Host & Container (CDB) : "lnx001:CDB1"  (from
+#                                    JIRA_sync_oracle_targets.yml, same
+#                                    field PDB and PAT already use)
+#
+# Required vars (vars/main.yml), in addition to the existing ones:
+#   jira_upg_target_field_name : "Target Host & Container (CDB)"
+#
+# Credentials: export JIRA_USER (Atlassian account email) and jira_api_token
+# (API token) in the environment, or override the vars below (vault).
+# =============================================================================
+
+- name: Jira-driven Oracle 21c to 26ai upgrades via AutoUpgrade
+  hosts: localhost
+  gather_facts: false
+
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  # -------------------------------------------------------------------------
+  # 0. Pre-flight: Jira token guard.
+  #    community.general.jira / searches silently return [] on an expired
+  #    token, so verify authentication explicitly before doing anything.
+  # -------------------------------------------------------------------------
+  - name: "PRE | Verify Jira API token is valid (/rest/api/2/myself)"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: jira_myself
+
+  - name: "PRE | Assert Jira identity resolved"
+    ansible.builtin.assert:
+      that:
+      - jira_myself.json.accountId is defined
+      fail_msg: >-
+        Jira authentication check failed -- token likely expired or invalid. Regenerate the API token before re-running.
+      success_msg: "Authenticated to Jira as {{ jira_myself.json.displayName | default(jira_user) }}"
+
+  # -------------------------------------------------------------------------
+  # 0b. Resolve the 'Target Host & Container (CDB)' field ID
+  # -------------------------------------------------------------------------
+  - name: "0b | Resolve 'Target Host & Container (CDB)' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_upg_target_field_name }}"
+
+  - name: "0b | Set jira_upg_target_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_upg_target_field: "{{ resolved_field_id }}"
+
+  # -------------------------------------------------------------------------
+  # 1. Find open UPG issues.
+  #    Uses the newer /rest/api/3/search/jql endpoint (the legacy
+  #    /rest/api/2/search POST endpoint has been retired on Jira Cloud).
+  # -------------------------------------------------------------------------
+  # Shepherd the intake queue before searching for work:
+  #   To Do -> Pending Approval; APPROVED Pending Approval -> In Progress.
+  # All other statuses are ignored. Freshly promoted issues are picked up
+  # by the search below in this same run.
+  - name: "0 | Shepherd UPG intake queue toward '{{ jira_status_in_progress }}'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "UPG"
+
+  - name: "PRE | Search for open {{ jira_upg_project }} issues"
+    ansible.builtin.uri:
+      url: >-
+        {{ jira_url }}/rest/api/3/search/jql?jql={{ jira_jql_upg | urlencode }}&fields=summary,{{ jira_upg_target_field }}&maxResults={{ jira_max_results }}
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: upg_search
+
+  - name: "PRE | WARN and skip issues with an unusable or unknown-host target"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.key }} has an unusable 'Target Host & Container (CDB)'
+        value ('{{ p_host_cdb }}') -- skipping.
+        {% if p_host not in oracle_instance_map %}Unknown host '{{ p_host }}' (known: {{ oracle_instance_map.keys() | list | join(', ') }}). {% endif %}
+      - "Populated custom fields on {{ item.key }}:"
+      - "{{ item.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
+    loop: "{{ upg_search.json.issues | default([]) }}"
+    loop_control:
+      label: "{{ item.key }}"
+    vars:
+      p_host_cdb: "{{ (item.fields[jira_upg_target_field] | default({}, true)).value | default('', true) }}"
+      p_host: "{{ p_host_cdb.split(':')[0] | default('') | trim }}"
+    when: p_host_cdb | length == 0 or p_host not in oracle_instance_map
+
+  - name: "PRE | Build upgrade job list from issues"
+    ansible.builtin.set_fact:
+      upg_jobs: >-
+        {{ upg_jobs | default([]) + [ {
+             'issue_key':    item.key,
+             'summary':      item.fields.summary,
+             'target_host':  p_host,
+             'oracle_sid':   p_sid
+           } ] }}
+    loop: "{{ upg_search.json.issues | default([]) }}"
+    loop_control:
+      label: "{{ item.key }}"
+    vars:
+      p_host_cdb: "{{ (item.fields[jira_upg_target_field] | default({}, true)).value | default('', true) }}"
+      p_host: "{{ p_host_cdb.split(':')[0] | default('') | trim }}"
+      p_sid: "{{ p_host_cdb.split(':')[1] | default('') | trim }}"
+    when: p_host_cdb | length > 0 and p_host in oracle_instance_map
+
+  - name: "PRE | Nothing to do?"
+    ansible.builtin.debug:
+      msg: "No open issues found in project {{ jira_upg_project }}. Exiting."
+    when: upg_jobs | default([]) | length == 0
+
+  - name: "PRE | End play when queue is empty"
+    ansible.builtin.meta: end_play
+    when: upg_jobs | default([]) | length == 0
+
+  - name: "PRE | Upgrade jobs queued"
+    ansible.builtin.debug:
+      msg: "{{ item.issue_key }} -- upgrade {{ item.oracle_sid }} on {{ item.target_host }} to 26ai"
+    loop: "{{ upg_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  # -------------------------------------------------------------------------
+  # 2. Run each upgrade job. A failure inside one job is handled by the
+  #    job file's rescue block (worklog + transition to Failed), so one
+  #    bad ticket does not stop the remaining tickets. The 26ai pre-flight
+  #    check now runs INSIDE each job, against that job's own target host.
+  # -------------------------------------------------------------------------
+  - name: "JOB | Dispatch upgrade job per issue"
+    ansible.builtin.include_tasks: JIRA_UPG_oracle_upgrade_job.yml
+    loop: "{{ upg_jobs | default([]) }}"
+    loop_control:
+      loop_var: job
+      label: "{{ job.issue_key }} ({{ job.oracle_sid }} on {{ job.target_host }})"

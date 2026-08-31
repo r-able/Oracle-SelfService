@@ -1,0 +1,188 @@
+---
+# COMMON_jira_sync_field_options.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <>
+#
+# Reusable include: syncs a list of live label strings into ONE Jira global
+# field's context options (create-if-missing, disable-if-stale), with the
+# same host-aware staleness protection built for JIRA_sync_oracle_targets.yml
+# (an unreachable host must never cause its still-valid options to be
+# disabled just because it contributed nothing this run).
+#
+# Extracted so JIRA_sync_oracle_targets.yml and JIRA_sync_oracle_schemas.yml
+# don't each carry their own copy of this logic - both need to write the
+# SAME kind of live-label set into MULTIPLE fields (targets sync feeds
+# "Database Instance", "Source Host:Database", "Target Host:Database";
+# schemas sync feeds "Source Schema", "Target Schema"), and duplicating the
+# diff/stale/create/disable logic per field-per-playbook would multiply into
+# five near-identical copies fast.
+#
+# Interface (set by the caller via `vars:` on the include_tasks task):
+#   sync_field_name       : exact Jira field display name to resolve and sync
+#   sync_live_labels      : list of label strings that ARE currently correct
+#                            e.g. ["lnx001:DEV", "lnx001:UAT", ...]
+#   sync_eligible_prefixes: list of prefixes (WITH trailing separator, e.g.
+#                            "lnx001:" for targets or "lnx001:DEV:" for
+#                            schemas) that this run has enough knowledge
+#                            about to judge staleness for. An existing
+#                            option whose value starts with a prefix NOT in
+#                            this list is either (a) garbage/unrecognized
+#                            format - always eligible to disable, or (b) a
+#                            recognized-but-not-scanned-this-run prefix -
+#                            left untouched, never disabled.
+#   sync_scanned_prefixes : subset of sync_eligible_prefixes that were
+#                            actually, successfully scanned THIS run - only
+#                            these prefixes' stale options get disabled.
+#
+# No output facts - this include is self-contained per call and only prints
+# its own summary. Call it once per field that needs the same label set.
+#
+# Usage:
+#   - name: "Sync '{{ some_field_name }}'"
+#     ansible.builtin.include_tasks: COMMON_jira_sync_field_options.yml
+#     vars:
+#       sync_field_name: "{{ some_field_name }}"
+#       sync_live_labels: "{{ my_labels }}"
+#       sync_eligible_prefixes: "{{ my_known_prefixes }}"
+#       sync_scanned_prefixes: "{{ my_scanned_prefixes }}"
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Resolve field ID"
+  ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+  vars:
+    resolve_field_name: "{{ sync_field_name }}"
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Set field ID fact"
+  ansible.builtin.set_fact:
+    sf_field_id: "{{ resolved_field_id }}"
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | List contexts"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/3/field/{{ sf_field_id }}/context"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: sf_field_contexts
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | FAIL if the field has no context at all"
+  ansible.builtin.fail:
+    msg: >-
+      '{{ sync_field_name }}' ({{ sf_field_id }}) has zero contexts. It may
+      not actually be a select-list field, or field config propagation
+      hasn't finished yet - re-check the field type in Jira admin.
+  when: sf_field_contexts.json['values'] | default([]) | length == 0
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Use the first context; WARN about any others"
+  ansible.builtin.set_fact:
+    sf_context: "{{ sf_field_contexts.json['values'][0].id }}"
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | WARN if the field has more than one context"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: '{{ sync_field_name }}' has {{ sf_field_contexts.json['values'] | length }}
+      contexts. Options are only being synced to context {{ sf_context }}
+      ({{ sf_field_contexts.json['values'][0].name | default('unnamed') }}).
+      Others ({{ sf_field_contexts.json['values'][1:] | map(attribute='id') | list | join(', ') }})
+      are untouched.
+  when: sf_field_contexts.json['values'] | length > 1
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Fetch existing options for this context"
+  ansible.builtin.uri:
+    url: >-
+      {{ jira_url }}/rest/api/3/field/{{ sf_field_id }}/context/{{ sf_context }}/option?maxResults=200
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: sf_existing_options
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | WARN if pagination truncated the option list"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: this field has {{ sf_existing_options.json['total'] }} options
+      total but only the first 200 were fetched - the diff below may be
+      incomplete.
+  when: sf_existing_options.json['total'] | default(0) > 200
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Build new-label and stale-candidate lists"
+  ansible.builtin.set_fact:
+    sf_new_labels: >-
+      {{
+        sync_live_labels
+        | difference(sf_existing_options.json['values'] | default([]) | map(attribute='value') | list)
+      }}
+    sf_stale_candidates: >-
+      {{
+        sf_existing_options.json['values'] | default([])
+        | rejectattr('value', 'in', sync_live_labels)
+        | rejectattr('disabled', 'equalto', true)
+        | list
+      }}
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Filter stale candidates down to ones eligible to disable"
+  ansible.builtin.set_fact:
+    sf_stale_options: []
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Determine eligible stale options"
+  ansible.builtin.set_fact:
+    sf_stale_options: "{{ sf_stale_options | default([]) + [item] }}"
+  loop: "{{ sf_stale_candidates }}"
+  loop_control:
+    label: "{{ item.value }}"
+  when: >-
+    (sync_eligible_prefixes | select('in', item.value) | list | length == 0)
+    or (sync_scanned_prefixes | select('in', item.value) | list | length > 0)
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Show stale candidates left untouched (not scanned this run)"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: '{{ item.value }}' looks stale but its prefix wasn't
+      successfully scanned this run - left untouched rather than risk
+      disabling a still-valid entry over a transient issue.
+  loop: "{{ sf_stale_candidates }}"
+  loop_control:
+    label: "{{ item.value }}"
+  when: >-
+    (sync_eligible_prefixes | select('in', item.value) | list | length > 0)
+    and (sync_scanned_prefixes | select('in', item.value) | list | length == 0)
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Create missing options in one batch call"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/3/field/{{ sf_field_id }}/context/{{ sf_context }}/option"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      options: "{{ sf_new_labels | map('community.general.dict_kv', 'value') | list }}"
+    status_code: 200
+  when: sf_new_labels | length > 0
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Disable stale options in one batch call"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/3/field/{{ sf_field_id }}/context/{{ sf_context }}/option"
+    method: PUT
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      options: "{{ sf_stale_options | map('combine', {'disabled': true}) | list }}"
+    status_code: 200
+  when: sf_stale_options | length > 0
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Show stale options that were disabled"
+  ansible.builtin.debug:
+    msg: "Disabled (no longer live): {{ item.value }}"
+  loop: "{{ sf_stale_options }}"
+  loop_control:
+    label: "{{ item.value }}"
+
+- name: "SYNC FIELD '{{ sync_field_name }}' | Summary"
+  ansible.builtin.debug:
+    msg:
+    - "  '{{ sync_field_name }}': {{ sf_new_labels | length }} created, {{ (sync_live_labels | length) - (sf_new_labels | length) }} already present, {{ sf_stale_options | length }} disabled"

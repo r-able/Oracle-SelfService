@@ -1,30 +1,17 @@
 ---
-# PRF_jira_performance_analysis_job.yml - included per issue by
-# PRF_jira_performance_analysis.yml
+# JIRA_PRF_performance_analysis_job.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
 #
-# Direct port of SNOW_PRF_performance_analysis_job.yml's Oracle-side logic,
-# with ServiceNow API calls swapped for Jira equivalents:
-#   work_notes PATCH        -> community.general.jira comment
-#   attachment/file POST    -> community.general.jira attach
-#   servicenow.itsm state   -> GET/POST transitions (COMMON_jira_shepherd
-#                              pattern: regex-match the target status name,
-#                              case-insensitive, then POST that transition id)
-#   COMMON_snow_create_followup.yml -> COMMON_jira_create_followup_task.yml
-
-- name: "JOB | {{ job.issue_key }} | Unknown host - skip this issue"
-  ansible.builtin.meta: end_host
-  when: job.target_host not in oracle_instance_map
-
-- name: "JOB | {{ job.issue_key }} | Resolve Oracle home/user from oracle_instance_map"
-  ansible.builtin.set_fact:
-    prf_oracle_home: "{{ oracle_instance_map[job.target_host].oracle_home }}"
-    prf_oracle_user: "{{ oracle_instance_map[job.target_host].oracle_user }}"
-    # job.oracle_sid is a PDB NAME (e.g. "UAT"), not a valid OS-level
-    # ORACLE_SID - AWR/DBA_HIST views are CDB-root-level structures, so the
-    # actual connection always uses the real CDB instance SID. The PDB name
-    # is used separately below to filter results (CON_ID) and to switch
-    # container for the tuning advisor specifically.
-    prf_cdb_sid: "{{ oracle_instance_map[job.target_host].oracle_sid }}"
+# Ported from SNOW_PRF_performance_analysis_job.yml - the Oracle-side logic
+# (snapshot resolution, AWR report, top-5 CPU SQL query, SQL Tuning
+# Advisor) is unchanged. Only the evidence delivery and outcome-posting are
+# Jira-native: real file attachments (fetched from the target host, then
+# uploaded via Jira's multipart attachment endpoint) instead of ServiceNow
+# attachment API calls, and a Jira comment instead of a work note.
+#
+# Included per job by JIRA_PRF_performance_analysis.yml. Loop variable:
+# `job` (issue_key, target_host, oracle_sid [PDB name], oracle_home,
+#  oracle_user, cdb_sid, start_dt, end_dt).
 
 - name: "JOB | {{ job.issue_key }} | Set per-job facts"
   ansible.builtin.set_fact:
@@ -33,8 +20,9 @@
     prf_success: true
     prf_fail_reason: ""
     prf_top_sql: []
+    prf_recommendations: []
 
-- name: "JOB | {{ job.issue_key }} | Comment: analysis started"
+- name: "JOB | {{ job.issue_key }} | Post 'analysis started' comment"
   community.general.jira:
     uri: "{{ jira_url }}"
     username: "{{ jira_user }}"
@@ -42,14 +30,15 @@
     operation: comment
     issue: "{{ job.issue_key }}"
     comment: >-
-      PRF: AWR performance analysis started for {{ job.oracle_sid }} on {{ job.target_host }}, issue period {{ job.start_dt }} -> {{ job.end_dt }}.
+      PRF: AWR performance analysis started for {{ job.oracle_sid }} on
+      {{ job.target_host }}, issue period {{ job.start_dt }} -> {{ job.end_dt }}.
     cloud: "{{ jira_cloud }}"
-  ignore_errors: true
+  failed_when: false
 
 # -----------------------------------------------------------------
-# Working directory - leaf directory must be world-writable (0777) for
-# oracle to create files in it; the base directory must exist too, since
-# every ancestor needs traversal permission.
+# Working directory - the leaf directory must be world-writable (0777) for
+# oracle to create files in it, and the base directory must exist too,
+# since every ancestor needs traversal permission.
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Ensure base working directory exists"
   ansible.builtin.file:
@@ -57,6 +46,7 @@
     state: directory
     mode: '0755'
   delegate_to: "{{ job.target_host }}"
+  become: true
 
 - name: "JOB | {{ job.issue_key }} | Ensure per-job working directory exists and is writable"
   ansible.builtin.file:
@@ -64,11 +54,13 @@
     state: directory
     mode: '0777'
   delegate_to: "{{ job.target_host }}"
+  become: true
 
 # -----------------------------------------------------------------
-# 0. Resolve the user-given start/end date-time into the bracketing AWR
+# 0. Resolve the given start/end date-time into the bracketing AWR
 #    snapshot IDs. begin_snap = last snapshot AT OR BEFORE the start time;
-#    end_snap = first snapshot AT OR AFTER the end time.
+#    end_snap = first snapshot AT OR AFTER the end time, so the resolved
+#    range fully brackets the requested period.
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Write snapshot-resolution SQL"
   ansible.builtin.copy:
@@ -87,6 +79,7 @@
         AND dbid = (SELECT dbid FROM v$database);
       EXIT;
   delegate_to: "{{ job.target_host }}"
+  become: true
 
 - name: "JOB | {{ job.issue_key }} | Write snapshot-resolution wrapper (explicit ORACLE_SID export)"
   ansible.builtin.copy:
@@ -94,17 +87,18 @@
     mode: '0755'
     content: |
       #!/bin/bash
-      export ORACLE_SID={{ prf_cdb_sid }}
-      export ORACLE_HOME={{ prf_oracle_home }}
+      export ORACLE_SID={{ job.cdb_sid }}
+      export ORACLE_HOME={{ job.oracle_home }}
       export PATH=$ORACLE_HOME/bin:$PATH
       "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/resolve_snapshots.sql
   delegate_to: "{{ job.target_host }}"
+  become: true
 
 - name: "JOB | {{ job.issue_key }} | Resolve snapshot IDs as oracle"
   ansible.builtin.command: "bash {{ prf_work_dir }}/run_resolve_snapshots.sh"
   delegate_to: "{{ job.target_host }}"
   become: true
-  become_user: "{{ prf_oracle_user }}"
+  become_user: "{{ job.oracle_user }}"
   register: prf_resolve_exec
   failed_when: false
   changed_when: false
@@ -120,7 +114,7 @@
   ansible.builtin.set_fact:
     prf_success: false
     prf_fail_reason: >-
-      Could not find AWR snapshots covering {{ job.start_dt }} -> {{ job.end_dt }} for {{ job.oracle_sid }} on {{ job.target_host }} (rc={{ prf_resolve_exec.rc }}, begin_snap={{ prf_begin_snap }}, end_snap={{ prf_end_snap }}). This usually means the requested time period is outside the AWR retention window, or no snapshots exist yet for that period. Raw output: {{ (prf_resolve_exec.stdout | default('')) | truncate(1000) }} {{ (prf_resolve_exec.stderr | default('')) | truncate(500) }}
+      Could not find AWR snapshots covering {{ job.start_dt }} -> {{ job.end_dt }} for {{ job.oracle_sid }} on {{ job.target_host }} (rc={{ prf_resolve_exec.rc }}, begin_snap={{ prf_begin_snap }}, end_snap={{ prf_end_snap }}). This usually means the requested time period is outside the AWR retention window, no snapshots exist yet for that period, or the Jira Date Time Picker's timezone doesn't match the Oracle server's (see the TIMEZONE CAVEAT in JIRA_PRF_performance_analysis.yml). Raw output: {{ (prf_resolve_exec.stdout | default('')) | truncate(1000) }} {{ (prf_resolve_exec.stderr | default('')) | truncate(500) }}
   when: >-
     prf_resolve_exec.rc != 0 or prf_begin_snap == 'NONE' or prf_end_snap == 'NONE' or prf_begin_snap | length == 0 or prf_end_snap | length == 0
 
@@ -130,7 +124,8 @@
   when: prf_success
 
 # -----------------------------------------------------------------
-# 1. AWR text report - human-readable evidence, attached as-is.
+# 1. AWR text report - human-readable evidence, attached as-is. DBID and
+#    instance_number are looked up dynamically rather than assumed.
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Write AWR report SQL"
   ansible.builtin.copy:
@@ -158,11 +153,12 @@
       SPOOL OFF
       EXIT;
   delegate_to: "{{ job.target_host }}"
+  become: true
   when: prf_success
 
 # -----------------------------------------------------------------
-# 2. Top-5 CPU SQL_IDs - queried directly from DBA_HIST_SQLSTAT, CON_ID-
-#    filtered to the target PDB.
+# 2. Top-5 CPU SQL_IDs - queried directly from DBA_HIST_SQLSTAT rather
+#    than parsed out of the AWR report text (far more reliable).
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Re-ensure working directory exists (defensive)"
   ansible.builtin.file:
@@ -170,6 +166,7 @@
     state: directory
     mode: '0777'
   delegate_to: "{{ job.target_host }}"
+  become: true
 
 - name: "JOB | {{ job.issue_key }} | Write top-5 CPU SQL_ID query"
   ansible.builtin.copy:
@@ -190,6 +187,7 @@
       WHERE ROWNUM <= 5;
       EXIT;
   delegate_to: "{{ job.target_host }}"
+  become: true
   when: prf_success
 
 - name: "JOB | {{ job.issue_key }} | Write execution wrapper (explicit ORACLE_SID export)"
@@ -198,19 +196,20 @@
     mode: '0755'
     content: |
       #!/bin/bash
-      export ORACLE_SID={{ prf_cdb_sid }}
-      export ORACLE_HOME={{ prf_oracle_home }}
+      export ORACLE_SID={{ job.cdb_sid }}
+      export ORACLE_HOME={{ job.oracle_home }}
       export PATH=$ORACLE_HOME/bin:$PATH
       "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/awr_report.sql
       "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @{{ prf_work_dir }}/top5.sql
   delegate_to: "{{ job.target_host }}"
+  become: true
   when: prf_success
 
 - name: "JOB | {{ job.issue_key }} | Run AWR report + top-5 query as oracle"
   ansible.builtin.command: "bash {{ prf_work_dir }}/run_awr_and_top5.sh"
   delegate_to: "{{ job.target_host }}"
   become: true
-  become_user: "{{ prf_oracle_user }}"
+  become_user: "{{ job.oracle_user }}"
   register: prf_top5_exec
   failed_when: false
   changed_when: true
@@ -257,6 +256,7 @@
       state: directory
       mode: '0777'
     delegate_to: "{{ job.target_host }}"
+    become: true
 
   - name: "JOB | {{ job.issue_key }} | Write tuning advisor script for {{ item.sql_id }}"
     ansible.builtin.copy:
@@ -272,12 +272,10 @@
         SET ECHO OFF
         SPOOL {{ prf_work_dir }}/tune_{{ item.sql_id }}.log
         WHENEVER SQLERROR CONTINUE
-        -- Connected to the CDB root (ORACLE_SID={{ prf_cdb_sid }}) - switch
+        -- Connected to the CDB root (ORACLE_SID={{ job.cdb_sid }}) - switch
         -- into the target PDB's container, since the SQL Tuning Advisor
         -- needs to run in the same container the SQL actually executed in.
         ALTER SESSION SET CONTAINER = {{ job.oracle_sid }};
-        -- Drop any stale task from a previous run of this same issue;
-        -- ignore the error if it does not exist yet.
         BEGIN
           DBMS_SQLTUNE.drop_tuning_task(task_name => 'PRF_{{ item.sql_id }}_{{ job.issue_key }}');
         EXCEPTION WHEN OTHERS THEN NULL;
@@ -298,16 +296,17 @@
         SPOOL OFF
         EXIT;
     delegate_to: "{{ job.target_host }}"
+    become: true
     loop: "{{ prf_top_sql }}"
     loop_control:
       label: "{{ item.sql_id }}"
 
   - name: "JOB | {{ job.issue_key }} | Execute tuning advisor for {{ item.sql_id }}"
     ansible.builtin.command: >-
-      bash -c "export ORACLE_SID={{ prf_cdb_sid }}; export ORACLE_HOME={{ prf_oracle_home }}; export PATH=$ORACLE_HOME/bin:$PATH; \"$ORACLE_HOME/bin/sqlplus\" -S / AS SYSDBA @{{ prf_work_dir }}/tune_{{ item.sql_id }}.sql"
+      bash -c "export ORACLE_SID={{ job.cdb_sid }}; export ORACLE_HOME={{ job.oracle_home }}; export PATH=$ORACLE_HOME/bin:$PATH; \"$ORACLE_HOME/bin/sqlplus\" -S / AS SYSDBA @{{ prf_work_dir }}/tune_{{ item.sql_id }}.sql"
     delegate_to: "{{ job.target_host }}"
     become: true
-    become_user: "{{ prf_oracle_user }}"
+    become_user: "{{ job.oracle_user }}"
     loop: "{{ prf_top_sql }}"
     loop_control:
       label: "{{ item.sql_id }}"
@@ -319,6 +318,7 @@
     ansible.builtin.slurp:
       src: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.log"
     delegate_to: "{{ job.target_host }}"
+    become: true
     loop: "{{ prf_top_sql }}"
     loop_control:
       label: "{{ item.sql_id }}"
@@ -331,7 +331,6 @@
         {{ prf_recommendations | default([]) + [ {
              'sql_id':     prf_top_sql[idx].sql_id,
              'cpu_secs':   prf_top_sql[idx].cpu_secs,
-             'report_text': (prf_tune_logs.results[idx].content | default('') | b64decode),
              'flag': (
                'SQL Profile suggested'
                if 'ACCEPT_SQL_PROFILE' in (prf_tune_logs.results[idx].content | default('') | b64decode).upper()
@@ -346,47 +345,87 @@
       index_var: idx
       label: "{{ item.sql_id }}"
 
-- name: "JOB | {{ job.issue_key }} | Determine outcome when tuning step was skipped"
+- name: "JOB | {{ job.issue_key }} | Ensure recommendations list is set when the tuning step was skipped"
   ansible.builtin.set_fact:
     prf_recommendations: []
   when: not prf_success
 
 # -----------------------------------------------------------------
-# 4. Attach evidence (AWR report + every tuning report) to the issue
+# 4. Fetch evidence files back to the controller, then upload as REAL Jira
+#    attachments via the multipart endpoint (not embedded in a comment -
+#    these files can be 50-200KB+, larger than is sensible for a comment).
 # -----------------------------------------------------------------
-- name: "JOB | {{ job.issue_key }} | Attach AWR report to the issue"
-  community.general.jira:
-    uri: "{{ jira_url }}"
-    username: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    operation: attach
-    issue: "{{ job.issue_key }}"
-    attachment:
-      filename: "{{ prf_work_dir }}/awr_report.log"
-    cloud: "{{ jira_cloud }}"
+- name: "JOB | {{ job.issue_key }} | Ensure local staging directory exists"
+  ansible.builtin.file:
+    path: "{{ prf_local_staging }}"
+    state: directory
+    mode: '0750'
+  when: prf_success
+
+- name: "JOB | {{ job.issue_key }} | Fetch AWR report to the controller"
+  ansible.builtin.fetch:
+    src: "{{ prf_work_dir }}/awr_report.log"
+    dest: "{{ prf_local_staging }}/{{ job.issue_key }}_awr_report.log"
+    flat: true
   delegate_to: "{{ job.target_host }}"
   when: prf_success
-  ignore_errors: true
+  failed_when: false
 
-- name: "JOB | {{ job.issue_key }} | Attach each tuning report to the issue"
-  community.general.jira:
-    uri: "{{ jira_url }}"
-    username: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    operation: attach
-    issue: "{{ job.issue_key }}"
-    attachment:
-      filename: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.log"
-    cloud: "{{ jira_cloud }}"
+- name: "JOB | {{ job.issue_key }} | Fetch each tuning report to the controller"
+  ansible.builtin.fetch:
+    src: "{{ prf_work_dir }}/tune_{{ item.sql_id }}.log"
+    dest: "{{ prf_local_staging }}/{{ job.issue_key }}_tune_{{ item.sql_id }}.log"
+    flat: true
   delegate_to: "{{ job.target_host }}"
   loop: "{{ prf_top_sql }}"
   loop_control:
     label: "{{ item.sql_id }}"
   when: prf_success
-  ignore_errors: true
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Upload AWR report as a real Jira attachment"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/attachments"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    headers:
+      X-Atlassian-Token: "no-check"
+    body_format: form-multipart
+    body:
+      file:
+        filename: "PRF_{{ job.issue_key }}_awr_report.log"
+        mime_type: "text/plain"
+        content: "{{ lookup('file', prf_local_staging + '/' + job.issue_key + '_awr_report.log') }}"
+    status_code: 200
+  when: prf_success
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Upload each tuning report as a real Jira attachment"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/attachments"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    headers:
+      X-Atlassian-Token: "no-check"
+    body_format: form-multipart
+    body:
+      file:
+        filename: "PRF_{{ job.issue_key }}_tune_{{ item.sql_id }}.log"
+        mime_type: "text/plain"
+        content: "{{ lookup('file', prf_local_staging + '/' + job.issue_key + '_tune_' + item.sql_id + '.log') }}"
+    status_code: 200
+  loop: "{{ prf_top_sql }}"
+  loop_control:
+    label: "{{ item.sql_id }}"
+  when: prf_success
+  failed_when: false
 
 # -----------------------------------------------------------------
-# 5. Comment + transition the analysis issue
+# 5. Comment + close the analysis issue
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Post analysis summary comment"
   community.general.jira:
@@ -395,146 +434,89 @@
     password: "{{ jira_api_token }}"
     operation: comment
     issue: "{{ job.issue_key }}"
-    comment: |
-      *PRF analysis {{ 'COMPLETE' if prf_success else 'FAILED' }} for {{ job.oracle_sid }} on {{ job.target_host }}.*
+    comment: |-
+      PRF analysis {{ 'COMPLETE' if prf_success else 'FAILED' }} for {{ job.oracle_sid }} on {{ job.target_host }}.
       {% if prf_success %}
       Top CPU-consuming SQL for issue period {{ job.start_dt }} -> {{ job.end_dt }}
       (AWR snapshots {{ prf_begin_snap }} -> {{ prf_end_snap }}):
       {% for r in prf_recommendations %}
-      * SQL_ID {{ r.sql_id }} - {{ r.cpu_secs }}s CPU - {{ r.flag }}
+      - SQL_ID {{ r.sql_id }} - {{ r.cpu_secs }}s CPU - {{ r.flag }}
       {% endfor %}
 
-      Full AWR report and per-SQL_ID tuning advisor reports are attached.
-      A separate follow-up task is being opened for the DBA team to
-      review these recommendations and implement any fix, subject to
-      your normal approval process. Ansible has NOT modified the
+      Full AWR report and per-SQL_ID tuning advisor reports are attached to
+      this issue. A separate follow-up issue is being opened for the DBA
+      team to review these recommendations and implement any fix, subject
+      to your normal approval process. Ansible has NOT modified the
       database - execute_tuning_task only produces advice.
       {% else %}
       {{ prf_fail_reason }}
       {% endif %}
     cloud: "{{ jira_cloud }}"
   failed_when: false
-  ignore_errors: true
-
-- name: "JOB | {{ job.issue_key }} | Get available transitions for DONE"
-  ansible.builtin.uri:
-    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
-    method: GET
-    user: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    force_basic_auth: true
-    return_content: true
-    status_code: 200
-  register: prf_done_transitions
-  when: prf_success
-  failed_when: false
-
-- name: "JOB | {{ job.issue_key }} | Transition to '{{ jira_status_done }}'"
-  ansible.builtin.uri:
-    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
-    method: POST
-    user: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    force_basic_auth: true
-    body_format: json
-    body:
-      transition:
-        id: "{{ tr_match.id }}"
-    status_code: 204
-  vars:
-    tr_all: "{{ prf_done_transitions.json.transitions | default([]) }}"
-    tr_match: >-
-      {{
-        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
-         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
-        | first | default({})
-      }}
-  when:
-  - prf_success
-  - tr_match.id is defined
-  failed_when: false
-
-- name: "JOB | {{ job.issue_key }} | WARN when no '{{ jira_status_done }}' transition is available"
-  ansible.builtin.debug:
-    msg: >-
-      WARNING: {{ job.issue_key }} could NOT be transitioned to '{{ jira_status_done }}'. Set jira_status_done in vars/main.yml to a real workflow status.
-  vars:
-    tr_all: "{{ prf_done_transitions.json.transitions | default([]) }}"
-    tr_match: >-
-      {{
-        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list)
-         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_done | regex_escape) + '$') | list))
-        | first | default({})
-      }}
-  when:
-  - prf_success
-  - tr_match.id is not defined
-
-- name: "JOB | {{ job.issue_key }} | Get available transitions for FAILED"
-  ansible.builtin.uri:
-    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
-    method: GET
-    user: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    force_basic_auth: true
-    return_content: true
-    status_code: 200
-  register: prf_failed_transitions
-  when: not prf_success
-  failed_when: false
-
-- name: "JOB | {{ job.issue_key }} | Transition to '{{ jira_status_failed }}'"
-  ansible.builtin.uri:
-    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
-    method: POST
-    user: "{{ jira_user }}"
-    password: "{{ jira_api_token }}"
-    force_basic_auth: true
-    body_format: json
-    body:
-      transition:
-        id: "{{ tr_match.id }}"
-    status_code: 204
-  vars:
-    tr_all: "{{ prf_failed_transitions.json.transitions | default([]) }}"
-    tr_match: >-
-      {{
-        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
-         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
-        | first | default({})
-      }}
-  when:
-  - not prf_success
-  - tr_match.id is defined
-  failed_when: false
-
-- name: "JOB | {{ job.issue_key }} | WARN when no '{{ jira_status_failed }}' transition is available"
-  ansible.builtin.debug:
-    msg: >-
-      WARNING: {{ job.issue_key }} could NOT be transitioned to '{{ jira_status_failed }}'. Set jira_status_failed in vars/main.yml to a real workflow status.
-  vars:
-    tr_all: "{{ prf_failed_transitions.json.transitions | default([]) }}"
-    tr_match: >-
-      {{
-        ((tr_all | selectattr('to.name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list)
-         + (tr_all | selectattr('name', 'match', '(?i)^' + (jira_status_failed | regex_escape) + '$') | list))
-        | first | default({})
-      }}
-  when:
-  - not prf_success
-  - tr_match.id is not defined
 
 # -----------------------------------------------------------------
-# 6. Follow-up task - ALWAYS opened when the analysis found at least one
-#    SQL_ID. On genuine total failure, this is a repair request instead
-#    of an implementation request.
+# 6. Transition the issue based on outcome
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Get available transitions"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
+    method: GET
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    return_content: true
+    status_code: 200
+  register: prf_transitions
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Apply the outcome transition"
+  ansible.builtin.uri:
+    url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/transitions"
+    method: POST
+    user: "{{ jira_user }}"
+    password: "{{ jira_api_token }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      transition:
+        id: >-
+          {{
+            (prf_transitions.json.transitions | selectattr('to.name', 'equalto', target_status) | map(attribute='id') | list
+             + prf_transitions.json.transitions | selectattr('name', 'equalto', target_status) | map(attribute='id') | list) | first
+          }}
+    status_code: 204
+  vars:
+    target_status: "{{ jira_status_done if prf_success else jira_status_failed }}"
+  when:
+  - prf_transitions is success
+  - (prf_transitions.json.transitions | selectattr('to.name', 'equalto', target_status) | list
+     + prf_transitions.json.transitions | selectattr('name', 'equalto', target_status) | list) | length > 0
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | WARN when the expected transition is unavailable"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ job.issue_key }} finished as {{ 'DONE' if prf_success else 'FAILED' }}
+      but could NOT be transitioned to '{{ target_status }}' -- the workflow
+      only offers: {{ prf_transitions.json.transitions | default([]) | map(attribute='name') | list | join(', ') }}.
+  vars:
+    target_status: "{{ jira_status_done if prf_success else jira_status_failed }}"
+  when:
+  - prf_transitions is success
+  - (prf_transitions.json.transitions | selectattr('to.name', 'equalto', target_status) | list
+     + prf_transitions.json.transitions | selectattr('name', 'equalto', target_status) | list) | length == 0
+
+# -----------------------------------------------------------------
+# 7. Follow-up issue - ALWAYS opened when at least one recommendation was
+#    found (Ansible never applies these itself), or a DBA repair follow-up
+#    on total analysis failure.
 # -----------------------------------------------------------------
 - name: "JOB | {{ job.issue_key }} | Open follow-up task for the DBA team to implement fixes"
   ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
   when: prf_success and prf_recommendations | length > 0
   vars:
     fu_original_key: "{{ job.issue_key }}"
-    fu_summary: "implement performance recommendations for {{ job.oracle_sid }} on {{ job.target_host }}"
+    fu_summary: "Implement performance recommendations for {{ job.oracle_sid }} on {{ job.target_host }}"
     fu_description: |-
       AWR performance analysis for {{ job.oracle_sid }} on {{ job.target_host }}
       (issue period {{ job.start_dt }} -> {{ job.end_dt }}) identified the
@@ -547,8 +529,8 @@
       SQL_ID {{ r.sql_id }} - {{ r.cpu_secs }}s CPU - {{ r.flag }}
       {% endfor %}
 
-      Full tuning advisor output for each SQL_ID is attached to this task.
-      See also the original analysis issue {{ job.issue_key }} for the AWR
+      Full tuning advisor output for each SQL_ID is attached to the
+      original analysis issue {{ job.issue_key }}, along with the AWR
       report and full automation history.
 
 - name: "JOB | {{ job.issue_key }} | Open DBA repair follow-up on total analysis failure"
@@ -559,9 +541,28 @@
     fu_summary: "PRF analysis failed for {{ job.oracle_sid }} on {{ job.target_host }}"
     fu_description: "{{ prf_fail_reason }}"
 
-- name: "JOB | {{ job.issue_key }} | Clean up temp files"
+# -----------------------------------------------------------------
+# 8. Cleanup
+# -----------------------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Clean up remote temp files"
   ansible.builtin.file:
     path: "{{ prf_work_dir }}"
     state: absent
   delegate_to: "{{ job.target_host }}"
+  become: true
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Clean up local AWR staging file"
+  ansible.builtin.file:
+    path: "{{ prf_local_staging }}/{{ job.issue_key }}_awr_report.log"
+    state: absent
+  failed_when: false
+
+- name: "JOB | {{ job.issue_key }} | Clean up local tuning-report staging files"
+  ansible.builtin.file:
+    path: "{{ prf_local_staging }}/{{ job.issue_key }}_tune_{{ item.sql_id }}.log"
+    state: absent
+  loop: "{{ prf_top_sql }}"
+  loop_control:
+    label: "{{ item.sql_id }}"
   failed_when: false

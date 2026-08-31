@@ -1,0 +1,108 @@
+---
+# =============================================================================
+# JIRA_sync_oracle_hosts.yml
+#
+# Syncs one entry per HOST (not per PDB) into the "Target Host & Container
+# (CDB)" Jira field used by PDB - e.g. "lnx001:CDB1", "lnx002:PERF". This is
+# the host/CDB-level counterpart to JIRA_sync_oracle_targets.yml (PDB-level)
+# and JIRA_sync_oracle_schemas.yml (schema-level): PDB creates a NEW
+# pluggable database inside a whole Oracle home, so its dropdown needs the
+# CONTAINER identity, not one of the individual PDBs already inside it.
+# Mirrors SNOW_sync_oracle_hosts.yml.
+#
+# GENUINELY SIMPLER than the other two sync playbooks: the host->SID mapping
+# already exists statically in oracle_instance_map (vars/main.yml) - there is
+# no need to connect to any remote host or run any SQL at all. This just
+# reads a local var and syncs it via COMMON_jira_sync_field_options.yml.
+#
+# ALWAYS SAFE TO FULLY REFRESH: unlike the PDB/schema syncs (which query
+# LIVE hosts that can be transiently unreachable, so stale-option pruning
+# has to be careful not to punish a connectivity blip), this dataset's
+# source of truth is the oracle_instance_map var itself - if a host is in
+# the var, it's "known", full stop. There's no partial-scan scenario to
+# protect against, so every configured host is always both "eligible" and
+# "scanned" for staleness purposes.
+#
+# Given how small and static this dataset genuinely is (adding a host means
+# editing oracle_instance_map by hand anyway), a light schedule is plenty -
+# every 15-30 minutes, or even just run manually after adding a new host to
+# oracle_instance_map. There's no live infrastructure state to fall behind on.
+#
+# Required vars (vars/main.yml):
+#   jira_host_field_names : ["Target Host & Container (CDB)"]
+#                            # every Jira field that should show this host:CDB list
+#   oracle_instance_map    : (already defined - host -> oracle_home/sid/user)
+#
+# Usage:
+#   ansible-playbook JIRA_sync_oracle_hosts.yml --ask-vault-pass
+# =============================================================================
+
+- name: Sync host-level Oracle targets into every configured Jira host-picker field
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  - name: Nothing to sync
+    ansible.builtin.meta: end_play
+    when: oracle_instance_map | default({}) | length == 0
+
+  - name: "Build host entries with label directly from oracle_instance_map"
+    ansible.builtin.set_fact:
+      sync_host_entries: >-
+        {{
+          sync_host_entries | default([]) + [ {
+            'host': item,
+            'oracle_sid': oracle_instance_map[item].oracle_sid,
+            'label': item ~ ':' ~ oracle_instance_map[item].oracle_sid
+          } ]
+        }}
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: Show hosts to sync
+    ansible.builtin.debug:
+      msg: "{{ sync_host_entries | map(attribute='label') | list }}"
+
+  # Every configured host is always "known" and always "scanned" - the data
+  # comes from a local var, not a live connection that can partially fail.
+  - name: "Sync live hosts into every configured host-picker field"
+    ansible.builtin.include_tasks: COMMON_jira_sync_field_options.yml
+    loop: "{{ jira_host_field_names }}"
+    loop_control:
+      loop_var: sync_field_name
+    vars:
+      sync_live_labels: "{{ sync_host_entries | map(attribute='label') | list }}"
+      sync_eligible_prefixes: "{{ oracle_instance_map.keys() | list | map('regex_replace', '$', ':') | list }}"
+      sync_scanned_prefixes: "{{ oracle_instance_map.keys() | list | map('regex_replace', '$', ':') | list }}"
+
+  - name: Final summary
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira oracle_hosts sync summary"
+      - "======================================================"
+      - "  Fields synced : {{ jira_host_field_names | join(', ') }}"
+      - "  Hosts synced  : {{ sync_host_entries | length }}"
+      - "  (per-field created/present/disabled counts are printed above, per field)"
+      - "======================================================"

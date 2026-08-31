@@ -1,0 +1,316 @@
+---
+# =============================================================================
+# JIRA_sync_oracle_schemas.yml
+#
+# Syncs REAL, non-system schemas within each known host:PDB combination into
+# TWO Jira global fields - "Source Schema" and "Target Schema" (both used by
+# the rebuilt REF project). Schema-level companion to
+# JIRA_sync_oracle_targets.yml, mirroring SNOW_sync_oracle_schemas.yml's
+# discovery logic (dba_users WHERE oracle_maintained = 'N').
+#
+# WHY oracle_maintained = 'N': rather than maintain a hardcoded list of
+# Oracle's dozens of built-in system schemas (SYS, SYSTEM, XDB, APPQOSSYS,
+# OUTLN, and many more, which also varies somewhat by installed features),
+# dba_users has a column Oracle itself uses to mark exactly this distinction
+# - real, user-created schemas vs. Oracle-supplied ones.
+#
+# FLAT LABELS, NOT CASCADING: unlike ServiceNow's u_oracle_schema (which
+# uses a Reference field with a qualifier to filter schemas by the
+# already-chosen host:PDB), Jira's plain global select-list fields cannot
+# cascade off another field's value without Jira Automation or a Forge/
+# Marketplace app. Every schema across every host:PDB is shown in one flat
+# list, fully-qualified as "host:PDB:schema" (e.g. "lnx001:UAT:HR") so it's
+# still unambiguous which database each schema belongs to - this matches
+# the same flat-label approach PAT's host picker already uses.
+#
+# DISCOVERY SCOPE: rediscovers the live host:PDB list itself (same PDB
+# query as JIRA_sync_oracle_targets.yml) rather than reading it back from
+# any Jira field's current options, so this playbook has no dependency on
+# JIRA_sync_oracle_targets.yml having run first or on any particular
+# field's state - it always reflects live Oracle reality independently.
+#
+# IDEMPOTENT + SAFE PRUNING: same pattern as JIRA_sync_oracle_targets.yml,
+# via COMMON_jira_sync_field_options.yml - a schema whose host:PDB wasn't
+# successfully scanned this run keeps its existing options untouched rather
+# than being wiped, and only genuinely-vanished schemas (their host:PDB WAS
+# scanned, they're just not in dba_users anymore) get disabled.
+#
+# Required vars (vars/main.yml):
+#   jira_schema_field_names : ["Source Schema", "Target Schema"]
+#                              # every Jira field that should show this schema list
+#   oracle_instance_map      : (already defined - host -> oracle_home/sid/user)
+#
+# Usage:
+#   ansible-playbook JIRA_sync_oracle_schemas.yml --ask-vault-pass
+# =============================================================================
+
+- name: Sync live per-PDB schemas into every configured Jira schema-picker field
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+  - vars/main.yml
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # -----------------------------------------------------------------
+  # Step 1: discover the live host:PDB list (identical logic to
+  # JIRA_sync_oracle_targets.yml's PDB discovery - kept independent here
+  # deliberately, see header note on why this doesn't read it back from Jira)
+  # -----------------------------------------------------------------
+  - name: "Ensure temp working dir exists on each host"
+    ansible.builtin.file:
+      path: "/tmp/jira_sync_oracle_schemas"
+      state: directory
+      mode: '0777'
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Write PDB discovery SQL for each host"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_schemas/list_pdbs.sql"
+      mode: '0644'
+      content: |
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SELECT name FROM v$pdbs
+        WHERE name != 'PDB$SEED'
+          AND open_mode = 'READ WRITE'
+        ORDER BY name;
+        EXIT;
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Write PDB-discovery execution wrapper for each host"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_schemas/run_list_pdbs.sh"
+      mode: '0755'
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ oracle_instance_map[item].oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[item].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @/tmp/jira_sync_oracle_schemas/list_pdbs.sql
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+
+  - name: "Run PDB discovery on each host as oracle"
+    ansible.builtin.command: "bash /tmp/jira_sync_oracle_schemas/run_list_pdbs.sh"
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    become: true
+    become_user: "{{ oracle_instance_map[item].oracle_user }}"
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+    register: sync_pdb_exec
+    failed_when: false
+    changed_when: false
+
+  - name: "Clean discovered PDB names (drop any blank/invalid lines)"
+    ansible.builtin.set_fact:
+      sync_pdb_clean: >-
+        {{ sync_pdb_clean | default([]) + [ {
+             'host': item.item,
+             'stdout_lines': item.stdout_lines | default([]) | select('match', '^[A-Za-z0-9_$]+$') | list
+           } ] }}
+    loop: "{{ sync_pdb_exec.results }}"
+    loop_control:
+      label: "{{ item.item }}"
+    when: item.unreachable | default(false) == false
+
+  - name: "Build known_targets from discovered PDBs (one entry per host:PDB)"
+    ansible.builtin.set_fact:
+      known_targets: >-
+        {{ known_targets | default([]) + [ {
+             'host': item.0.host,
+             'sid': item.1
+           } ] }}
+    loop: "{{ sync_pdb_clean | default([]) | subelements('stdout_lines', skip_missing=True) }}"
+    loop_control:
+      label: "{{ item.0.host }}:{{ item.1 }}"
+
+  - name: Nothing to scan for schemas
+    ansible.builtin.meta: end_play
+    when: known_targets | default([]) | length == 0
+
+  # -----------------------------------------------------------------
+  # Step 2: for each known host:PDB, discover real (non-system) schemas
+  # via dba_users, connecting inside that specific PDB's container.
+  # -----------------------------------------------------------------
+  - name: "Write schema discovery SQL for each host:PDB"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_schemas/list_schemas_{{ item.sid }}.sql"
+      mode: '0644'
+      content: |
+        SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF ECHO OFF LINESIZE 200 TRIMSPOOL ON
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        ALTER SESSION SET CONTAINER = {{ item.sid }};
+        SELECT username FROM dba_users
+        WHERE oracle_maintained = 'N'
+        ORDER BY username;
+        EXIT;
+    delegate_to: "{{ item.host }}"
+    ignore_unreachable: true
+    loop: "{{ known_targets }}"
+    loop_control:
+      label: "{{ item.host }}:{{ item.sid }}"
+
+  - name: "Write schema-discovery execution wrapper for each host:PDB"
+    ansible.builtin.copy:
+      dest: "/tmp/jira_sync_oracle_schemas/run_{{ item.sid }}.sh"
+      mode: '0755'
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ oracle_instance_map[item.host].oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[item.host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        "$ORACLE_HOME/bin/sqlplus" -S / AS SYSDBA @/tmp/jira_sync_oracle_schemas/list_schemas_{{ item.sid }}.sql
+    delegate_to: "{{ item.host }}"
+    ignore_unreachable: true
+    loop: "{{ known_targets }}"
+    loop_control:
+      label: "{{ item.host }}:{{ item.sid }}"
+
+  - name: "Run schema discovery for each host:PDB as oracle"
+    ansible.builtin.command: "bash /tmp/jira_sync_oracle_schemas/run_{{ item.sid }}.sh"
+    delegate_to: "{{ item.host }}"
+    ignore_unreachable: true
+    become: true
+    become_user: "{{ oracle_instance_map[item.host].oracle_user }}"
+    loop: "{{ known_targets }}"
+    loop_control:
+      label: "{{ item.host }}:{{ item.sid }}"
+    register: sync_schema_exec
+    failed_when: false
+    changed_when: false
+
+  - name: "WARN about any host:PDB where schema discovery failed or was unreachable"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: could not list schemas for {{ item.item.host }}:{{ item.item.sid }}
+        ({{ 'unreachable' if item.unreachable | default(false) else 'rc=' + (item.rc | default('n/a') | string) }}).
+        This host:PDB contributes ZERO schema entries this run - its
+        existing schema options are left untouched.
+        stderr: {{ item.stderr | default('') | truncate(300) }}
+    loop: "{{ sync_schema_exec.results }}"
+    loop_control:
+      label: "{{ item.item.host }}:{{ item.item.sid }}"
+    when: item.unreachable | default(false) or item.rc | default(1) != 0
+
+  - name: "Build list of successfully-scanned host:PDB prefixes (safe to disable stale schemas for)"
+    ansible.builtin.set_fact:
+      sync_scanned_target_prefixes: []
+
+  - name: "Add each successfully-scanned host:PDB to the eligible-prefix list"
+    ansible.builtin.set_fact:
+      sync_scanned_target_prefixes: >-
+        {{ sync_scanned_target_prefixes | default([]) + [ item.item.host ~ ':' ~ item.item.sid ~ ':' ] }}
+    loop: "{{ sync_schema_exec.results }}"
+    loop_control:
+      label: "{{ item.item.host }}:{{ item.item.sid }}"
+    when:
+    - item.unreachable | default(false) == false
+    - item.rc | default(1) == 0
+
+  - name: "Clean discovered schema names (drop any blank/invalid lines)"
+    ansible.builtin.set_fact:
+      sync_schema_clean: >-
+        {{ sync_schema_clean | default([]) + [ {
+             'host': item.item.host,
+             'sid': item.item.sid,
+             'stdout_lines': item.stdout_lines | default([]) | select('match', '^[A-Za-z0-9_$#]+$') | list
+           } ] }}
+    loop: "{{ sync_schema_exec.results }}"
+    loop_control:
+      label: "{{ item.item.host }}:{{ item.item.sid }}"
+    when: item.rc | default(1) == 0
+
+  - name: "Build sync_schemas from discovered schemas (one label per host:PDB:schema)"
+    ansible.builtin.set_fact:
+      sync_schemas: >-
+        {{ sync_schemas | default([]) + [ {
+             'host': item.0.host,
+             'sid': item.0.sid,
+             'schema': item.1,
+             'label': item.0.host ~ ':' ~ item.0.sid ~ ':' ~ item.1
+           } ] }}
+    loop: "{{ sync_schema_clean | default([]) | subelements('stdout_lines', skip_missing=True) }}"
+    loop_control:
+      label: "{{ item.0.host }}:{{ item.0.sid }}:{{ item.1 }}"
+
+  - name: Show schemas to sync
+    ansible.builtin.debug:
+      msg: "{{ sync_schemas | default([]) | map(attribute='label') | list }}"
+
+  - name: Nothing to sync
+    ansible.builtin.meta: end_play
+    when: sync_schemas | default([]) | length == 0
+
+  # -----------------------------------------------------------------
+  # Step 3: sync the flat host:PDB:schema label set into every configured
+  # schema-picker field, using the same shared, host-aware-staleness logic
+  # as the targets sync.
+  # -----------------------------------------------------------------
+  - name: "Sync live schemas into every configured schema-picker field"
+    ansible.builtin.include_tasks: COMMON_jira_sync_field_options.yml
+    loop: "{{ jira_schema_field_names }}"
+    loop_control:
+      loop_var: sync_field_name
+    vars:
+      sync_live_labels: "{{ sync_schemas | map(attribute='label') | list }}"
+      sync_eligible_prefixes: >-
+        {{
+          known_targets | map(attribute='host') | list
+          | zip(known_targets | map(attribute='sid') | list)
+          | map('join', ':') | map('regex_replace', '$', ':') | list
+        }}
+      sync_scanned_prefixes: "{{ sync_scanned_target_prefixes }}"
+
+  - name: Clean up temp files on each host
+    ansible.builtin.file:
+      path: "/tmp/jira_sync_oracle_schemas"
+      state: absent
+    delegate_to: "{{ item }}"
+    ignore_unreachable: true
+    loop: "{{ oracle_instance_map.keys() | list }}"
+    loop_control:
+      label: "{{ item }}"
+    failed_when: false
+
+  - name: Final summary
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira oracle_schemas sync summary"
+      - "======================================================"
+      - "  Fields synced                  : {{ jira_schema_field_names | join(', ') }}"
+      - "  Host:PDBs scanned successfully : {{ sync_scanned_target_prefixes | map('regex_replace', ':$', '') | join(', ') | default('none', true) }}"
+      - "  Schemas discovered             : {{ sync_schemas | length }}"
+      - "  (per-field created/present/disabled counts are printed above, per field)"
+      - "======================================================"

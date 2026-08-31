@@ -1,0 +1,626 @@
+---
+# =============================================================================
+# JIRA_UPG_oracle_upgrade_job.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# Per-issue Oracle 21c -> 26ai AutoUpgrade job. Included from
+# JIRA_UPG_oracle_upgrade.yml with loop_var `job`:
+#     job.issue_key   e.g. UPG-1
+#     job.summary     issue summary text
+#     job.target_host e.g. lnx001 (parsed from "Target Host & Container (CDB)")
+#     job.oracle_sid  e.g. CDB1 (case-sensitive, used verbatim)
+#
+# REWRITTEN (Aug 2026): the 26ai pre-flight check (software home + jar
+# exist) used to be a single blanket check against one hardcoded
+# oracle_host, run once at the top of JIRA_UPG_oracle_upgrade.yml before
+# any issues were even fetched. It now runs HERE, per-job, against
+# job.target_host specifically - see the check itself below for why. Every
+# reference to the old fixed oracle_host/oracle_source_home vars has been
+# replaced with job.target_host / oracle_instance_map[job.target_host].oracle_home.
+#
+# Reference: https://oracle-base.com/articles/26/multitenant-upgrade-to-26-autoupgrade
+#
+# Notes on established environment quirks (still honoured here):
+#   * `become_user: oracle` under sudo strips env vars -> all Oracle work is
+#     done via temp shell scripts with explicit exports, never `environment:`.
+#   * AutoUpgrade must run with -noconsole for non-interactive use.
+#   * Stale recovery data from a previously interrupted deploy makes
+#     AutoUpgrade exit rc=1 ("There is an unfinished execution of a deploy
+#     mode..."). We detect that in rescue, post a targeted worklog, and
+#     transition the issue to Failed. Recovery data is NEVER cleared
+#     automatically -- clearing while the CDB is mid-upgrade would strand it.
+# =============================================================================
+
+# ---- Per-job derived paths --------------------------------------------------
+- name: "JOB | {{ job.issue_key }} | Set per-job facts"
+  ansible.builtin.set_fact:
+    job_dir: "{{ autoupgrade_base }}/{{ job.oracle_sid }}_{{ job.issue_key }}"
+    job_cfg: "{{ autoupgrade_base }}/{{ job.oracle_sid }}_{{ job.issue_key }}/autoupgrade.cfg"
+    job_log_dir: "{{ autoupgrade_base }}/{{ job.oracle_sid }}_{{ job.issue_key }}/log"
+    analyze_script: "/tmp/upg_analyze_{{ job.oracle_sid }}_{{ job.issue_key }}.sh"
+    deploy_script: "/tmp/upg_deploy_{{ job.oracle_sid }}_{{ job.issue_key }}.sh"
+    verify_script: "/tmp/upg_verify_{{ job.oracle_sid }}_{{ job.issue_key }}.sh"
+    job_failed_reason: ""
+
+- name: "JOB | {{ job.issue_key }} | Run upgrade with failure handling"
+  block:
+
+  # =========================================================================
+  # 0. Pre-flight: confirm the 26ai software home is installed on THIS job's
+  #    target host - REWRITTEN (Aug 2026): previously this was a single
+  #    blanket check against one hardcoded oracle_host at the top of
+  #    JIRA_UPG_oracle_upgrade.yml, run once before any issues were even
+  #    fetched. That meant every job silently assumed 26ai was installed on
+  #    the SAME one host, regardless of what host the ticket actually named
+  #    (the ticket's host was parsed but never used - a genuine latent bug,
+  #    shared with the ServiceNow version, that simply never surfaced
+  #    because only one 26ai-capable host has existed so far). Now this
+  #    check runs per-job, against job.target_host specifically, and a
+  #    failure here is caught by the rescue: block below like any other
+  #    failure in this job - it fails just THIS ticket cleanly, rather than
+  #    either blocking the whole run or silently checking the wrong host.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Check 26ai Oracle home exists on {{ job.target_host }}"
+    ansible.builtin.stat:
+      path: "{{ oracle_target_home }}/bin/sqlplus"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: target_home_check
+
+  - name: "JOB | {{ job.issue_key }} | Assert 26ai home is installed on {{ job.target_host }}"
+    ansible.builtin.assert:
+      that:
+      - target_home_check.stat.exists
+      fail_msg: >-
+        26ai software home not found at {{ oracle_target_home }} on {{ job.target_host }}. Install the 26ai software first (runInstaller -silent, software-only) and ensure the oracle-ai-database-preinstall-26ai package has been applied on that specific host.
+
+  - name: "JOB | {{ job.issue_key }} | Check autoupgrade.jar exists in 26ai home on {{ job.target_host }}"
+    ansible.builtin.stat:
+      path: "{{ autoupgrade_jar }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: autoupgrade_jar_check
+
+  - name: "JOB | {{ job.issue_key }} | Assert autoupgrade.jar is present on {{ job.target_host }}"
+    ansible.builtin.assert:
+      that:
+      - autoupgrade_jar_check.stat.exists
+      fail_msg: >-
+        {{ autoupgrade_jar }} not found on {{ job.target_host }}. It ships with the 26ai home; if it was removed, download the latest from https://download.oracle.com/otn-pub/otn_software/autoupgrade.jar into {{ oracle_target_home }}/rdbms/admin/.
+
+  # =========================================================================
+  # 1. Transition issue to In Progress + opening worklog
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Get available transitions"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: job_transitions
+
+  - name: "JOB | {{ job.issue_key }} | Transition to {{ jira_status_in_progress }} (if available)"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ (job_transitions.json.transitions | selectattr('name', 'equalto', jira_status_in_progress) | list | first).id }}"
+      status_code: 204
+    when: job_transitions.json.transitions | selectattr('name', 'equalto', jira_status_in_progress) | list | length > 0
+
+  - name: "JOB | {{ job.issue_key }} | Worklog: upgrade started"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/worklog"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        timeSpent: "1m"
+        comment: >-
+          AutoUpgrade 21c -> 26ai started for SID {{ job.oracle_sid }} on {{ job.target_host }}. Source home: {{ oracle_instance_map[job.target_host].oracle_home }}. Target home: {{ oracle_target_home }}. Job dir: {{ job_dir }}.
+      status_code: 201
+
+  # =========================================================================
+  # 2. Sanity-check the source database (must be 21c and OPEN)
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Write source DB check script"
+    ansible.builtin.copy:
+      dest: "{{ verify_script }}"
+      owner: oracle
+      group: oinstall
+      mode: "0755"
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[job.target_host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOF'
+        set heading off feedback off pagesize 0
+        select 'VERSION='||version_full from v$instance;
+        select 'STATUS='||status from v$instance;
+        select 'PDB='||name||':'||open_mode from v$pdbs;
+        exit;
+        EOF
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  - name: "JOB | {{ job.issue_key }} | Check source DB version and state"
+    ansible.builtin.command:
+      cmd: "{{ verify_script }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: source_db_check
+    changed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Assert source is 21c and OPEN"
+    ansible.builtin.assert:
+      that:
+      - "'VERSION=21.' in source_db_check.stdout"
+      - "'STATUS=OPEN' in source_db_check.stdout"
+      fail_msg: >-
+        Source database {{ job.oracle_sid }} is not a 21c instance in OPEN state. Output: {{ source_db_check.stdout }}
+
+  # =========================================================================
+  # 3. Create per-issue AutoUpgrade config
+  #    Parameters per the oracle-base 26ai article. Recovery/log state is
+  #    isolated under this issue's job dir. target_version is omitted --
+  #    only required when the target is 12.2.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Create job directories"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: directory
+      owner: oracle
+      group: oinstall
+      mode: "0755"
+    loop:
+    - "{{ job_dir }}"
+    - "{{ job_log_dir }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  - name: "JOB | {{ job.issue_key }} | Write autoupgrade.cfg"
+    ansible.builtin.copy:
+      dest: "{{ job_cfg }}"
+      owner: oracle
+      group: oinstall
+      mode: "0644"
+      content: |
+        global.global_log_dir={{ job_log_dir }}
+        upg1.sid={{ job.oracle_sid }}
+        upg1.source_home={{ oracle_instance_map[job.target_host].oracle_home }}
+        upg1.target_home={{ oracle_target_home }}
+        upg1.log_dir={{ job_log_dir }}/{{ job.oracle_sid }}
+        upg1.start_time=NOW
+        upg1.run_utlrp=yes
+        upg1.timezone_upg=yes
+        upg1.restoration={{ autoupgrade_restoration | default('yes') }}
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  # =========================================================================
+  # 4. AutoUpgrade ANALYZE
+  #    Run with the 26ai home's JDK and the jar shipped in the 26ai home
+  #    (self-updating from AutoUpgrade 26.2 onward). ORACLE_SID/HOME are
+  #    exported inside the script -- source home, per the article.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Write AutoUpgrade analyze script"
+    ansible.builtin.copy:
+      dest: "{{ analyze_script }}"
+      owner: oracle
+      group: oinstall
+      mode: "0755"
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[job.target_host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        {{ autoupgrade_java }} \
+          -jar {{ autoupgrade_jar }} \
+          -config {{ job_cfg }} \
+          -mode analyze -noconsole
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  - name: "JOB | {{ job.issue_key }} | Run AutoUpgrade analyze phase (pre-upgrade check)"
+    ansible.builtin.command:
+      cmd: "{{ analyze_script }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: analyze_run
+    async: 3600
+    poll: 15
+    changed_when: true
+
+  - name: "JOB | {{ job.issue_key }} | Parse analyze summary"
+    ansible.builtin.set_fact:
+      analyze_jobs_failed: >-
+        {{ analyze_run.stdout
+           | regex_search('Jobs failed\s+\[(\d+)\]', '\1')
+           | default(['?'], true) | first }}
+
+  - name: "JOB | {{ job.issue_key }} | Assert analyze passed"
+    ansible.builtin.assert:
+      that:
+      - analyze_jobs_failed == '0'
+      fail_msg: >-
+        AutoUpgrade analyze reported {{ analyze_jobs_failed }} failed job(s). Review {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log and the prechecks detail log ({{ job.oracle_sid }}_preupgrade.log) for required manual fixups before re-running.
+
+  - name: "JOB | {{ job.issue_key }} | Read analyze status.log"
+    ansible.builtin.command:
+      cmd: "cat {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: analyze_status_log
+    changed_when: false
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Worklog: analyze complete"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/worklog"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        timeSpent: "1m"
+        comment: |
+          AutoUpgrade ANALYZE completed successfully for {{ job.oracle_sid }} (Jobs failed [0]).
+          Proceeding to deploy. Analyze summary:
+          {{ analyze_status_log.stdout | default('status.log not readable') | truncate(4000) }}
+      status_code: 201
+
+  # =========================================================================
+  # 5. AutoUpgrade DEPLOY (fixups + upgrade in one action, per the article;
+  #    a separate fixups run is unnecessary for same-server upgrades).
+  #    Fire async and poll -- DBUPGRADE + POSTFIXUPS can take many hours.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Write AutoUpgrade deploy script"
+    ansible.builtin.copy:
+      dest: "{{ deploy_script }}"
+      owner: oracle
+      group: oinstall
+      mode: "0755"
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_instance_map[job.target_host].oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        {{ autoupgrade_java }} \
+          -jar {{ autoupgrade_jar }} \
+          -config {{ job_cfg }} \
+          -mode deploy -noconsole
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  - name: "JOB | {{ job.issue_key }} | Launch AutoUpgrade deploy (async)"
+    ansible.builtin.command:
+      cmd: "{{ deploy_script }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: deploy_async
+    async: "{{ deploy_async_seconds }}"
+    poll: 0
+    changed_when: true
+
+  - name: "JOB | {{ job.issue_key }} | Wait for deploy to finish"
+    ansible.builtin.async_status:
+      jid: "{{ deploy_async.ansible_job_id }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: deploy_result
+    until: deploy_result.finished
+    retries: "{{ deploy_poll_retries }}"
+    delay: "{{ deploy_poll_delay }}"
+
+  - name: "JOB | {{ job.issue_key }} | Parse deploy summary"
+    ansible.builtin.set_fact:
+      deploy_jobs_failed: >-
+        {{ deploy_result.stdout | default('')
+           | regex_search('Jobs failed\s+\[(\d+)\]', '\1')
+           | default(['?'], true) | first }}
+      deploy_jobs_restored: >-
+        {{ deploy_result.stdout | default('')
+           | regex_search('Jobs restored\s+\[(\d+)\]', '\1')
+           | default(['0'], true) | first }}
+      deploy_grp_drop_cmd: >-
+        {{ deploy_result.stdout | default('')
+           | regex_search('(drop restore point \S+)', '\1')
+           | default([''], true) | first }}
+
+  - name: "JOB | {{ job.issue_key }} | Assert deploy succeeded"
+    ansible.builtin.assert:
+      that:
+      - deploy_result.rc | default(1) == 0
+      - deploy_jobs_failed == '0'
+      - deploy_jobs_restored == '0'
+      fail_msg: >-
+        AutoUpgrade deploy did not complete cleanly (rc={{ deploy_result.rc | default('n/a') }}, failed=[{{ deploy_jobs_failed }}], restored=[{{ deploy_jobs_restored }}]). If jobs were restored, the database was flashed back to the guaranteed restore point. Review {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log and the dbupgrade stage logs.
+
+  # =========================================================================
+  # 6. Post-upgrade: bounce under the new home (per the article) and verify.
+  #    26ai continues the 23ai version stream, so version_full reports as
+  #    23.26.x -- we accept either 23.26.* or 26.* here.
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Write post-upgrade bounce/verify script"
+    ansible.builtin.copy:
+      dest: "{{ verify_script }}"
+      owner: oracle
+      group: oinstall
+      mode: "0755"
+      content: |
+        #!/bin/bash
+        export ORACLE_SID={{ job.oracle_sid }}
+        export ORACLE_HOME={{ oracle_target_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOF'
+        shutdown immediate;
+        startup;
+        set heading off feedback off pagesize 0
+        select 'VERSION='||version_full from v$instance;
+        select 'STATUS='||status from v$instance;
+        select 'PDB='||name||':'||open_mode from v$pdbs;
+        select 'GRP='||name from v$restore_point where guarantee_flashback_database='YES';
+        exit;
+        EOF
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  - name: "JOB | {{ job.issue_key }} | Restart database under 26ai home and verify"
+    ansible.builtin.command:
+      cmd: "{{ verify_script }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: oracle
+    register: post_upgrade_check
+    async: 1800
+    poll: 15
+    changed_when: true
+
+  - name: "JOB | {{ job.issue_key }} | Assert database is on 26ai and OPEN"
+    ansible.builtin.assert:
+      that:
+      - post_upgrade_check.stdout is regex('VERSION=(23\.26|26)\.')
+      - "'STATUS=OPEN' in post_upgrade_check.stdout"
+      fail_msg: >-
+        Post-upgrade verification failed for {{ job.oracle_sid }}. Output: {{ post_upgrade_check.stdout }}
+
+  - name: "JOB | {{ job.issue_key }} | Ensure /etc/oratab points at 26ai home"
+    ansible.builtin.lineinfile:
+      path: /etc/oratab
+      regexp: '^{{ job.oracle_sid }}:'
+      line: "{{ job.oracle_sid }}:{{ oracle_target_home }}:Y"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+
+  # =========================================================================
+  # 7. Success: worklog + transition to Done.
+  #    The GRP is left in place deliberately -- it is dropped manually
+  #    once the upgrade is accepted (it consumes FRA space until then).
+  # =========================================================================
+  - name: "JOB | {{ job.issue_key }} | Worklog: upgrade complete"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/worklog"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        timeSpent: "1m"
+        comment: |
+          AutoUpgrade DEPLOY completed successfully for {{ job.oracle_sid }} on {{ job.target_host }}.
+          Database restarted under {{ oracle_target_home }} and verified:
+          {{ post_upgrade_check.stdout | truncate(2000) }}
+
+          NOTE: guaranteed restore point retained. Drop it once the upgrade
+          is accepted (it consumes FRA space):
+          {{ deploy_grp_drop_cmd | default('see v$restore_point', true) }}
+
+          Logs: {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log
+      status_code: 201
+
+  - name: "JOB | {{ job.issue_key }} | Get transitions for Done"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: done_transitions
+
+  - name: "JOB | {{ job.issue_key }} | Transition to {{ jira_status_done }}"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ (done_transitions.json.transitions | selectattr('name', 'equalto', jira_status_done) | list | first).id }}"
+      status_code: 204
+    when: done_transitions.json.transitions | selectattr('name', 'equalto', jira_status_done) | list | length > 0
+  # ===========================================================================
+  # RESCUE: detect -> halt -> notify. Never auto-clears recovery data.
+  # ===========================================================================
+  rescue:
+
+  - name: "JOB | {{ job.issue_key }} | Classify failure"
+    ansible.builtin.set_fact:
+      job_failed_reason: >-
+        {%- set err = (ansible_failed_result.stderr | default('')) ~ ' ' ~ (ansible_failed_result.msg | default('')) -%} {%- if 'unfinished execution of a deploy' in err -%} STALE RECOVERY DATA: a previous AutoUpgrade deploy for this config ({{ job_cfg }}) did not finish. Manual DBA decision required -- EITHER resume it:
+          {{ autoupgrade_java }} -jar {{ autoupgrade_jar }} -config {{ job_cfg }} -mode deploy
+        OR, only if the database was already manually restored, clear recovery data and start over:
+          {{ autoupgrade_java }} -jar {{ autoupgrade_jar }} -config {{ job_cfg }} -clear_recovery_data
+        Recovery data was NOT cleared automatically. {%- else -%} Task "{{ ansible_failed_task.name | default('unknown') }}" failed: {{ ansible_failed_result.msg | default('no message') | truncate(1500) }} stderr: {{ ansible_failed_result.stderr | default('') | truncate(1500) }} {%- endif -%}
+
+  - name: "JOB | {{ job.issue_key }} | Worklog: upgrade failed, DBA review required"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ job.issue_key }}/worklog"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        timeSpent: "1m"
+        comment: |
+          AutoUpgrade job HALTED for {{ job.oracle_sid }} on {{ job.target_host }} -- manual intervention required.
+
+          {{ job_failed_reason }}
+
+          Logs: {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log
+      status_code: 201
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Get transitions for Failed status"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    register: failed_transitions
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Transition to {{ jira_status_failed }}"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/3/issue/{{ job.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: "{{ (failed_transitions.json.transitions | selectattr('name', 'equalto', jira_status_failed) | list | first).id }}"
+      status_code: 204
+    when:
+    - failed_transitions.json is defined
+    - failed_transitions.json.transitions | selectattr('name', 'equalto', jira_status_failed) | list | length > 0
+    failed_when: false
+
+  # ---------------------------------------------------------------------------
+  # Create DBA repair follow-up task in the same project, in "To Do", with the
+  # failure reason and the AutoUpgrade status.log (fetched from the DB host)
+  # attached. Everything is failure-tolerant so the rescue always completes.
+  # ---------------------------------------------------------------------------
+
+  - name: "JOB | {{ job.issue_key }} | Set follow-up run timestamp"
+    ansible.builtin.set_fact:
+      fu_run_ts: "{{ '%Y%m%dT%H%M%S' | strftime }}"
+    when: jira_followup_enabled | default(true) | bool
+
+  - name: "JOB | {{ job.issue_key }} | Ensure follow-up log dir exists on controller"
+    ansible.builtin.file:
+      path: "{{ followup_log_dir }}"
+      state: directory
+      mode: "0750"
+    when: jira_followup_enabled | default(true) | bool
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Write failure report for follow-up"
+    ansible.builtin.copy:
+      content: |
+        Oracle AutoUpgrade FAILURE LOG - {{ fu_run_ts }}
+        Issue       : {{ job.issue_key }}
+        Oracle SID  : {{ job.oracle_sid }}
+        DB host     : {{ job.target_host }}
+        Source home : {{ oracle_instance_map[job.target_host].oracle_home }}
+        Target home : {{ oracle_target_home }}
+        Job dir     : {{ job_dir }}
+
+        Failure reason:
+        {{ job_failed_reason }}
+
+        AutoUpgrade status log on {{ job.target_host }}:
+        {{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log
+        (a copy is attached to the follow-up task if it could be retrieved)
+      dest: "{{ followup_log_dir }}/UPG_{{ job.issue_key }}_failure_{{ fu_run_ts }}.log"
+      mode: "0640"
+    when: jira_followup_enabled | default(true) | bool
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Fetch AutoUpgrade status.log from {{ job.target_host }}"
+    ansible.builtin.fetch:
+      src: "{{ job_log_dir }}/cfgtoollogs/upgrade/auto/status/status.log"
+      dest: "{{ followup_log_dir }}/UPG_{{ job.issue_key }}_status_{{ fu_run_ts }}.log"
+      flat: true
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+    when: jira_followup_enabled | default(true) | bool
+    failed_when: false
+
+  - name: "JOB | {{ job.issue_key }} | Create DBA repair follow-up task"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    when: jira_followup_enabled | default(true) | bool
+    vars:
+      fu_original_key: "{{ job.issue_key }}"
+      fu_summary: "DBA repair required: AutoUpgrade halted for {{ job.oracle_sid }} on {{ job.target_host }} ({{ job.issue_key }})"
+      fu_description: |-
+        Oracle AutoUpgrade 21c -> 26ai HALTED and the original issue has been
+        transitioned to "{{ jira_status_failed }}". Manual DBA intervention is
+        required — recovery data was NOT cleared automatically.
+
+        Oracle SID  : {{ job.oracle_sid }}
+        DB host     : {{ job.target_host }}
+        Job dir     : {{ job_dir }}
+
+        Failure reason:
+        {{ job_failed_reason }}
+      fu_attach_files:
+      - "{{ followup_log_dir }}/UPG_{{ job.issue_key }}_failure_{{ fu_run_ts }}.log"
+      - "{{ followup_log_dir }}/UPG_{{ job.issue_key }}_status_{{ fu_run_ts }}.log"
+
+  - name: "JOB | {{ job.issue_key }} | Continue to next issue"
+    ansible.builtin.debug:
+      msg: "Job {{ job.issue_key }} halted and transitioned to Failed. Continuing with remaining issues."
+  # ===========================================================================
+  # ALWAYS: remove temp scripts from lnx001
+  # ===========================================================================
+  always:
+
+  - name: "JOB | {{ job.issue_key }} | Clean up temp scripts"
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+    - "{{ analyze_script }}"
+    - "{{ deploy_script }}"
+    - "{{ verify_script }}"
+    delegate_to: "{{ job.target_host }}"
+    become: true
+    become_user: root
+    failed_when: false

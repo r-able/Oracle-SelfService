@@ -1,0 +1,284 @@
+---
+# JIRA_PRF_performance_analysis.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# NEW (Aug 2026) - this project never had a JIRA-side playbook at all;
+# JIRA_PRF_cron_wrapper.sh existed and pointed at this filename, but
+# nothing was ever built to match it (same gap PDB had). Ported from
+# SNOW_PRF_performance_analysis.yml / SNOW_PRF_performance_analysis_job.yml
+# - the Oracle-side logic (AWR snapshot resolution, AWR report generation,
+# DBA_HIST_SQLSTAT top-5 query, SQL Tuning Advisor execution) is copied
+# essentially verbatim, since none of that cares which ticketing system
+# originated the request. Read-only analysis only - execute_tuning_task
+# only ever produces ADVICE, it never applies an index or SQL Profile.
+#
+# INTAKE, JIRA-NATIVE (replaces ServiceNow's free-text spec parsing):
+#   Database Instance : "lnx001:DEV"  - REUSES the exact same live field
+#                        DCR/CDP already populate via
+#                        JIRA_sync_oracle_targets.yml. Gives both the host
+#                        (to resolve the real CDB via oracle_instance_map)
+#                        and the target PDB name (for CON_ID filtering and
+#                        the tuning advisor's ALTER SESSION SET CONTAINER) -
+#                        exactly what PRF needs, no new field required.
+#   Analysis Start     : Jira Date Time Picker field
+#   Analysis End        : Jira Date Time Picker field
+#
+# TIMEZONE CAVEAT (read this before trusting a real analysis run): Jira's
+# Date Time Picker records whatever timezone the REPORTER'S BROWSER is set
+# to, not necessarily the Oracle server's timezone. This playbook does NOT
+# attempt timezone conversion - it takes the picked date/time at face
+# value and passes it straight to Oracle's TO_DATE(). If your Jira users
+# and your Oracle server are ever in different timezones, snapshot
+# resolution will silently look at the wrong hours (or find nothing).
+# Confirm this is a non-issue for your organization before relying on it.
+#
+# EVIDENCE: REAL Jira file attachments (not embedded in a comment) - AWR
+# reports and tuning advisor reports can run 50-200KB+, large enough that
+# cramming them into a comment (as DCR/REF/PDB/DDP do for their much
+# smaller evidence) risks hitting Jira's comment size limits. Files are
+# fetched from the target host back to the controller, then uploaded via
+# Jira's multipart attachment endpoint (ansible.builtin.uri body_format:
+# form-multipart, requires the X-Atlassian-Token: no-check header Jira's
+# attachment API requires).
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   0b. Resolve    : the "Database Instance", "Analysis Start", and
+#                    "Analysis End" field IDs
+#   0c. Shepherd   : promote To Do -> Pending Approval -> In Progress (this
+#                    is read-only analysis, ServiceNow's own form says "no
+#                    approval required" - the shepherd gate is applied
+#                    anyway for consistency with the rest of this suite,
+#                    but is harmless either way since nothing destructive
+#                    ever happens here)
+#   1. Search      : find all "In Progress" PRF issues matching the JQL
+#   2. Fetch       : retrieve each issue, parse target host:PDB and the
+#                    analysis window; drop issues with missing fields, an
+#                    unknown host, or an unusable date/time
+#   3. Resolve     : find the AWR snapshots bracketing the given window
+#   4. AWR report  : generate the full text AWR report for that range
+#   5. Top SQL     : query DBA_HIST_SQLSTAT directly (not parsed from the
+#                    AWR text - far more reliable) for the top 5 SQL_IDs by
+#                    total CPU time in that range
+#   6. Tuning      : run DBMS_SQLTUNE against each of the (up to) 5
+#                    SQL_IDs, capture the recommendation report for each
+#   7. Attach      : fetch the AWR report and every tuning report back to
+#                    the controller, upload as real Jira attachments
+#   8. Comment     : post a one-line-per-SQL_ID summary
+#   9. Transition  : "Done" on success, "Failed" on error
+#   10. Follow-up  : ALWAYS opened when at least one recommendation was
+#                    found (for the DBA team to review and implement -
+#                    Ansible never applies a tuning recommendation itself);
+#                    a separate DBA repair follow-up opens on total failure
+#   11. Summary    : print final outcome table
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   jira_url, jira_user, jira_api_token
+#   jira_jql_prf, jira_max_results, jira_cloud
+#   jira_status_done, jira_status_failed, jira_status_todo,
+#   jira_status_pending_approval, jira_status_in_progress
+#   jira_prf_target_field_name : "Database Instance"
+#   jira_prf_start_field_name  : "Analysis Start"
+#   jira_prf_end_field_name    : "Analysis End"
+#   oracle_instance_map : (already defined - host -> oracle_home/sid/user)
+#   followup_log_dir
+#
+# NEEDS VALIDATION before trusting this against a real analysis request -
+# not yet live-tested end-to-end on the JIRA side (the ServiceNow version
+# this was ported from IS confirmed working). The multipart attachment
+# upload in particular is the first real use of this mechanism in this
+# suite - confirm it actually works against your Jira instance before
+# relying on it.
+#
+# Usage:
+#   ansible-playbook JIRA_PRF_performance_analysis.yml --ask-vault-pass
+
+- name: "Jira -> Oracle AWR performance analysis -> Close issue"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    prf_local_staging: "/tmp/jira_prf_staging"
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # -- 0b. Resolve the three field IDs ---------------------------------------
+
+  - name: "0b | Resolve 'Database Instance' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_prf_target_field_name }}"
+
+  - name: "0b | Set jira_prf_target_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_prf_target_field: "{{ resolved_field_id }}"
+
+  - name: "0b | Resolve 'Analysis Start' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_prf_start_field_name }}"
+
+  - name: "0b | Set jira_prf_start_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_prf_start_field: "{{ resolved_field_id }}"
+
+  - name: "0b | Resolve 'Analysis End' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_prf_end_field_name }}"
+
+  - name: "0b | Set jira_prf_end_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_prf_end_field: "{{ resolved_field_id }}"
+
+  # -- 0c. Shepherd the intake queue toward 'In Progress' --------------------
+
+  - name: "0c | Shepherd PRF intake queue toward 'In Progress'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "PRF"
+
+  # -- 1. Search for issues genuinely at 'In Progress' now --------------------
+
+  - name: "1 | Search for open Jira PRF issues matching JQL"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: search
+      jql: "{{ jira_jql_prf }}"
+      maxresults: "{{ jira_max_results }}"
+      cloud: "{{ jira_cloud }}"
+    register: jira_search
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: "No Tasks Found -- no Jira issues currently match JQL: {{ jira_jql_prf }}. Nothing to process; exiting cleanly."
+    when: jira_search.meta.issues | default([]) | length == 0
+
+  - name: "1 | End play gracefully when no issues are found"
+    ansible.builtin.meta: end_play
+    when: jira_search.meta.issues | default([]) | length == 0
+
+  - name: "1 | Show issues found"
+    ansible.builtin.debug:
+      msg: "Found {{ jira_search.meta.issues | length }} PRF issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}"
+
+  - name: "2 | Fetch full details for each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: fetch
+      issue: "{{ item.key }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ jira_search.meta.issues }}"
+    loop_control:
+      label: "{{ item.key }}"
+    register: jira_issue_details
+
+  # -- Parse target host:PDB and the analysis window --------------------------
+  # Jira's Date Time Picker returns an ISO-8601 string like
+  # "2026-02-21T21:02:00.000-0500" - the first 19 characters, with the "T"
+  # swapped for a space, give exactly the "YYYY-MM-DD HH24:MI:SS" format
+  # Oracle's TO_DATE() expects. No timezone conversion is attempted - see
+  # the TIMEZONE CAVEAT in the file header.
+
+  - name: "2 | WARN and skip issues with an unusable target, start, or end"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} has an unusable spec
+        (Database Instance: '{{ p_host_pdb }}', Start: '{{ p_start_raw }}',
+        End: '{{ p_end_raw }}') -- skipping.
+        {% if p_host not in oracle_instance_map %}Unknown host '{{ p_host }}' (known: {{ oracle_instance_map.keys() | list | join(', ') }}). {% endif %}
+        {% if p_start_raw | length < 19 or p_end_raw | length < 19 %}Both 'Analysis Start' and 'Analysis End' must be filled in. {% endif %}
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      p_host_pdb: "{{ (item.meta.fields[jira_prf_target_field] | default({}, true)).value | default('', true) }}"
+      p_host: "{{ p_host_pdb.split(':')[0] | default('') | trim }}"
+      p_start_raw: "{{ item.meta.fields[jira_prf_start_field] | default('', true) }}"
+      p_end_raw: "{{ item.meta.fields[jira_prf_end_field] | default('', true) }}"
+    when: >-
+      p_host_pdb | length == 0 or p_host not in oracle_instance_map
+      or p_start_raw | length < 19 or p_end_raw | length < 19
+
+  - name: "2 | Build the analysis job list"
+    ansible.builtin.set_fact:
+      prf_jobs: >-
+        {{
+          prf_jobs | default([]) + [{
+            'issue_key':    item.meta.key,
+            'target_host':  p_host,
+            'oracle_sid':   p_pdb,
+            'oracle_home':  oracle_instance_map[p_host].oracle_home,
+            'oracle_user':  oracle_instance_map[p_host].oracle_user,
+            'cdb_sid':      oracle_instance_map[p_host].oracle_sid,
+            'start_dt':     p_start_raw[0:19] | replace('T', ' '),
+            'end_dt':       p_end_raw[0:19] | replace('T', ' ')
+          }]
+        }}
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      p_host_pdb: "{{ (item.meta.fields[jira_prf_target_field] | default({}, true)).value | default('', true) }}"
+      p_host: "{{ p_host_pdb.split(':')[0] | default('') | trim }}"
+      p_pdb: "{{ p_host_pdb.split(':')[1] | default('') | trim | upper }}"
+      p_start_raw: "{{ item.meta.fields[jira_prf_start_field] | default('', true) }}"
+      p_end_raw: "{{ item.meta.fields[jira_prf_end_field] | default('', true) }}"
+    when: >-
+      p_host_pdb | length > 0 and p_host in oracle_instance_map
+      and p_start_raw | length >= 19 and p_end_raw | length >= 19
+
+  - name: "2 | Nothing valid to process"
+    ansible.builtin.meta: end_play
+    when: prf_jobs | default([]) | length == 0
+
+  - name: "2 | Jobs queued"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} -- analyze {{ item.oracle_sid }} on {{ item.target_host }}, period {{ item.start_dt }} -> {{ item.end_dt }}
+    loop: "{{ prf_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "3-10 | Run performance analysis for each job"
+    ansible.builtin.include_tasks: JIRA_PRF_performance_analysis_job.yml
+    loop: "{{ prf_jobs }}"
+    loop_control:
+      loop_var: job
+      label: "{{ job.issue_key }} ({{ job.oracle_sid }} on {{ job.target_host }})"
+
+  - name: "11 | Final summary"
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira PRF Performance Analysis Summary"
+      - "======================================================"
+      - "  Run timestamp   : {{ ansible_date_time.iso8601 }}"
+      - "  Issues found    : {{ prf_jobs | length }}"
+      - "======================================================"

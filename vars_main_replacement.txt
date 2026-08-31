@@ -1,0 +1,5 @@
+jira_dcr_host_db_field_name: "Database Instance"
+jira_target_field_names: ["Database Instance"]
+jira_schema_field_names: ["Source Schema", "Target Schema"]
+jira_ref_source_schema_field_name: "Source Schema"
+jira_ref_target_schema_field_name: "Target Schema"

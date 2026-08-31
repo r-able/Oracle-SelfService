@@ -1,0 +1,677 @@
+---
+# JIRA_DDP_drop_pluggable_database.yml
+# Released under the MIT license. Copyright (c) 2026, Vlad von Grigorian <
+#
+# REWRITTEN (Aug 2026) - the previous version had several real problems
+# found on review, serious enough to fix before this destructive/
+# irreversible operation is ever run for real:
+#   1. Fixed single host (oracle_host="lnx001", oracle_sid="CDB1"
+#      hardcoded) - the same "one fixed database" bug this whole project
+#      started from. Could only ever drop a PDB on lnx001.
+#   2. Hardcoded placeholder customfield IDs, never validated against a
+#      real Jira instance.
+#   3. Called COMMON_jira_transition_issue.yml - a file that doesn't exist
+#      anywhere in this suite. Would have failed outright on first use.
+#   4. Called COMMON_jira_create_followup_task.yml with the wrong variable
+#      names (followup_source_project/followup_reason instead of the real
+#      interface fu_original_key/fu_summary/fu_description) - would have
+#      silently failed to create a real follow-up task.
+#   5. Uploaded evidence via a raw (non-multipart) file POST to Jira's
+#      attachment endpoint, which Jira's API actually requires as
+#      multipart/form-data - almost certainly broken as written.
+#
+# FIXED, consolidated into one file (the separate ddp_process_issue.yml
+# include is retired - PDB and CDP don't need one either, since each drop
+# targets exactly one host, no cross-host dispatch like REF requires):
+#   - Target host:PDB now comes from the SAME "Database Instance" field
+#     DCR already uses (JIRA_sync_oracle_targets.yml), reusing its live
+#     sync rather than adding a new field - DDP needed no new Jira admin
+#     setup at all, since this field is already live from DCR/CDP.
+#   - Field ID resolved by name via COMMON_jira_resolve_field.yml, same
+#     self-diagnosing pattern as every other rebuilt playbook.
+#   - Confirmation string check now reads a dedicated "Confirm Drop" field
+#     (matching ServiceNow's actual design - a labeled field visible on the
+#     intake form, not something buried in free text) rather than the
+#     issue's Description. An earlier version of this rewrite tried reading
+#     Description directly, which also hit a real Jinja gotcha worth noting:
+#     Jira returns an empty Description as JSON null, and Ansible's
+#     `default('')` filter only substitutes for undefined values, not None -
+#     a null value flows straight through and renders as the literal text
+#     "None". Fixed properly here by using a real field (and `default('',
+#     true)`'s boolean form, which does treat None as needing the default).
+#   - Transitions use the same inline transition-lookup-by-name pattern
+#     proven working in DCR/REF/PDB/CDP, not a phantom include.
+#   - Follow-up tasks use the REAL COMMON_jira_create_followup_task.yml
+#     interface (fu_original_key/fu_summary/fu_description).
+#   - Evidence (pre-drop snapshot + drop log) is embedded in a Jira
+#     comment, matching the established pattern in DCR/REF/PDB, rather
+#     than a real file attachment.
+#
+# SAFETY GATES PRESERVED FROM THE ORIGINAL (these were good ideas):
+#   - PDB$SEED and anything in ddp_protected_pdbs (default: PDB$SEED, PRO)
+#     is hard-blocked regardless of what Jira says, unless
+#     ddp_allow_protected_override is explicitly set true.
+#   - A literal confirmation string "CONFIRM DROP <PDB_NAME>" must appear
+#     in a dedicated "Confirm Drop" field (plain text), exactly matching
+#     the selected PDB name - Jira's "In Progress" approval gate alone is
+#     NOT treated as sufficient for something this irreversible.
+#   - A pre-drop metadata snapshot (dba_pdbs, tablespaces, datafiles) is
+#     captured and posted as a comment BEFORE anything destructive runs.
+#
+# Workflow:
+#   0. Pre-flight  : validate Jira API token via /rest/api/2/myself
+#   0b. Resolve    : the "Database Instance" field ID
+#   0c. Shepherd   : promote To Do -> Pending Approval -> In Progress
+#   1. Search      : find all "In Progress" DDP issues matching the JQL
+#   2. Fetch       : retrieve each issue, parse the target host:PDB and the
+#                    confirmation string from the "Confirm Drop" field
+#   3. Guardrails  : block protected PDBs and missing/mismatched
+#                    confirmation strings - blocked issues get a comment,
+#                    "Failed" transition, and a DBA follow-up, and never
+#                    reach step 4
+#   4. Snapshot    : capture dba_pdbs/tablespace/datafile listing BEFORE
+#                    the drop, post as a comment
+#   5. Drop        : ALTER PLUGGABLE DATABASE ... CLOSE IMMEDIATE, then
+#                    DROP PLUGGABLE DATABASE ... INCLUDING DATAFILES
+#   6. Comment     : post the drop log as a Jira comment
+#   7. Transition  : "Done" on success, "Failed" on error (also opens a DBA
+#                    repair follow-up)
+#   8. Summary     : print final outcome table
+#
+# FIELD FORMAT:
+#   Database Instance : "lnx001:DEV"  (from JIRA_sync_oracle_targets.yml,
+#                        same field DCR and CDP already use)
+#
+# Required vars (vars/main.yml -- vault-encrypt sensitive values):
+#   jira_url, jira_user, jira_api_token
+#   jira_jql_ddp, jira_max_results, jira_cloud
+#   jira_status_done, jira_status_failed, jira_status_todo,
+#   jira_status_pending_approval, jira_status_in_progress
+#   jira_ddp_target_field_name : "Database Instance"
+#   jira_ddp_confirm_field_name : "Confirm Drop"
+#   ddp_protected_pdbs         : ["PDB$SEED", "PRO"]
+#   ddp_allow_protected_override : false
+#   oracle_instance_map : (already defined - host -> oracle_home/sid/user)
+#   followup_log_dir
+#
+# NEEDS VALIDATION before trusting this against a real drop request - the
+# original version had five real bugs and was apparently never actually
+# exercised end-to-end. Test against a genuinely disposable PDB first.
+#
+# Usage:
+#   ansible-playbook JIRA_DDP_drop_pluggable_database.yml --ask-vault-pass
+
+- name: "Jira -> Drop Oracle pluggable database -> Close issue"
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - vars/main.yml
+
+  vars:
+    ddp_work_dir: "/tmp/jira_ddp_run"
+
+  tasks:
+
+  - name: "PRE-FLIGHT | Validate Jira API token via /rest/api/2/myself"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/myself"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      status_code: 200
+      return_content: true
+    register: jira_auth_check
+    no_log: true
+
+  - name: "PRE-FLIGHT | Confirm authenticated identity"
+    ansible.builtin.debug:
+      msg: >-
+        Jira authentication OK -- connected as '{{ jira_auth_check.json.displayName }}' ({{ jira_auth_check.json.emailAddress }})
+
+  # -- 0b. Resolve the 'Database Instance' field ID --------------------------
+
+  - name: "0b | Resolve 'Database Instance' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_ddp_target_field_name }}"
+
+  - name: "0b | Set jira_ddp_target_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_ddp_target_field: "{{ resolved_field_id }}"
+
+  - name: "0b | Resolve 'Confirm Drop' field ID"
+    ansible.builtin.include_tasks: COMMON_jira_resolve_field.yml
+    vars:
+      resolve_field_name: "{{ jira_ddp_confirm_field_name }}"
+
+  - name: "0b | Set jira_ddp_confirm_field from the resolved ID"
+    ansible.builtin.set_fact:
+      jira_ddp_confirm_field: "{{ resolved_field_id }}"
+
+  # -- 0c. Shepherd the intake queue toward 'In Progress' --------------------
+
+  - name: "0c | Shepherd DDP intake queue toward 'In Progress'"
+    ansible.builtin.include_tasks: COMMON_jira_shepherd_statuses.yml
+    vars:
+      shepherd_project: "DDP"
+
+  # -- 1. Search for issues genuinely at 'In Progress' now --------------------
+
+  - name: "1 | Search for open Jira DDP issues matching JQL"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: search
+      jql: "{{ jira_jql_ddp }}"
+      maxresults: "{{ jira_max_results }}"
+      cloud: "{{ jira_cloud }}"
+    register: jira_search
+
+  - name: "1 | Show 'No Tasks Found' and exit cleanly when queue is empty"
+    ansible.builtin.debug:
+      msg: "No Tasks Found -- no Jira issues currently match JQL: {{ jira_jql_ddp }}. Nothing to process; exiting cleanly."
+    when: jira_search.meta.issues | default([]) | length == 0
+
+  - name: "1 | End play gracefully when no issues are found"
+    ansible.builtin.meta: end_play
+    when: jira_search.meta.issues | default([]) | length == 0
+
+  - name: "1 | Show issues found"
+    ansible.builtin.debug:
+      msg: "Found {{ jira_search.meta.issues | length }} DDP issue(s): {{ jira_search.meta.issues | map(attribute='key') | list | join(', ') }}"
+
+  - name: "2 | Fetch full details for each issue"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: fetch
+      issue: "{{ item.key }}"
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ jira_search.meta.issues }}"
+    loop_control:
+      label: "{{ item.key }}"
+    register: jira_issue_details
+
+  # -- Parse target host:PDB and the confirmation string ----------------------
+
+  - name: "2 | WARN and skip issues with an unusable or unknown-host target"
+    ansible.builtin.debug:
+      msg:
+      - >-
+        WARNING: {{ item.meta.key }} has an unusable 'Database Instance'
+        value ('{{ p_host_pdb }}') -- skipping.
+        {% if p_host not in oracle_instance_map %}Unknown host '{{ p_host }}' (known: {{ oracle_instance_map.keys() | list | join(', ') }}). {% endif %}
+      - "Populated custom fields on {{ item.meta.key }}:"
+      - "{{ item.meta.fields | dict2items | selectattr('key', 'match', '^customfield_') | rejectattr('value', 'none') | items2dict }}"
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      p_host_pdb: "{{ (item.meta.fields[jira_ddp_target_field] | default({})).value | default('') }}"
+      p_host: "{{ p_host_pdb.split(':')[0] | default('') | trim }}"
+    when: p_host_pdb | length == 0 or p_host not in oracle_instance_map
+
+  - name: "2 | Build the drop job list"
+    ansible.builtin.set_fact:
+      ddp_jobs: >-
+        {{
+          ddp_jobs | default([]) + [{
+            'issue_key':      item.meta.key,
+            'target_host':    p_host,
+            'target_pdb':     p_pdb,
+            'confirm_text':   (item.meta.fields[jira_ddp_confirm_field] | default('', true)) | trim,
+            'oracle_sid':     oracle_instance_map[p_host].oracle_sid,
+            'oracle_home':    oracle_instance_map[p_host].oracle_home,
+            'oracle_user':    oracle_instance_map[p_host].oracle_user
+          }]
+        }}
+    loop: "{{ jira_issue_details.results }}"
+    loop_control:
+      label: "{{ item.meta.key }}"
+    vars:
+      p_host_pdb: "{{ (item.meta.fields[jira_ddp_target_field] | default({})).value | default('') }}"
+      p_host: "{{ p_host_pdb.split(':')[0] | default('') | trim }}"
+      p_pdb: "{{ p_host_pdb.split(':')[1] | default('') | trim | upper }}"
+    when: p_host_pdb | length > 0 and p_host in oracle_instance_map
+
+  - name: "2 | Nothing valid to process"
+    ansible.builtin.meta: end_play
+    when: ddp_jobs | default([]) | length == 0
+
+  # =========================================================================
+  # 3. Guardrails - protected PDB block + confirmation string match
+  #    Blocked issues are commented, transitioned to Failed, and get a DBA
+  #    follow-up here - they never reach the actual drop in step 4.
+  # =========================================================================
+
+  - name: "3 | Determine block reason per job (protected list / bad confirmation)"
+    ansible.builtin.set_fact:
+      ddp_jobs: >-
+        {{
+          ddp_jobs
+          | rejectattr('issue_key', 'equalto', item.issue_key)
+          | list
+          + [ item | combine({
+                'blocked': (block_protected or block_confirm),
+                'block_reason': (
+                  (item.target_pdb + ' is on the protected list (ddp_protected_pdbs) - set ddp_allow_protected_override to bypass, if genuinely intended.')
+                  if block_protected else
+                  ('Confirmation text must read exactly \'CONFIRM DROP ' + item.target_pdb + '\' in the \'Confirm Drop\' field (got: \'' + item.confirm_text + '\').')
+                  if block_confirm else ''
+                )
+              }) ]
+        }}
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    vars:
+      block_protected: >-
+        {{
+          item.target_pdb in ddp_protected_pdbs
+          and not (ddp_allow_protected_override | default(false) | bool)
+        }}
+      block_confirm: "{{ item.confirm_text != ('CONFIRM DROP ' ~ item.target_pdb) }}"
+
+  - name: "3 | Show block status per job"
+    ansible.builtin.debug:
+      msg: >-
+        {{ item.issue_key }} -- target {{ item.target_host }}:{{ item.target_pdb }}:
+        {{ 'BLOCKED - ' + item.block_reason if item.blocked else 'clear to proceed' }}
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "3 | Post block-reason comment for BLOCKED issues"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.issue_key }}"
+      comment: |-
+        DDP aborted before any destructive action was taken.
+
+        Reason: {{ item.block_reason }}
+
+        Target requested : {{ item.target_host }}:{{ item.target_pdb }}
+        Timestamp         : {{ ansible_date_time.iso8601 }}
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.blocked
+    failed_when: false
+
+  # -- Transition BLOCKED issues to Failed (same inline lookup-by-name
+  #    pattern used for the real drop outcomes below) -------------------------
+
+  - name: "3 | Get available transitions for BLOCKED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: item.blocked
+    register: blocked_transitions
+    failed_when: false
+
+  - name: "3 | Transition BLOCKED issues to Failed"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: >-
+            {{
+              (item.json.transitions | selectattr('to.name', 'equalto', jira_status_failed) | map(attribute='id') | list
+               + item.json.transitions | selectattr('name', 'equalto', jira_status_failed) | map(attribute='id') | list) | first
+            }}
+      status_code: 204
+    loop: "{{ blocked_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - ((item.json.transitions | selectattr('to.name', 'equalto', jira_status_failed) | list)
+       + (item.json.transitions | selectattr('name', 'equalto', jira_status_failed) | list)) | length > 0
+    failed_when: false
+
+  - name: "3 | DBA follow-up task for BLOCKED issues"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when: fu_item.blocked
+    vars:
+      fu_original_key: "{{ fu_item.issue_key }}"
+      fu_summary: "DDP blocked: {{ fu_item.block_reason }}"
+      fu_description: |-
+        An automated pluggable database drop request was blocked BEFORE any
+        destructive action was taken, and the original issue has been
+        transitioned to "{{ jira_status_failed }}".
+
+        Target requested : {{ fu_item.target_host }}:{{ fu_item.target_pdb }}
+        Reason            : {{ fu_item.block_reason }}
+
+        If this drop is genuinely intended, review ddp_protected_pdbs and
+        ddp_allow_protected_override in vars/main.yml, or correct the
+        confirmation text in the "Confirm Drop" field, then re-run.
+
+  - name: "3 | Keep only unblocked jobs going forward"
+    ansible.builtin.set_fact:
+      ddp_jobs: "{{ ddp_jobs | rejectattr('blocked') | list }}"
+
+  - name: "3 | Nothing left to process (all remaining jobs were blocked)"
+    ansible.builtin.meta: end_play
+    when: ddp_jobs | default([]) | length == 0
+
+  # =========================================================================
+  # 4. Pre-drop snapshot - captured and posted BEFORE anything destructive
+  # =========================================================================
+
+  - name: "4 | Ensure working directory exists on each target host"
+    ansible.builtin.file:
+      path: "{{ ddp_work_dir }}"
+      state: directory
+      mode: '0750'
+    delegate_to: "{{ item.target_host }}"
+    become: true
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+
+  - name: "4 | Capture pre-drop metadata snapshot"
+    ansible.builtin.shell:
+      cmd: |
+        set -o pipefail
+        export ORACLE_SID={{ item.oracle_sid }}
+        export ORACLE_HOME={{ item.oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOSQL'
+        SET HEADING ON FEEDBACK OFF PAGESIZE 200 LINESIZE 200
+        PROMPT === dba_pdbs ===
+        SELECT pdb_name, status, open_mode FROM dba_pdbs WHERE pdb_name = '{{ item.target_pdb }}';
+        PROMPT === tablespaces ===
+        SELECT tablespace_name FROM cdb_tablespaces WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ item.target_pdb }}');
+        PROMPT === datafiles ===
+        SELECT file_name FROM cdb_data_files WHERE con_id = (SELECT con_id FROM v$pdbs WHERE name = '{{ item.target_pdb }}');
+        EXIT;
+        EOSQL
+      executable: /bin/bash
+    delegate_to: "{{ item.target_host }}"
+    become: true
+    become_user: "{{ item.oracle_user }}"
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.target_pdb }}"
+    register: ddp_snapshot
+    changed_when: false
+    failed_when: false
+
+  - name: "4 | Post pre-drop snapshot as a Jira comment"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.item.issue_key }}"
+      comment: |-
+        Pre-drop metadata snapshot - {{ ansible_date_time.iso8601 }}
+        Target: {{ item.item.target_host }}:{{ item.item.target_pdb }}
+
+        {{ item.stdout | default('(no output - snapshot query failed, rc=' + (item.rc | string) + ')') }}
+
+        Proceeding to drop this pluggable database now.
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ ddp_snapshot.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+    failed_when: false
+
+  # =========================================================================
+  # 5. The drop itself - CLOSE IMMEDIATE, then DROP INCLUDING DATAFILES
+  # =========================================================================
+
+  - name: "5 | Close and drop the pluggable database"
+    ansible.builtin.shell:
+      cmd: |
+        set -o pipefail
+        export ORACLE_SID={{ item.oracle_sid }}
+        export ORACLE_HOME={{ item.oracle_home }}
+        export PATH=$ORACLE_HOME/bin:$PATH
+        sqlplus -s / as sysdba <<'EOSQL'
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+        SET ECHO ON FEEDBACK ON LINESIZE 400 PAGESIZE 200
+        ALTER PLUGGABLE DATABASE "{{ item.target_pdb }}" CLOSE IMMEDIATE;
+        DROP PLUGGABLE DATABASE "{{ item.target_pdb }}" INCLUDING DATAFILES;
+        EXIT;
+        EOSQL
+      executable: /bin/bash
+    delegate_to: "{{ item.target_host }}"
+    become: true
+    become_user: "{{ item.oracle_user }}"
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }} / {{ item.target_pdb }}"
+    register: ddp_drop
+    failed_when: false
+
+  - name: "5 | Determine outcome per job (rc==0 AND no ORA- error text)"
+    ansible.builtin.set_fact:
+      ddp_outcomes: >-
+        {{
+          ddp_outcomes | default({}) | combine({
+            item.item.issue_key: (
+              'done' if (item.rc == 0 and 'ORA-' not in (item.stdout | default('')))
+              else 'failed'
+            )
+          })
+        }}
+    loop: "{{ ddp_drop.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+
+  - name: "5 | Per-issue outcome"
+    ansible.builtin.debug:
+      msg: "{{ item.key }} -> {{ item.value | upper }}"
+    loop: "{{ ddp_outcomes | dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+
+  # =========================================================================
+  # 6. Post the drop log as a Jira comment
+  # =========================================================================
+
+  - name: "6 | Post drop result as a Jira comment"
+    community.general.jira:
+      uri: "{{ jira_url }}"
+      username: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      operation: comment
+      issue: "{{ item.item.issue_key }}"
+      comment: |-
+        Automated Oracle PDB drop - {{ ansible_date_time.iso8601 }}
+        Target         : {{ item.item.target_host }}:{{ item.item.target_pdb }}
+        Overall result : {{ ddp_outcomes[item.item.issue_key] | upper }}
+
+        {{ item.stdout | default('(no output)') }}
+        {% if item.rc != 0 %}
+        stderr:
+        {{ item.stderr | default('(none)') }}
+        {% endif %}
+
+        Performed by : {{ jira_user }} (Ansible automation)
+      cloud: "{{ jira_cloud }}"
+    loop: "{{ ddp_drop.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key }}"
+    failed_when: false
+
+  # =========================================================================
+  # 7. Transition issues based on outcome
+  # =========================================================================
+
+  - name: "7 | Get available transitions for SUCCESSFUL issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: ddp_outcomes[item.issue_key] == 'done'
+    register: done_transitions
+    failed_when: false
+
+  - name: "7 | Apply the 'Done' transition"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: >-
+            {{
+              (item.json.transitions | selectattr('to.name', 'equalto', jira_status_done) | map(attribute='id') | list
+               + item.json.transitions | selectattr('name', 'equalto', jira_status_done) | map(attribute='id') | list) | first
+            }}
+      status_code: 204
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - (item.json.transitions | selectattr('to.name', 'equalto', jira_status_done) | list
+       + item.json.transitions | selectattr('name', 'equalto', jira_status_done) | list) | length > 0
+    failed_when: false
+
+  - name: "7 | WARN when no 'Done' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} succeeded but could NOT be
+        transitioned to '{{ jira_status_done }}' -- the workflow only offers:
+        {{ item.json.transitions | map(attribute='name') | list | join(', ') }}.
+    loop: "{{ done_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - (item.json.transitions | selectattr('to.name', 'equalto', jira_status_done) | list
+       + item.json.transitions | selectattr('name', 'equalto', jira_status_done) | list) | length == 0
+
+  - name: "7 | Get available transitions for FAILED issues"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.issue_key }}/transitions"
+      method: GET
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      return_content: true
+      status_code: 200
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      label: "{{ item.issue_key }}"
+    when: ddp_outcomes[item.issue_key] == 'failed'
+    register: failed_transitions
+    failed_when: false
+
+  - name: "7 | Apply the 'Failed' transition"
+    ansible.builtin.uri:
+      url: "{{ jira_url }}/rest/api/2/issue/{{ item.item.issue_key }}/transitions"
+      method: POST
+      user: "{{ jira_user }}"
+      password: "{{ jira_api_token }}"
+      force_basic_auth: true
+      body_format: json
+      body:
+        transition:
+          id: >-
+            {{
+              (item.json.transitions | selectattr('to.name', 'equalto', jira_status_failed) | map(attribute='id') | list
+               + item.json.transitions | selectattr('name', 'equalto', jira_status_failed) | map(attribute='id') | list) | first
+            }}
+      status_code: 204
+    loop: "{{ failed_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - (item.json.transitions | selectattr('to.name', 'equalto', jira_status_failed) | list
+       + item.json.transitions | selectattr('name', 'equalto', jira_status_failed) | list) | length > 0
+    failed_when: false
+
+  - name: "7 | WARN when no 'Failed' transition is available"
+    ansible.builtin.debug:
+      msg: >-
+        WARNING: {{ item.item.issue_key }} failed but could NOT be
+        transitioned to '{{ jira_status_failed }}' -- the workflow only offers:
+        {{ item.json.transitions | map(attribute='name') | list | join(', ') }}.
+    loop: "{{ failed_transitions.results | default([]) }}"
+    loop_control:
+      label: "{{ item.item.issue_key | default('skipped') }}"
+    when:
+    - item is not skipped
+    - (item.json.transitions | selectattr('to.name', 'equalto', jira_status_failed) | list
+       + item.json.transitions | selectattr('name', 'equalto', jira_status_failed) | list) | length == 0
+
+  # =========================================================================
+  # 8. DBA repair follow-up for genuine drop failures
+  # =========================================================================
+
+  - name: "8 | DBA follow-up task for FAILED drops"
+    ansible.builtin.include_tasks: COMMON_jira_create_followup_task.yml
+    loop: "{{ ddp_jobs }}"
+    loop_control:
+      loop_var: fu_item
+      label: "{{ fu_item.issue_key }}"
+    when: ddp_outcomes[fu_item.issue_key] == 'failed'
+    vars:
+      fu_original_key: "{{ fu_item.issue_key }}"
+      fu_summary: "DBA repair required: PDB drop failed for {{ fu_item.target_host }}:{{ fu_item.target_pdb }}"
+      fu_description: |-
+        Automated Oracle pluggable database drop FAILED and the original
+        issue has been transitioned to "{{ jira_status_failed }}". Please
+        investigate - the PDB may be left in an inconsistent state (closed
+        but not dropped, or partially dropped).
+
+        Target : {{ fu_item.target_host }}:{{ fu_item.target_pdb }}
+
+        See the comments on {{ fu_item.issue_key }} for the pre-drop
+        snapshot and the full drop attempt output.
+
+  # =========================================================================
+  # 9. Summary
+  # =========================================================================
+
+  - name: "9 | Final summary"
+    ansible.builtin.debug:
+      msg:
+      - "======================================================"
+      - "  Jira PDB Drop (DDP) Summary"
+      - "======================================================"
+      - "  Run timestamp   : {{ ansible_date_time.iso8601 }}"
+      - "  Issues found    : {{ jira_search.meta.issues | length }}"
+      - "  Dropped OK      : {{ ddp_outcomes | default({}) | dict2items | selectattr('value', 'equalto', 'done') | list | length }}"
+      - "  Failed          : {{ ddp_outcomes | default({}) | dict2items | selectattr('value', 'equalto', 'failed') | list | length }}"
+      - "======================================================"
