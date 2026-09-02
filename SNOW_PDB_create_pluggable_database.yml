@@ -443,6 +443,17 @@
         ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" OPEN READ WRITE;
         ALTER SESSION SET CONTAINER = "{{ item.pdb_name }}";
         GRANT CONNECT, RESOURCE, CREATE SESSION TO "{{ pdb_admin_user }}";
+        -- Provision this PDB's own local ROLLBACK/REFRESH directory objects
+        -- now, at creation time, rather than leaving future DDP/REF runs to
+        -- discover they're missing. Directory objects are per-container in
+        -- multitenant Oracle - a directory created in CDB$ROOT (or in any
+        -- other PDB) is NOT visible here. CREATE DIRECTORY silently redefines
+        -- the path if the name already exists, so this is safe to run even
+        -- if a PDB is ever recreated under the same name.
+        CREATE DIRECTORY ROLLBACK AS '/rollback';
+        GRANT READ, WRITE ON DIRECTORY ROLLBACK TO PUBLIC;
+        CREATE DIRECTORY REFRESH AS '/refresh';
+        GRANT READ, WRITE ON DIRECTORY REFRESH TO PUBLIC;
         ALTER SESSION SET CONTAINER = CDB$ROOT;
         ALTER PLUGGABLE DATABASE "{{ item.pdb_name }}" SAVE STATE;
         EXIT;
