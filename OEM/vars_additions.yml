@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Host CPU alert automation - add these to /etc/ansible/vars/main.yml
+# ---------------------------------------------------------------------------
+
+# Critical SERVICE_NAMEs that must always be protected by Resource Manager,
+# and must NEVER be auto-throttled by the reactive resolver even if somehow
+# matched elsewhere. This is the "10 mission-critical databases" list -
+# keyed by service name (not SQL_ID, which changes across hard parses).
+oem_cpu_protected_services:
+  - "PROD_OLTP_FIN"
+  - "PROD_OLTP_ORDERS"
+  - "PROD_OLTP_CRM"
+  # ... add the remaining critical services here
+
+# Known ad-hoc / low-business-impact CLIENT_PROGRAM values, safe to throttle.
+# service: "ANY" matches regardless of which database/service the session is on.
+# module/program values are matched case-insensitively, substring match.
+oem_cpu_low_impact_combos:
+  - { service: "ANY", program: "sqlplus" }
+  - { service: "ANY", program: "toad" }
+  - { service: "ANY", program: "sqldeveloper" }
+  - { service: "REPORTING", program: "ANY" }
+
+# Known, expected recurring OS-level jobs that are safe to auto-throttle via
+# a systemd/cgroups CPU fence when they're identified as the top consumer.
+# pattern is matched against the process command line (case-insensitive).
+oem_cpu_known_os_jobs:
+  - { pattern: "rman", cpu_quota: "30%", nice: 15 }
+  - { pattern: "expdp", cpu_quota: "40%", nice: 10 }
+  - { pattern: "rsync", cpu_quota: "25%", nice: 15 }
+  - { pattern: "gzip", cpu_quota: "25%", nice: 15 }
+
+# Resource Manager plan settings used by the provisioning playbook
+oem_cpu_plan_name: "HOST_CPU_PROTECT_PLAN"
+oem_cpu_critical_group: "CRITICAL_CG"
+oem_cpu_adhoc_group: "ADHOC_REPORTING"
+oem_cpu_critical_mgmt_p1: 80
+oem_cpu_adhoc_mgmt_p1: 20
+oem_cpu_adhoc_switch_time_secs: 60

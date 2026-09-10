@@ -1,0 +1,301 @@
+---
+# SNOW_OEM_resolve_host_cpu_incident.yml
+# Included per-incident by the dispatcher when the alert is a Host CPU metric
+# (routing happens in SNOW_OEM_oracle_auto_resolve.yml - see routing note
+# there). Follows the same connection pattern as the tablespace resolver:
+# direct `ssh oracle@host` for every remote action, no delegate_to/become.
+#
+# This resolver NEVER kills a session and NEVER touches an unrecognized
+# process. It only acts (throttle) when the offending session/process is
+# positively identified against the maintained low-impact/known-job lists;
+# anything else is documented and escalated for a human decision, matching
+# the "notify, don't auto-kill by default" requirement.
+
+- name: "Reset per-incident facts (host CPU)"
+  ansible.builtin.set_fact:
+    oem_host: "{{ incident.u_oem_host }}"
+    oem_target_name: "{{ incident.u_oem_target_name }}"
+
+- name: "Guard - host must be in oracle_instance_map"
+  block:
+    - name: "Set connection facts"
+      ansible.builtin.set_fact:
+        oem_oracle_sid: "{{ oracle_instance_map[oem_host].oracle_sid }}"
+        oem_oracle_home: "{{ oracle_instance_map[oem_host].oracle_home }}"
+        oem_ssh_target: "oracle@{{ hostvars[oem_host].ansible_host }}"
+        oem_incident_id_oem: "{{ incident.u_oem_incident_id }}"
+      when: oem_host in oracle_instance_map
+
+    - name: "Post failure note if host is unknown"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: >-
+          Auto-remediation FAILED: host '{{ oem_host }}' is not present in
+          oracle_instance_map. Manual DBA intervention required.
+      when: oem_host not in oracle_instance_map
+
+- name: "Continue only if host was recognized"
+  when: oem_oracle_sid is defined
+  block:
+
+    - name: "Claim incident - mark In Progress"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: >-
+          Auto-diagnosis started by Ansible: Host CPU alert on
+          {{ oem_target_name }} ({{ oem_host }}).
+        note_set_state: 2
+
+    # --- Step 1: OS-level - who is actually consuming CPU right now? -----
+    - name: "Check top CPU-consuming OS processes"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} \"ps -eo pid,user,pcpu,etime,cmd --sort=-pcpu --no-headers | head -5\""
+      register: oem_top_procs
+      changed_when: false
+
+    - name: "Parse top process"
+      ansible.builtin.set_fact:
+        oem_top_proc_line: "{{ oem_top_procs.stdout_lines[0] | trim }}"
+        oem_top_proc_user: "{{ (oem_top_procs.stdout_lines[0] | trim).split()[1] }}"
+
+    - name: "Post OS-level diagnostic note"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: |-
+          Top 5 CPU-consuming processes on {{ oem_host }}
+          (ps -eo pid,user,pcpu,etime,cmd --sort=-pcpu):
+
+          {{ oem_top_procs.stdout }}
+
+          Top consumer's owning OS user: {{ oem_top_proc_user }}
+
+    # --- Step 2a: If it's Oracle, identify the session/SQL via ASH -------
+    - name: "Diagnose via ASH if top consumer is the oracle OS user"
+      when: oem_top_proc_user == oracle_instance_map[oem_host].oracle_user
+      block:
+        - name: "Remove any stale ASH check script"
+          ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_cpu_ash_{{ incident.sys_id }}.sh'"
+          changed_when: false
+
+        - name: "Write ASH diagnostic script"
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+            "cat > /tmp/oem_cpu_ash_{{ incident.sys_id }}.sh && chmod 700 /tmp/oem_cpu_ash_{{ incident.sys_id }}.sh"
+          args:
+            stdin: |
+              #!/bin/bash
+              export ORACLE_HOME={{ oem_oracle_home }}
+              export ORACLE_SID={{ oem_oracle_sid }}
+              export PATH=$ORACLE_HOME/bin:$PATH
+              $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+              set pagesize 0 feedback off verify off heading off echo off linesize 500
+              select nvl(service_name,'UNKNOWN')||'|'||nvl(program,'UNKNOWN')||'|'||nvl(module,'UNKNOWN')||'|'||
+                     nvl(machine,'UNKNOWN')||'|'||nvl(osuser,'UNKNOWN')||'|'||nvl(sql_id,'NONE')||'|'||count(*)
+              from v\$active_session_history
+              where sample_time > sysdate - interval '15' minute
+                and session_state = 'ON CPU'
+              group by service_name, program, module, machine, osuser, sql_id
+              order by count(*) desc
+              fetch first 1 rows only;
+              SQL
+          changed_when: true
+
+        - name: "Run ASH diagnostic"
+          ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} /tmp/oem_cpu_ash_{{ incident.sys_id }}.sh"
+          register: oem_ash_result
+          changed_when: false
+
+        - name: "Clean up ASH script"
+          ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_cpu_ash_{{ incident.sys_id }}.sh'"
+          changed_when: false
+
+        - name: "Parse ASH result"
+          ansible.builtin.set_fact:
+            oem_ash_found: "{{ (oem_ash_result.stdout_lines | default([]) | length > 0) and ('|' in (oem_ash_result.stdout_lines[0] | default(''))) }}"
+
+        - name: "Handle a genuine ASH match"
+          when: oem_ash_found | bool
+          block:
+            - name: "Set session facts"
+              ansible.builtin.set_fact:
+                oem_cpu_service: "{{ oem_ash_result.stdout_lines[0].split('|')[0] }}"
+                oem_cpu_program: "{{ oem_ash_result.stdout_lines[0].split('|')[1] }}"
+                oem_cpu_module: "{{ oem_ash_result.stdout_lines[0].split('|')[2] }}"
+                oem_cpu_machine: "{{ oem_ash_result.stdout_lines[0].split('|')[3] }}"
+                oem_cpu_osuser: "{{ oem_ash_result.stdout_lines[0].split('|')[4] }}"
+                oem_cpu_sql_id: "{{ oem_ash_result.stdout_lines[0].split('|')[5] }}"
+                oem_cpu_samples: "{{ oem_ash_result.stdout_lines[0].split('|')[6] }}"
+
+            - name: "Classify: is this service protected (never touch)?"
+              ansible.builtin.set_fact:
+                oem_cpu_is_protected: "{{ oem_cpu_service in oem_cpu_protected_services }}"
+
+            - name: "Classify: does this match a known low-impact combo?"
+              ansible.builtin.set_fact:
+                oem_cpu_is_low_impact: >-
+                  {{ oem_cpu_low_impact_combos
+                     | selectattr('program', 'defined')
+                     | selectattr('program', 'ne', 'ANY')
+                     | selectattr('program', 'in', [oem_cpu_program | lower])
+                     | list | length > 0
+                     or
+                     oem_cpu_low_impact_combos
+                     | selectattr('service', 'defined')
+                     | selectattr('service', 'ne', 'ANY')
+                     | selectattr('service', 'equalto', oem_cpu_service)
+                     | list | length > 0 }}
+
+            - name: "Post classification + full diagnostic note"
+              ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+              vars:
+                note_incident_sys_id: "{{ incident.sys_id }}"
+                note_text: |-
+                  ASH diagnosis on {{ oem_host }} (last 15 min, ON CPU samples):
+                  service={{ oem_cpu_service }}, program={{ oem_cpu_program }},
+                  module={{ oem_cpu_module }}, machine={{ oem_cpu_machine }},
+                  osuser={{ oem_cpu_osuser }}, sql_id={{ oem_cpu_sql_id }},
+                  samples={{ oem_cpu_samples }}
+
+                  Classification: protected={{ oem_cpu_is_protected }}, low_impact={{ oem_cpu_is_low_impact }}
+                  {{ 'Action: PROTECTED SERVICE - no automated action will be taken regardless of classification.' if oem_cpu_is_protected else ('Action: recognized low-impact pattern - throttling this session.' if oem_cpu_is_low_impact else 'Action: UNRECOGNIZED combination - no automated action taken, escalating for DBA review.') }}
+
+            - name: "Throttle the session if low-impact and not protected"
+              when: (oem_cpu_is_low_impact | bool) and not (oem_cpu_is_protected | bool)
+              block:
+                - name: "Find a currently active session matching this SQL_ID"
+                  ansible.builtin.shell: >
+                    ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+                    "export ORACLE_HOME={{ oem_oracle_home }}; export ORACLE_SID={{ oem_oracle_sid }}; export PATH=$ORACLE_HOME/bin:$PATH; $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+                    set pagesize 0 feedback off verify off heading off echo off
+                    select sid||'|'||serial# from v\$session where sql_id = '{{ oem_cpu_sql_id }}' and status='ACTIVE' and rownum=1;
+                    SQL"
+                  register: oem_live_session
+                  changed_when: false
+
+                - name: "Switch the session to the throttled consumer group, if still active"
+                  when: oem_live_session.stdout_lines | default([]) | length > 0 and '|' in (oem_live_session.stdout_lines[0] | default(''))
+                  block:
+                    - name: "Set sid/serial facts"
+                      ansible.builtin.set_fact:
+                        oem_cpu_sid: "{{ oem_live_session.stdout_lines[0].split('|')[0] }}"
+                        oem_cpu_serial: "{{ oem_live_session.stdout_lines[0].split('|')[1] }}"
+
+                    - name: "Execute the consumer group switch"
+                      ansible.builtin.shell: >
+                        ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+                        "export ORACLE_HOME={{ oem_oracle_home }}; export ORACLE_SID={{ oem_oracle_sid }}; export PATH=$ORACLE_HOME/bin:$PATH; $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+                        set feedback on
+                        exec DBMS_RESOURCE_MANAGER.SWITCH_CONSUMER_GROUP_FOR_SESS('{{ oem_cpu_sid }}','{{ oem_cpu_serial }}','{{ oem_cpu_adhoc_group }}');
+                        SQL"
+                      register: oem_switch_result
+
+                    - name: "Post throttle action + notify session owner"
+                      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+                      vars:
+                        note_incident_sys_id: "{{ incident.sys_id }}"
+                        note_text: |-
+                          Throttled session SID={{ oem_cpu_sid }}, SERIAL#={{ oem_cpu_serial }}
+                          (osuser={{ oem_cpu_osuser }}, program={{ oem_cpu_program }}) into
+                          consumer group {{ oem_cpu_adhoc_group }}.
+
+                          Raw output:
+                          {{ oem_switch_result.stdout }}
+
+                          Notification: session owner ({{ oem_cpu_osuser }}) notified via this
+                          incident record - no session was killed. If CPU remains elevated,
+                          this incident will escalate to the on-call DBA.
+
+                - name: "Note that no live session was found to act on"
+                  ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+                  vars:
+                    note_incident_sys_id: "{{ incident.sys_id }}"
+                    note_text: >-
+                      SQL_ID {{ oem_cpu_sql_id }} was identified via ASH but is no longer
+                      an active session - no live action taken. Monitoring for recurrence.
+                  when: not (oem_live_session.stdout_lines | default([]) | length > 0 and '|' in (oem_live_session.stdout_lines[0] | default('')))
+
+            # --- Escalation path: protected OR unrecognized -> human only ---
+            - name: "Escalate to on-call DBA (protected service or unrecognized pattern)"
+              when: (oem_cpu_is_protected | bool) or not (oem_cpu_is_low_impact | bool)
+              ansible.builtin.uri:
+                url: "{{ sn_instance }}/api/now/table/incident/{{ incident.sys_id }}"
+                method: PATCH
+                user: "{{ sn_username }}"
+                password: "{{ sn_password }}"
+                force_basic_auth: true
+                body_format: json
+                body:
+                  urgency: "1"
+                  assignment_group: "Database Atlanta"
+                  work_notes: >-
+                    Escalated to on-call DBA: this session requires a manual
+                    kill/throttle decision and will not be acted on automatically.
+                status_code: 200
+
+        - name: "Note that ASH found nothing conclusive"
+          ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+          vars:
+            note_incident_sys_id: "{{ incident.sys_id }}"
+            note_text: >-
+              Top OS consumer is the oracle user, but ASH returned no clear
+              single session/SQL responsible for CPU over the last 15 minutes
+              (load may be spread across many short sessions). Escalating for
+              DBA review.
+          when: not (oem_ash_found | bool)
+
+    # --- Step 2b: If it's NOT Oracle, check known recurring jobs ----------
+    - name: "Handle a non-Oracle top consumer"
+      when: oem_top_proc_user != oracle_instance_map[oem_host].oracle_user
+      vars:
+        oem_matched_job: >-
+          {{ oem_cpu_known_os_jobs | selectattr('pattern', 'in', [oem_top_proc_line | lower]) | list }}
+      block:
+        - name: "Apply a CPU fence if this is a known recurring job"
+          when: oem_matched_job | length > 0
+          block:
+            - name: "Extract the PID of the top consumer"
+              ansible.builtin.set_fact:
+                oem_top_pid: "{{ (oem_top_proc_line | trim).split()[0] }}"
+
+            - name: "Apply systemd CPU fence"
+              ansible.builtin.shell: >
+                ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+                "sudo systemctl set-property --runtime user-$(id -u {{ oem_top_proc_user }}).slice CPUQuota={{ oem_matched_job[0].cpu_quota }} 2>&1 || echo FENCE_FAILED_NEEDS_SUDO"
+              register: oem_fence_result
+
+            - name: "Post throttle note"
+              ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+              vars:
+                note_incident_sys_id: "{{ incident.sys_id }}"
+                note_text: |-
+                  Non-Oracle top consumer identified as a known recurring job
+                  (matched pattern: {{ oem_matched_job[0].pattern }}).
+                  Applied CPU fence: {{ oem_matched_job[0].cpu_quota }} via systemd.
+
+                  Raw output:
+                  {{ oem_fence_result.stdout }}
+
+        - name: "Escalate - unrecognized non-Oracle process"
+          when: oem_matched_job | length == 0
+          ansible.builtin.uri:
+            url: "{{ sn_instance }}/api/now/table/incident/{{ incident.sys_id }}"
+            method: PATCH
+            user: "{{ sn_username }}"
+            password: "{{ sn_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              urgency: "1"
+              assignment_group: "Database Atlanta"
+              work_notes: >-
+                Top CPU consumer is process '{{ oem_top_proc_line }}' - not
+                Oracle, and not on the known recurring-job list. No automated
+                action taken. Escalated to on-call DBA for manual review.
+            status_code: 200
+
+# NOTE: this resolver deliberately never sets state=6/Resolved. Resolution
+# only happens when OEM's own next collection cycle observes CPU back under
+# threshold and fires the Clear event through the same generic webhook -
+# identical closing mechanism to the tablespace resolver.

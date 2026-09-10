@@ -1,0 +1,32 @@
+---
+# SNOW_OEM_provision_resource_manager.yml
+# ONE-TIME SETUP PLAYBOOK - run manually, not on a schedule, and not per-incident.
+# Provisions a Resource Manager plan + consumer groups + automatic session
+# classification on every database in oracle_instance_map, so that CPU
+# protection for critical services is always-on and native to Oracle,
+# rather than something the reactive alert-driven resolver has to enforce
+# after the fact.
+#
+# Safe to re-run: uses CREATE_PENDING_AREA / VALIDATE / SUBMIT, and DROPs
+# the prior plan/groups first if they already exist, so this is idempotent.
+#
+# Usage: ansible-playbook /etc/ansible/OEM/SNOW_OEM_provision_resource_manager.yml
+#        (optionally: --extra-vars "target_hosts=lnx003" to limit to one host)
+
+- name: Provision Resource Manager CPU protection on every known Oracle host
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+
+  tasks:
+    - name: Build the list of hosts to provision
+      ansible.builtin.set_fact:
+        oem_cpu_target_hosts: "{{ [target_hosts] if (target_hosts | default('')) | length > 0 else (oracle_instance_map.keys() | list) }}"
+
+    - name: Provision each host
+      ansible.builtin.include_tasks: SNOW_OEM_provision_one_host.yml
+      loop: "{{ oem_cpu_target_hosts }}"
+      loop_control:
+        loop_var: prov_host

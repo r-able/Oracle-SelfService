@@ -1,0 +1,620 @@
+---
+# SNOW_ALR_tablespace_resolution.yml
+#
+# Triggered by the HPsuperdome webhook listener (oem_alr_webhook_listener.py)
+# the instant ServiceNow creates an Incident from an OEM "Tablespace Full"
+# notification. Fetches the incident, extracts the target host/tablespace
+# from its short_description (format: "ALR | <host> | <db_target> | <tablespace> | <oem_incident_id>"),
+# runs the appropriate remediation, uploads a log, and resolves/closes the
+# incident.
+#
+# ARCHITECTURE DECISION (2026-09-05): remediation runs via direct Ansible
+# SSH + sqlplus, matching the existing 9-project pattern - NOT via emcli
+# create_job_from_library. EM CLI is scoped only to managing OEM's own
+# incident (acknowledge, comment), never the database.
+#
+# CAPACITY SAFEGUARD (2026-09-06): before adding a new datafile, checks
+# whether doing so would push the total committed MAXSIZE ceiling of every
+# datafile/tempfile - across every SID in /etc/oratab on that host, not
+# just the tablespace being extended - past a safety threshold of the
+# physical mount's TOTAL size (not currently-free space; see rationale
+# below). If it would, no datafile is added; instead two follow-up Change
+# Requests are opened (storage team + DBA team) and the incident is left
+# In Progress rather than resolved.
+#
+# INTERPRETATION FLAGGED FOR VLAD: "75% of available space" is implemented
+# here as 75% of the mount's TOTAL disk size, not `df`-reported free space.
+# Comparing worst-case committed MAXSIZE totals against merely-free space
+# would fail on nearly every healthy system, since most datafiles never
+# grow anywhere near their ceiling. If you meant literal free space, change
+# alr_capacity_use_total_size to false and adjust alr_capacity_check.py's
+# threshold calc accordingly (mounts[i][2] instead of mounts[i][1]).
+#
+# BUG FIX (2026-09-06): the original production-path SQL picked the
+# "largest existing datafile" via `WHERE ROWNUM=1 ORDER BY bytes DESC` -
+# ROWNUM filters BEFORE ORDER BY sorts, so this picked an arbitrary
+# datafile, not the largest one. Fixed here (and in the new target-directory
+# lookup) using a subquery: `SELECT ... FROM (SELECT ... ORDER BY bytes DESC)
+# WHERE ROWNUM=1`.
+#
+# Required extra-vars (passed by the webhook listener):
+#   incident_number   e.g. INC0010234
+#
+# ASSUMPTIONS FLAGGED FOR VLAD TO CONFIRM:
+#   - close_code choice value 'Solution provided' - CONFIRMED against this
+#     instance's sys_choice list on 2026-09-05.
+#   - Incident category/assignment_group values are placeholders except
+#     where noted as confirmed.
+#   - Follow-up Change Request field names CONFIRMED (2026-09-06) via
+#     `ansible-doc servicenow.itsm.change_request`: type (REQUIRED -
+#     standard/normal/emergency), state, short_description, description,
+#     category, assignment_group are ALL top-level parameters (not nested
+#     under `other:` - same lesson as the incident module's close_code).
+#     category choices are lowercase (hardware, software, inquiry,
+#     database, network, ...) per the module's default choice list.
+#   - Storage CR assignment_group: "Hardware" (confirmed by Vlad 2026-09-06).
+#   - DBA CR assignment_group: "Database Atlanta" (reused from established
+#     convention in the other 9 projects - not re-confirmed this session).
+#   - TEST_ tablespace naming convention used to distinguish "safe to drop"
+#     test scenarios from "real" production capacity events.
+#   - EM CLI incident-lookup/acknowledge/clear verb names are CONFIRMED
+#     (2026-09-05): `manage_incident` (acknowledge via -assign_to=SYSMAN)
+#     and `add_comment_to_incident`. No single-incident "clear now" verb
+#     exists - the OEM incident is left to auto-clear on its next scheduled
+#     metric collection rather than being force-cleared.
+
+- name: Resolve OEM tablespace-full incident
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - /etc/ansible/vars/main.yml   # sn_instance, sn_username, sn_password, oracle_instance_map
+
+  vars:
+    alr_work_dir: "/tmp/alr_tablespace_{{ incident_number }}"
+    alr_prod_extend_mb: 500          # size of new datafile added for real (non-test) tablespaces
+    alr_new_datafile_maxsize_gb: 3   # MAXSIZE ceiling for new datafiles (confirmed with Vlad 2026-09-06)
+    alr_capacity_safety_pct: 0.75    # new commitments must not push total committed MAXSIZE past this % of mount size
+    alr_oms_host: lnx003             # where EM CLI is installed/configured - OMS host, NOT the DB target's host
+    alr_emcli_bin: /u01/app/oracle/emcli/emcli
+    alr_emcli_user: oracle
+    alr_capacity_script: /etc/ansible/OEM/alr_capacity_check.py
+
+  tasks:
+
+    - name: Fail fast if incident_number wasn't passed
+      ansible.builtin.fail:
+        msg: "incident_number is required (pass via -e incident_number=INC00xxxxx)"
+      when: incident_number is not defined or incident_number | length == 0
+
+    - name: Ensure working directory exists (0755 base / 0777 leaf - oracle needs to write)
+      ansible.builtin.file:
+        path: "{{ alr_work_dir }}"
+        state: directory
+        mode: "0777"
+
+    - name: Fetch the incident record from ServiceNow
+      servicenow.itsm.incident_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+      register: alr_incident_lookup
+
+    - name: Fail if incident not found
+      ansible.builtin.fail:
+        msg: "No incident found for number {{ incident_number }}"
+      when: alr_incident_lookup.records | length == 0
+
+    - name: Extract the incident record
+      ansible.builtin.set_fact:
+        alr_incident: "{{ alr_incident_lookup.records[0] }}"
+
+    - name: Parse short_description "ALR | host | db_target | tablespace_name | oem_incident_id"
+      ansible.builtin.set_fact:
+        alr_parts: "{{ alr_incident.short_description.split('|') | map('trim') | list }}"
+
+    - name: Self-diagnosing WARNING if short_description doesn't match expected format
+      ansible.builtin.fail:
+        msg: >-
+          short_description did not parse into 5 pipe-separated parts.
+          Got: "{{ alr_incident.short_description }}". Expected format:
+          "ALR | host | db_target | tablespace_name | oem_incident_id". Check
+          the ServiceNow Scripted REST API script that builds this field
+          from the OEM webhook payload.
+      when: alr_parts | length != 5
+
+    - name: Set target facts
+      ansible.builtin.set_fact:
+        alr_host: "{{ alr_parts[1] }}"
+        alr_db_target: "{{ alr_parts[2] }}"
+        alr_tablespace: "{{ alr_parts[3] }}"
+        alr_oem_incident_id: "{{ alr_parts[4] }}"
+
+    - name: Look up Oracle connection details for this host
+      ansible.builtin.set_fact:
+        alr_oracle_home: "{{ oracle_instance_map[alr_host].oracle_home }}"
+        alr_oracle_sid: "{{ oracle_instance_map[alr_host].oracle_sid }}"
+        alr_oracle_user: "{{ oracle_instance_map[alr_host].oracle_user }}"
+
+    - name: Self-diagnosing WARNING if host isn't in oracle_instance_map
+      ansible.builtin.fail:
+        msg: >-
+          Host "{{ alr_host }}" was not found in oracle_instance_map
+          (vars/main.yml). Available hosts: {{ oracle_instance_map.keys() | list }}
+      when: alr_host not in oracle_instance_map
+
+    - name: Mark ServiceNow incident In Progress and add work note
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            Automation (ALR playbook) picked up this incident.
+            Target: {{ alr_host }} / {{ alr_db_target }} / tablespace {{ alr_tablespace }}.
+            Determining remediation action.
+
+    # =====================================================================
+    # EM CLI - OEM-side incident acknowledgment. Runs via a plain SSH
+    # command from the controller directly to oracle@lnx003, NOT through
+    # Ansible's command module + become/delegate_to (lnx003's Python is
+    # too old for ansible-core 2.21's module requirements, and becoming an
+    # unprivileged user hits a separate confirmed ansible-core ACL bug).
+    # =====================================================================
+    - name: Acknowledge the OEM incident (assign to SYSMAN, which auto-acknowledges)
+      ansible.builtin.command: >
+        ssh {{ alr_emcli_user }}@{{ alr_oms_host }}
+        '{{ alr_emcli_bin }} manage_incident -incident_id="{{ alr_oem_incident_id }}" -assign_to=SYSMAN -comment="Automation (ALR playbook) picked up this incident. Target: {{ alr_host }} / {{ alr_db_target }} / tablespace {{ alr_tablespace }}. Remediation in progress - see ServiceNow {{ incident_number }} for full detail."'
+      delegate_to: localhost
+      register: alr_oem_ack_result
+      failed_when: false
+      when: alr_oem_incident_id != 'UNKNOWN'
+
+    - name: Self-diagnosing WARNING if OEM incident_id was never captured
+      ansible.builtin.debug:
+        msg: >-
+          alr_oem_incident_id came through as 'UNKNOWN' - the OEM
+          notification method's payload template did not supply
+          oem_incident_id, or the Scripted REST API script isn't passing
+          it through. EM CLI acknowledge step was skipped. Check OEM's
+          Notification Method body template.
+      when: alr_oem_incident_id == 'UNKNOWN'
+
+    # --- Decide which remediation path applies -------------------------
+    - name: Determine whether this is a disposable test tablespace
+      ansible.builtin.set_fact:
+        alr_is_test_tablespace: "{{ alr_tablespace is match('^TEST_.*') }}"
+
+    # =====================================================================
+    # CAPACITY SAFEGUARD - only applies to the production (add-datafile)
+    # path. Skipped entirely for disposable TEST_ tablespaces, which are
+    # dropped, not extended.
+    # =====================================================================
+
+    - name: Write SQL to find the target directory for the new datafile (bug-fixed ROWNUM/ORDER BY)
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/get_target_dir.sql"
+        mode: "0644"
+        content: |
+          SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON
+          SELECT file_name FROM (
+            SELECT file_name FROM dba_data_files
+            WHERE tablespace_name = '{{ alr_tablespace }}'
+            ORDER BY bytes DESC
+          ) WHERE ROWNUM = 1;
+          EXIT;
+      when: not alr_is_test_tablespace
+
+    - name: Write SQL to inventory every datafile/tempfile across every SID in /etc/oratab
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/inventory_one_sid.sql"
+        mode: "0644"
+        content: |
+          SET SERVEROUTPUT ON SIZE UNLIMITED
+          SET PAGESIZE 0 FEEDBACK OFF HEADING OFF LINESIZE 500 TRIMSPOOL ON VERIFY OFF
+          DECLARE
+            v_cdb VARCHAR2(3);
+          BEGIN
+            SELECT cdb INTO v_cdb FROM v$database;
+            IF v_cdb = 'YES' THEN
+              FOR r IN (SELECT file_name fn, CASE WHEN maxbytes = 0 THEN bytes ELSE maxbytes END cb FROM cdb_data_files
+                        UNION ALL
+                        SELECT file_name, CASE WHEN maxbytes = 0 THEN bytes ELSE maxbytes END FROM cdb_temp_files) LOOP
+                DBMS_OUTPUT.PUT_LINE('&1|' || r.fn || '|' || r.cb);
+              END LOOP;
+            ELSE
+              FOR r IN (SELECT file_name fn, CASE WHEN maxbytes = 0 THEN bytes ELSE maxbytes END cb FROM dba_data_files
+                        UNION ALL
+                        SELECT file_name, CASE WHEN maxbytes = 0 THEN bytes ELSE maxbytes END FROM dba_temp_files) LOOP
+                DBMS_OUTPUT.PUT_LINE('&1|' || r.fn || '|' || r.cb);
+              END LOOP;
+            END IF;
+          END;
+          /
+          EXIT;
+      when: not alr_is_test_tablespace
+
+    - name: Write the oratab-looping wrapper shell script
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/run_inventory.sh"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          OUT="{{ alr_work_dir }}/datafile_inventory.txt"
+          > "$OUT"
+          while IFS=: read -r sid home rest; do
+            case "$sid" in
+              ''|'#'*|'*') continue ;;
+            esac
+            ORACLE_SID="$sid"
+            ORACLE_HOME="$home"
+            export ORACLE_SID ORACLE_HOME
+            PATH="$ORACLE_HOME/bin:$PATH"
+            export PATH
+            "$ORACLE_HOME/bin/sqlplus" -s / as sysdba "{{ alr_work_dir }}/inventory_one_sid.sql" "$sid" >> "$OUT" 2>&1
+          done < /etc/oratab
+      when: not alr_is_test_tablespace
+
+    - name: Copy target-dir SQL, inventory SQL, and inventory wrapper to the target host
+      ansible.builtin.command: >
+        scp {{ alr_work_dir }}/{{ item }} {{ alr_oracle_user }}@{{ alr_host }}:{{ alr_work_dir }}/{{ item }}
+      loop:
+        - get_target_dir.sql
+        - inventory_one_sid.sql
+        - run_inventory.sh
+      delegate_to: localhost
+      when: not alr_is_test_tablespace
+
+    - name: Ensure remote working directory exists on the target host (before scp above can land)
+      ansible.builtin.command: >
+        ssh {{ alr_oracle_user }}@{{ alr_host }} 'mkdir -p {{ alr_work_dir }}'
+      delegate_to: localhost
+      when: not alr_is_test_tablespace
+
+    - name: Run target-dir lookup on the target host
+      ansible.builtin.command: >
+        ssh {{ alr_oracle_user }}@{{ alr_host }}
+        'export ORACLE_HOME={{ alr_oracle_home }}; export ORACLE_SID={{ alr_oracle_sid }}; export PATH=$ORACLE_HOME/bin:$PATH; sqlplus -s / as sysdba {{ alr_work_dir }}/get_target_dir.sql'
+      delegate_to: localhost
+      register: alr_target_file_result
+      when: not alr_is_test_tablespace
+
+    - name: Derive target directory from the returned file path
+      ansible.builtin.set_fact:
+        alr_target_dir: "{{ alr_target_file_result.stdout | trim | regex_replace('^(.*/)[^/]*$', '\\1') }}"
+      when: not alr_is_test_tablespace
+
+    - name: Run the oratab inventory loop on the target host
+      ansible.builtin.command: >
+        ssh {{ alr_oracle_user }}@{{ alr_host }} 'sh {{ alr_work_dir }}/run_inventory.sh'
+      delegate_to: localhost
+      when: not alr_is_test_tablespace
+
+    - name: Fetch the datafile inventory back to the controller
+      ansible.builtin.command: >
+        scp {{ alr_oracle_user }}@{{ alr_host }}:{{ alr_work_dir }}/datafile_inventory.txt {{ alr_work_dir }}/datafile_inventory.txt
+      delegate_to: localhost
+      when: not alr_is_test_tablespace
+
+    - name: Capture df output (total/available bytes per mount) on the target host
+      ansible.builtin.command: >
+        ssh {{ alr_oracle_user }}@{{ alr_host }} "df --output=target,size,avail -B1"
+      delegate_to: localhost
+      register: alr_df_result
+      when: not alr_is_test_tablespace
+
+    - name: Write df output to a local file for the capacity-check script to read
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/df_output.txt"
+        content: "{{ alr_df_result.stdout }}"
+        mode: "0644"
+      when: not alr_is_test_tablespace
+
+    - name: Run the local capacity-check script
+      ansible.builtin.command: >
+        python3 {{ alr_capacity_script }}
+        {{ alr_work_dir }}/datafile_inventory.txt
+        {{ alr_work_dir }}/df_output.txt
+        {{ alr_target_dir }}
+        {{ (alr_new_datafile_maxsize_gb * 1024 * 1024 * 1024) | int }}
+        {{ alr_capacity_safety_pct }}
+      delegate_to: localhost
+      register: alr_capacity_raw
+      when: not alr_is_test_tablespace
+
+    - name: Parse the capacity-check result
+      ansible.builtin.set_fact:
+        alr_capacity_result: "{{ alr_capacity_raw.stdout | from_json }}"
+      when: not alr_is_test_tablespace
+
+    - name: Self-diagnosing WARNING if the capacity check itself errored
+      ansible.builtin.debug:
+        msg: >-
+          Capacity check returned ERROR: {{ alr_capacity_result.reason | default('unknown') }}.
+          Treating as a capacity failure (safe default) so no datafile is added
+          without a confirmed clear check.
+      when: not alr_is_test_tablespace and alr_capacity_result.result == 'ERROR'
+
+    - name: Determine whether remediation should proceed
+      ansible.builtin.set_fact:
+        alr_should_remediate: >-
+          {{ alr_is_test_tablespace or
+             (alr_capacity_result is defined and alr_capacity_result.result == 'PASS') }}
+
+    # --- Build the remediation SQL script (written to a temp file to
+    #     avoid the known `environment:` + loop-var templating failure) --
+    - name: Write TEST-path remediation SQL (drop owning users + tablespace)
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/remediate.sql"
+        mode: "0644"
+        content: |
+          WHENEVER SQLERROR EXIT FAILURE
+          SET SERVEROUTPUT ON
+          SET FEEDBACK ON
+          SPOOL {{ alr_work_dir }}/remediate.log
+          DECLARE
+            CURSOR c_users IS
+              SELECT username FROM dba_users
+              WHERE default_tablespace = '{{ alr_tablespace }}';
+          BEGIN
+            FOR r IN c_users LOOP
+              DBMS_OUTPUT.PUT_LINE('Dropping user ' || r.username || ' (cascade)');
+              EXECUTE IMMEDIATE 'DROP USER ' || r.username || ' CASCADE';
+            END LOOP;
+          END;
+          /
+          DROP TABLESPACE {{ alr_tablespace }} INCLUDING CONTENTS AND DATAFILES;
+          SELECT tablespace_name FROM dba_tablespaces WHERE tablespace_name = '{{ alr_tablespace }}';
+          SPOOL OFF
+          EXIT;
+      when: alr_is_test_tablespace
+
+    - name: Write PRODUCTION-path remediation SQL (add datafile alongside the fullest one, bug-fixed ROWNUM/ORDER BY)
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/remediate.sql"
+        mode: "0644"
+        content: |
+          WHENEVER SQLERROR EXIT FAILURE
+          SET SERVEROUTPUT ON
+          SET FEEDBACK ON
+          SPOOL {{ alr_work_dir }}/remediate.log
+          DECLARE
+            v_file      VARCHAR2(513);
+            v_dir       VARCHAR2(500);
+            v_new_file  VARCHAR2(513);
+            v_seq       NUMBER;
+          BEGIN
+            SELECT file_name INTO v_file FROM (
+              SELECT file_name FROM dba_data_files
+              WHERE tablespace_name = '{{ alr_tablespace }}'
+              ORDER BY bytes DESC
+            ) WHERE ROWNUM = 1;
+            v_dir := SUBSTR(v_file, 1, INSTR(v_file, '/', -1));
+            SELECT NVL(MAX(TO_NUMBER(REGEXP_SUBSTR(file_name, '[0-9]+(?=\.dbf$)'))), 0) + 1
+            INTO v_seq
+            FROM dba_data_files
+            WHERE tablespace_name = '{{ alr_tablespace }}';
+            v_new_file := v_dir || '{{ alr_tablespace }}_ext' || v_seq || '.dbf';
+            DBMS_OUTPUT.PUT_LINE('Adding datafile ' || v_new_file || ' (' || {{ alr_prod_extend_mb }} || 'M) to {{ alr_tablespace }}');
+            EXECUTE IMMEDIATE
+              'ALTER TABLESPACE {{ alr_tablespace }} ADD DATAFILE ''' || v_new_file ||
+              ''' SIZE {{ alr_prod_extend_mb }}M AUTOEXTEND ON NEXT 100M MAXSIZE {{ alr_new_datafile_maxsize_gb }}G';
+          END;
+          /
+          SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) mb_allocated
+          FROM dba_data_files
+          WHERE tablespace_name = '{{ alr_tablespace }}'
+          GROUP BY tablespace_name;
+          SPOOL OFF
+          EXIT;
+      when: not alr_is_test_tablespace and alr_should_remediate
+
+    - name: Write connection wrapper shell script (explicit ORACLE_HOME/SID export)
+      ansible.builtin.copy:
+        dest: "{{ alr_work_dir }}/run_remediate.sh"
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          export ORACLE_HOME={{ alr_oracle_home }}
+          export ORACLE_SID={{ alr_oracle_sid }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          $ORACLE_HOME/bin/sqlplus -s / as sysdba @{{ alr_work_dir }}/remediate.sql
+      when: alr_should_remediate
+
+    - name: Copy remediation SQL script to the target Oracle host
+      ansible.builtin.command: >
+        scp {{ alr_work_dir }}/remediate.sql {{ alr_oracle_user }}@{{ alr_host }}:{{ alr_work_dir }}/remediate.sql
+      delegate_to: localhost
+      when: alr_should_remediate
+
+    - name: Copy connection wrapper shell script to the target Oracle host
+      ansible.builtin.command: >
+        scp {{ alr_work_dir }}/run_remediate.sh {{ alr_oracle_user }}@{{ alr_host }}:{{ alr_work_dir }}/run_remediate.sh
+      delegate_to: localhost
+      when: alr_should_remediate
+
+    - name: Execute remediation on the target Oracle host (direct SSH, per revised architecture)
+      ansible.builtin.command: >
+        ssh {{ alr_oracle_user }}@{{ alr_host }} 'sh {{ alr_work_dir }}/run_remediate.sh'
+      delegate_to: localhost
+      register: alr_remediation_result
+      failed_when: false
+      when: alr_should_remediate
+
+    - name: Fetch the remediation log back to the controller
+      ansible.builtin.command: >
+        scp {{ alr_oracle_user }}@{{ alr_host }}:{{ alr_work_dir }}/remediate.log {{ alr_work_dir }}/remediate.log
+      delegate_to: localhost
+      failed_when: false
+      when: alr_should_remediate
+
+    - name: Read the log content for the work note
+      ansible.builtin.slurp:
+        src: "{{ alr_work_dir }}/remediate.log"
+      register: alr_log_slurp
+      when: alr_should_remediate
+
+    - name: Decode log content
+      ansible.builtin.set_fact:
+        alr_log_text: "{{ alr_log_slurp.content | b64decode }}"
+      when: alr_should_remediate
+
+    # --- Attach the log to the incident ---------------------------------
+    - name: Upload remediation log as an attachment on the incident
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/attachment/file?table_name=incident&table_sys_id={{ alr_incident.sys_id }}&file_name=remediate_{{ incident_number }}.log"
+        method: POST
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers:
+          Content-Type: "text/plain"
+        body: "{{ alr_log_text }}"
+        body_format: raw
+        status_code: 201
+      when: alr_should_remediate
+
+    # --- Resolve or leave in-progress based on outcome ------------------
+    - name: Resolve the incident (remediation succeeded)
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+        state: resolved
+        close_code: "Solution provided"
+        close_notes: >-
+          Automated remediation completed for tablespace {{ alr_tablespace }}
+          on {{ alr_host }}/{{ alr_db_target }}.
+          {{ 'Test tablespace and owning user(s) dropped.' if alr_is_test_tablespace
+             else 'New datafile added (' ~ alr_prod_extend_mb ~ 'M, autoextend on, MAXSIZE ' ~ alr_new_datafile_maxsize_gb ~ 'G).' }}
+          Full remediation log attached.
+        other:
+          work_notes: "Remediation script exit code: {{ alr_remediation_result.rc }}"
+      when: alr_should_remediate and alr_remediation_result.rc == 0
+
+    - name: Leave incident In Progress with failure detail (remediation failed)
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            AUTOMATED REMEDIATION FAILED (exit code {{ alr_remediation_result.rc }}).
+            Manual DBA investigation required. Remediation log attached above.
+      when: alr_should_remediate and alr_remediation_result.rc != 0
+
+    - name: Close the incident (only after successful resolve)
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+        state: closed
+      when: alr_should_remediate and alr_remediation_result.rc == 0
+
+    # =====================================================================
+    # CAPACITY BLOCKED - open follow-up CRs instead of adding a datafile.
+    # UNVERIFIED field names for servicenow.itsm.change_request - confirm
+    # via `ansible-doc servicenow.itsm.change_request` before a real run.
+    # =====================================================================
+    - name: Open storage team CR (capacity check failed)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        type: normal
+        state: new
+        short_description: >-
+          ALR | Storage capacity check failed for tablespace {{ alr_tablespace }}
+          on {{ alr_host }}/{{ alr_db_target }} - mount {{ alr_capacity_result.mount }}
+          at {{ alr_capacity_result.pct_of_total }}% of capacity
+        description: >-
+          Automated tablespace remediation blocked: adding a new
+          {{ alr_new_datafile_maxsize_gb }}GB datafile to tablespace {{ alr_tablespace }}
+          would push committed MAXSIZE totals on mount {{ alr_capacity_result.mount }}
+          to {{ alr_capacity_result.committed_bytes }} bytes, exceeding the
+          {{ (alr_capacity_safety_pct * 100) | int }}% safety threshold of
+          {{ alr_capacity_result.threshold_bytes }} bytes (mount total:
+          {{ alr_capacity_result.mount_total_bytes }} bytes). Additional physical
+          storage is needed on this mount before further tablespace growth can
+          proceed safely. Related incident: {{ incident_number }}.
+        category: hardware
+        assignment_group: "Hardware"
+      register: alr_storage_cr
+      when: not alr_should_remediate
+
+    - name: Open DBA team CR (capacity check failed)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        type: normal
+        state: new
+        short_description: >-
+          ALR | Tablespace {{ alr_tablespace }} on {{ alr_host }}/{{ alr_db_target }}
+          needs DBA action once storage is added (see linked storage CR)
+        description: >-
+          Tablespace {{ alr_tablespace }} on {{ alr_host }}/{{ alr_db_target }} needs
+          a new datafile, but automated remediation was blocked by the physical
+          capacity safeguard (mount {{ alr_capacity_result.mount }} at
+          {{ alr_capacity_result.pct_of_total }}% of committed capacity). Storage CR
+          {{ alr_storage_cr.record.number | default('N/A') }} has been opened to add
+          physical storage. Once storage is added, extend the tablespace manually or
+          re-trigger this automation. Related incident: {{ incident_number }}.
+        category: database
+        assignment_group: "Database Atlanta"
+      register: alr_dba_cr
+      when: not alr_should_remediate
+
+    - name: Leave incident In Progress - blocked on storage capacity, CRs opened
+      servicenow.itsm.incident:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ incident_number }}"
+        state: in_progress
+        other:
+          work_notes: >-
+            Automated remediation BLOCKED: adding a new datafile to tablespace
+            {{ alr_tablespace }} would exceed the {{ (alr_capacity_safety_pct * 100) | int }}%
+            physical capacity safety threshold on mount {{ alr_capacity_result.mount }}
+            (currently at {{ alr_capacity_result.pct_of_total }}% of committed capacity
+            across all databases on this host). Opened Storage CR
+            {{ alr_storage_cr.record.number | default('N/A') }} and DBA CR
+            {{ alr_dba_cr.record.number | default('N/A') }} to add physical storage
+            before this tablespace can be safely extended.
+      when: not alr_should_remediate
+
+    # =====================================================================
+    # EM CLI - final comment on the OEM incident. No verified "clear this
+    # one incident now" verb exists - the OEM incident auto-clears on its
+    # next scheduled metric collection once the underlying condition is
+    # confirmed resolved, so this just leaves a closing/status note.
+    # =====================================================================
+    - name: Add closing comment to the OEM incident
+      ansible.builtin.command: >
+        ssh {{ alr_emcli_user }}@{{ alr_oms_host }}
+        '{{ alr_emcli_bin }} add_comment_to_incident -incident_id="{{ alr_oem_incident_id }}" -comment="{{ 'Remediation succeeded via Ansible.' if (alr_should_remediate and alr_remediation_result.rc == 0) else ('Remediation FAILED (exit code ' ~ alr_remediation_result.rc ~ ').') if alr_should_remediate else ('Blocked by physical storage capacity safeguard - Storage CR ' ~ (alr_storage_cr.record.number | default('N/A')) ~ ' and DBA CR ' ~ (alr_dba_cr.record.number | default('N/A')) ~ ' opened.') }} Full detail in ServiceNow {{ incident_number }}."'
+      delegate_to: localhost
+      failed_when: false
+      when: alr_oem_incident_id != 'UNKNOWN'
+
+    - name: Clean up local working directory
+      ansible.builtin.file:
+        path: "{{ alr_work_dir }}"
+        state: absent

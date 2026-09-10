@@ -1,0 +1,336 @@
+---
+# SNOW_OEM_resolve_one_incident.yml
+# Included per-incident by SNOW_OEM_oracle_auto_resolve.yml.
+# Expects loop_var `incident` (a ServiceNow incident record dict).
+#
+# NOTE: this file deliberately does NOT use delegate_to + become/remote_user
+# to reach the Oracle host. On this environment, become_user, remote_user,
+# and vars:ansible_user were all confirmed (via repeated testing) to be
+# silently ignored when combined with delegate_to - the connection kept
+# authenticating as the inventory/control-node user (ansible_admin)
+# regardless of what was set. Since ansible_admin cannot see into the
+# Oracle home (owned oracle:oinstall, no other-access), every remote
+# action failed with a misleading "No such file or directory".
+# Workaround: every remote action below shells out to a literal
+# `ssh oracle@<ip>` directly from the control node, bypassing Ansible's
+# connection/delegation resolution entirely. This is confirmed to work
+# (ssh oracle@192.168.1.223 whoami succeeds passwordlessly for
+# ansible_admin's key).
+
+- name: "Reset per-incident facts"
+  ansible.builtin.set_fact:
+    oem_host: "{{ incident.u_oem_host }}"
+    oem_tablespace: "{{ incident.u_oem_metric_name }}"
+    oem_target_name: "{{ incident.u_oem_target_name }}"
+
+# --- Guard: host must be a known Oracle target -----------------------
+- name: "Guard - host must be in oracle_instance_map"
+  block:
+    - name: "Set Oracle connection facts for this host"
+      ansible.builtin.set_fact:
+        oem_oracle_sid: "{{ oracle_instance_map[oem_host].oracle_sid }}"
+        oem_oracle_home: "{{ oracle_instance_map[oem_host].oracle_home }}"
+        oem_ssh_target: "oracle@{{ hostvars[oem_host].ansible_host }}"
+        oem_incident_id_oem: "{{ incident.u_oem_incident_id }}"
+      when: oem_host in oracle_instance_map
+
+    - name: "Post failure note if host is unknown"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: >-
+          Auto-remediation FAILED: host '{{ oem_host }}' is not present in
+          oracle_instance_map. Manual DBA intervention required.
+      when: oem_host not in oracle_instance_map
+
+- name: "Continue only if host was recognized"
+  when: oem_oracle_sid is defined
+  block:
+
+    # --- Claim the incident so a concurrent run won't reprocess it ---
+    - name: "Claim incident - mark In Progress"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: >-
+          Auto-remediation started by Ansible: checking tablespace
+          '{{ oem_tablespace }}' on {{ oem_target_name }} ({{ oem_host }},
+          ORACLE_SID={{ oem_oracle_sid }}).
+        note_set_state: 2
+
+    # --- Build and run the tablespace/datafile query script ---------
+    - name: "Set status query SQL text (for logging and execution)"
+      ansible.builtin.set_fact:
+        oem_status_sql: |-
+          select tablespace_name||'|'||round(used_space*8192/1024/1024,2)||'|'||
+                 round(tablespace_size*8192/1024/1024,2)||'|'||round(used_percent,2)
+          from dba_tablespace_usage_metrics
+          where tablespace_name = upper('{{ oem_tablespace }}');
+
+          select file_name||'|'||round(bytes/1024/1024,2)||'|'||autoextensible||'|'||
+                 round(nvl(maxbytes,0)/1024/1024,2)
+          from dba_data_files
+          where tablespace_name = upper('{{ oem_tablespace }}')
+          and rownum = 1;
+
+    - name: "Remove any stale status query script from a prior run"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_ts_status_{{ incident.sys_id }}.sh'"
+      changed_when: false
+
+    - name: "Write tablespace status query script (direct SSH as oracle)"
+      ansible.builtin.shell: >
+        ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+        "cat > /tmp/oem_ts_status_{{ incident.sys_id }}.sh && chmod 700 /tmp/oem_ts_status_{{ incident.sys_id }}.sh"
+      args:
+        stdin: |
+          #!/bin/bash
+          export ORACLE_HOME={{ oem_oracle_home }}
+          export ORACLE_SID={{ oem_oracle_sid }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+          set pagesize 0 feedback off verify off heading off echo off linesize 300
+          {{ oem_status_sql }}
+          SQL
+      changed_when: true
+
+    - name: "DEBUG - verify script exists and check sqlplus binary right before execution"
+      ansible.builtin.shell: >
+        ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+        "whoami; ls -la /tmp/oem_ts_status_{{ incident.sys_id }}.sh; ls -la {{ oem_oracle_home }}/bin/sqlplus; file {{ oem_oracle_home }}/bin/sqlplus"
+      register: oem_debug_check
+      changed_when: false
+
+    - name: "DEBUG - show verification output"
+      ansible.builtin.debug:
+        var: oem_debug_check.stdout_lines
+
+    - name: "Run tablespace status query"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} /tmp/oem_ts_status_{{ incident.sys_id }}.sh"
+      register: oem_ts_status
+      changed_when: false
+
+    - name: "Parse tablespace status output"
+      ansible.builtin.set_fact:
+        oem_ts_line: "{{ oem_ts_status.stdout_lines[0] | trim }}"
+        oem_df_line: "{{ oem_ts_status.stdout_lines[1] | trim }}"
+
+    - name: "Set structured facts from parsed output"
+      ansible.builtin.set_fact:
+        oem_used_mb: "{{ oem_ts_line.split('|')[1] | float }}"
+        oem_total_mb: "{{ oem_ts_line.split('|')[2] | float }}"
+        oem_pct_used: "{{ oem_ts_line.split('|')[3] | float }}"
+        oem_datafile_name: "{{ oem_df_line.split('|')[0] }}"
+        oem_datafile_mb: "{{ oem_df_line.split('|')[1] | float }}"
+        oem_autoextensible: "{{ oem_df_line.split('|')[2] }}"
+        oem_current_maxsize_mb: "{{ oem_df_line.split('|')[3] | float }}"
+
+    - name: "Post diagnostic query note (real SQL and real result)"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: |-
+          Diagnostic query executed on {{ oem_host }} (ORACLE_SID={{ oem_oracle_sid }}):
+
+          {{ oem_status_sql }}
+
+          Result (tablespace_name|used_mb|total_mb|pct_used):
+          {{ oem_ts_line }}
+
+          Result (datafile_name|size_mb|autoextensible|maxbytes_mb):
+          {{ oem_df_line }}
+
+    # --- Compute the resize target -----------------------------------
+    - name: "Compute new MAXSIZE (or direct size, if not autoextensible) to reach target free %"
+      ansible.builtin.set_fact:
+        oem_new_total_mb: >-
+          {{ ((oem_used_mb | float) / (1 - (oem_target_free_pct | float / 100))) | round(0, 'ceil') | int }}
+
+    - name: "Compute growth needed (target vs. current PHYSICAL file size, either action path)"
+      ansible.builtin.set_fact:
+        oem_growth_mb: "{{ (oem_new_total_mb | int) - (oem_datafile_mb | int) }}"
+
+    # --- Disk safety checks -------------------------------------------
+    - name: "Determine mount point backing the datafile"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} \"df --output=target {{ oem_datafile_name | dirname }} | tail -1\""
+      register: oem_mount_point
+      changed_when: false
+
+    - name: "Check available disk space on that mount"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} \"df --output=avail -BM {{ oem_mount_point.stdout | trim }} | tail -1 | tr -d 'M '\""
+      register: oem_disk_avail
+      changed_when: false
+
+    - name: "Check total disk capacity on that mount"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} \"df --output=size -BM {{ oem_mount_point.stdout | trim }} | tail -1 | tr -d 'M '\""
+      register: oem_disk_total
+      changed_when: false
+
+    # --- System-wide MAXSIZE check: EVERY database in /etc/oratab, ------
+    # --- not just the CDB this incident is about -------------------------
+    - name: "Read /etc/oratab entries on this host"
+      ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} \"grep -Ev '^#|^\\s*$' /etc/oratab\""
+      register: oem_oratab_raw
+      changed_when: false
+
+    - name: "Parse oratab entries into sid/home pairs"
+      ansible.builtin.set_fact:
+        oem_oratab_parsed: >-
+          {{ oem_oratab_raw.stdout_lines
+             | map('trim')
+             | select('search', ':')
+             | map('split', ':')
+             | list }}
+
+    - name: "Reset database check results list"
+      ansible.builtin.set_fact:
+        oem_db_check_results: []
+
+    - name: "Check every database listed in /etc/oratab"
+      ansible.builtin.include_tasks: SNOW_OEM_check_one_database.yml
+      loop: "{{ oem_oratab_parsed }}"
+      loop_control:
+        loop_var: oem_oratab_entry
+      vars:
+        check_sid: "{{ oem_oratab_entry[0] }}"
+        check_home: "{{ oem_oratab_entry[1] }}"
+
+    - name: "Aggregate system-wide totals across all reachable databases"
+      ansible.builtin.set_fact:
+        oem_sys_current_mb: "{{ oem_db_check_results | selectattr('reachable') | map(attribute='current_mb') | sum }}"
+        oem_sys_theoretical_max_mb: "{{ oem_db_check_results | selectattr('reachable') | map(attribute='max_mb') | sum }}"
+        oem_oratab_reachable_count: "{{ oem_db_check_results | selectattr('reachable') | list | length }}"
+        oem_oratab_unreachable_sids: "{{ oem_db_check_results | rejectattr('reachable') | map(attribute='sid') | list }}"
+        oem_oratab_total_count: "{{ oem_db_check_results | length }}"
+
+    - name: "Build oratab summary text for the incident note"
+      ansible.builtin.set_fact:
+        oem_oratab_summary: >-
+          {% if oem_oratab_total_count | int == 1 %}
+          Only one database ({{ oem_db_check_results[0].sid }}) found in
+          /etc/oratab on {{ oem_host }} - no other databases present on this
+          host to check.
+          {% else %}
+          {{ oem_oratab_total_count }} databases found in /etc/oratab on
+          {{ oem_host }}: {{ oem_db_check_results | map(attribute='sid') | join(', ') }}.
+          {% endif %}
+          {% for r in oem_db_check_results %}
+          {{ r.sid }}: {{ 'current=' ~ r.current_mb ~ 'MB, max=' ~ r.max_mb ~ 'MB' if r.reachable else 'UNREACHABLE - excluded from aggregate, verify manually' }}
+          {% endfor %}
+
+    - name: "Set disk safety facts"
+      ansible.builtin.set_fact:
+        oem_disk_avail_mb: "{{ oem_disk_avail.stdout | trim | int }}"
+        oem_disk_total_mb: "{{ oem_disk_total.stdout | trim | int }}"
+        oem_disk_safe: >-
+          {{ ((oem_disk_avail.stdout | trim | int) - (oem_growth_mb | int)) >= (oem_min_disk_headroom_mb | int) }}
+        oem_systemwide_risk: >-
+          {{ (oem_sys_theoretical_max_mb | float) > (oem_disk_total.stdout | trim | int) }}
+
+    - name: "Post disk safety check note"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: |-
+          Disk safety check on {{ oem_host }}:
+
+          df --output=target {{ oem_datafile_name | dirname }}
+          -> mount point: {{ oem_mount_point.stdout | trim }}
+
+          df --output=avail -BM {{ oem_mount_point.stdout | trim }}
+          -> available: {{ oem_disk_avail_mb }}MB
+
+          df --output=size -BM {{ oem_mount_point.stdout | trim }}
+          -> total capacity: {{ oem_disk_total_mb }}MB
+
+          Planned growth for this remediation: {{ oem_growth_mb }}MB
+          (target: bring {{ oem_tablespace }} to ~{{ oem_target_free_pct }}% free against
+          the new ceiling; new target size {{ oem_new_total_mb }}MB, current physical
+          file size {{ oem_datafile_mb }}MB, current MAXSIZE {{ oem_current_maxsize_mb }}MB)
+
+          Required headroom after growth: {{ oem_min_disk_headroom_mb }}MB
+          Safe to proceed: {{ oem_disk_safe }}
+
+          System-wide MAXSIZE check (every database in /etc/oratab on
+          {{ oem_host }}, not just {{ oem_oracle_sid }}):
+          {{ oem_oratab_summary }}
+
+          Aggregate across {{ oem_oratab_reachable_count }} reachable
+          database(s): if every autoextensible datafile on this host grew to
+          its configured MAXSIZE simultaneously, total allocated would be
+          {{ oem_sys_theoretical_max_mb }}MB against {{ oem_disk_total_mb }}MB
+          total disk capacity on this mount.
+          {{ 'WARNING: theoretical max EXCEEDS disk capacity - review MAXSIZE settings fleet-wide.' if (oem_systemwide_risk | bool) else 'Within capacity.' }}
+          {{ ('WARNING: ' ~ (oem_oratab_unreachable_sids | join(', ')) ~ ' could not be reached and were excluded from the aggregate - verify these manually.') if (oem_oratab_unreachable_sids | length > 0) else '' }}
+
+    # --- Abort if the resize itself would not fit safely --------------
+    - name: "Abort - insufficient disk space for this resize"
+      ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+      vars:
+        note_incident_sys_id: "{{ incident.sys_id }}"
+        note_text: >-
+          Auto-remediation ABORTED: resizing {{ oem_datafile_name }} from
+          {{ oem_datafile_mb }}MB to {{ oem_new_total_mb }}MB needs
+          {{ oem_growth_mb }}MB, but only {{ oem_disk_avail_mb }}MB is free
+          on {{ oem_mount_point.stdout | trim }}. Manual DBA intervention
+          required.
+      when: not (oem_disk_safe | bool)
+
+    # --- Perform the resize ---------------------------------------------
+    - name: "Resize datafile and post result"
+      when: oem_disk_safe | bool
+      block:
+        - name: "Set remediation SQL text (autoextend-aware: raise MAXSIZE, or resize directly if autoextend is off)"
+          ansible.builtin.set_fact:
+            oem_resize_sql: >-
+              {{ "alter database datafile '" ~ oem_datafile_name ~ "' autoextend on maxsize " ~ oem_new_total_mb ~ "M;"
+                 if (oem_autoextensible == 'YES')
+                 else "alter database datafile '" ~ oem_datafile_name ~ "' resize " ~ oem_new_total_mb ~ "M;" }}
+            oem_remediation_kind: "{{ 'Raised MAXSIZE (autoextend already handles physical growth)' if (oem_autoextensible == 'YES') else 'Direct resize (autoextend is not enabled on this datafile)' }}"
+
+        - name: "Remove any stale resize script from a prior run"
+          ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_ts_resize_{{ incident.sys_id }}.sh'"
+          changed_when: false
+
+        - name: "Write resize script (direct SSH as oracle)"
+          ansible.builtin.shell: >
+            ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+            "cat > /tmp/oem_ts_resize_{{ incident.sys_id }}.sh && chmod 700 /tmp/oem_ts_resize_{{ incident.sys_id }}.sh"
+          args:
+            stdin: |
+              #!/bin/bash
+              export ORACLE_HOME={{ oem_oracle_home }}
+              export ORACLE_SID={{ oem_oracle_sid }}
+              export PATH=$ORACLE_HOME/bin:$PATH
+              $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+              {{ oem_resize_sql }}
+              SQL
+          changed_when: true
+
+        - name: "Execute resize"
+          ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} /tmp/oem_ts_resize_{{ incident.sys_id }}.sh"
+          register: oem_resize_result
+
+        - name: "Post resize statement and raw result"
+          ansible.builtin.include_tasks: COMMON_snow_oem_post_note.yml
+          vars:
+            note_incident_sys_id: "{{ incident.sys_id }}"
+            note_text: |-
+              Remediation executed on {{ oem_host }} (ORACLE_SID={{ oem_oracle_sid }}):
+              {{ oem_remediation_kind }}.
+
+              {{ oem_resize_sql }}
+
+              Raw output:
+              {{ oem_resize_result.stdout }}
+
+              {{ oem_datafile_name }}: current physical size {{ oem_datafile_mb }}MB,
+              previous MAXSIZE {{ oem_current_maxsize_mb }}MB -> new MAXSIZE {{ oem_new_total_mb }}MB
+              (was {{ oem_pct_used }}% used against the previous ceiling). Awaiting
+              next OEM collection cycle to confirm clear and auto-resolve this incident.
+
+    # --- Clean up temp scripts -----------------------------------------
+    - name: "Clean up temp scripts"
+      ansible.builtin.shell: >
+        ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+        "rm -f /tmp/oem_ts_status_{{ incident.sys_id }}.sh /tmp/oem_ts_resize_{{ incident.sys_id }}.sh"
+      changed_when: false

@@ -1,0 +1,44 @@
+---
+# SNOW_OEM_oracle_auto_resolve.yml
+# Polls ServiceNow for open, unclaimed OEM-triggered tablespace alerts
+# and auto-remediates each one. Run on a schedule via cron wrapper.
+
+- name: OEM Tablespace Alert Auto-Resolution
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+  vars:
+    # Top up the tablespace until it is roughly this % free after resize
+    oem_target_free_pct: 50
+    # Minimum free disk space (MB) to leave on the mount after resizing
+    oem_min_disk_headroom_mb: 500
+
+  tasks:
+    - name: Search ServiceNow for open, unclaimed OEM incidents
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query=correlation_display=OEM^state=1^active=true&sysparm_fields=sys_id,number,u_oem_target_name,u_oem_host,u_oem_metric_name,u_oem_incident_id,short_description"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        return_content: true
+        status_code: 200
+      register: snow_incidents
+
+    - name: Set incident list fact
+      ansible.builtin.set_fact:
+        oem_incidents: "{{ snow_incidents.json.result }}"
+
+    - name: Report if nothing to do
+      ansible.builtin.debug:
+        msg: "No open, unclaimed OEM incidents found."
+      when: oem_incidents | length == 0
+
+    - name: Process each OEM incident
+      ansible.builtin.include_tasks: SNOW_OEM_resolve_one_incident.yml
+      loop: "{{ oem_incidents }}"
+      loop_control:
+        loop_var: incident
+      when: oem_incidents | length > 0

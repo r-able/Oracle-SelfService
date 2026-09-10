@@ -1,0 +1,42 @@
+---
+# COMMON_snow_oem_post_note.yml
+# Reusable include: posts a work note to a ServiceNow incident, optionally
+# also setting state. Expects vars: note_incident_sys_id, note_text,
+# and optionally note_set_state (integer state code).
+#
+# Also mirrors the same note as a comment on the matching OEM incident via
+# emcli add_comment_to_incident, when oem_incident_id_oem and oem_ssh_target
+# are set (they are not yet set at the point the very first "host not
+# recognized" failure note is posted, so this step is skipped there).
+#
+# note_text is transmitted base64-encoded and decoded on the remote side,
+# since it commonly contains $ signs (e.g. literal "$ORACLE_HOME" from SQL
+# scripts quoted in earlier notes), quotes, and newlines that would otherwise
+# require fragile nested shell escaping to survive local-shell -> ssh ->
+# remote-shell parsing intact.
+
+- name: "Post work note to incident {{ note_incident_sys_id }}"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/incident/{{ note_incident_sys_id }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body: >-
+      {{
+        {'work_notes': note_text} |
+        combine({'state': note_set_state} if note_set_state is defined else {})
+      }}
+    status_code: 200
+
+- name: "Mirror the same note as a comment on the matching OEM incident"
+  ansible.builtin.shell: >
+    ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+    'COMMENT_TEXT=$(echo {{ note_text | b64encode }} | base64 -d); /u01/app/oracle/product/19.3/middleware/bin/emcli add_comment_to_incident -incident_id="{{ oem_incident_id_oem }}" -comment="[ServiceNow {{ note_incident_sys_id }}] $COMMENT_TEXT"'
+  changed_when: false
+  failed_when: false
+  when:
+    - oem_incident_id_oem is defined
+    - oem_ssh_target is defined
+    - oem_incident_id_oem | length > 0

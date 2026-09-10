@@ -1,0 +1,65 @@
+---
+# SNOW_OEM_check_one_database.yml
+# Included per /etc/oratab entry by the resolver's oratab sweep.
+# Expects vars: check_sid, check_home, oem_ssh_target, incident (for temp filenames).
+# Appends a result dict to oem_db_check_results (created on first use).
+
+- name: "Remove any stale check script for {{ check_sid }}"
+  ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_db_check_{{ incident.sys_id }}_{{ check_sid }}.sh'"
+  changed_when: false
+
+- name: "Write datafile-totals check script for {{ check_sid }}"
+  ansible.builtin.shell: >
+    ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }}
+    "cat > /tmp/oem_db_check_{{ incident.sys_id }}_{{ check_sid }}.sh && chmod 700 /tmp/oem_db_check_{{ incident.sys_id }}_{{ check_sid }}.sh"
+  args:
+    stdin: |
+      #!/bin/bash
+      export ORACLE_HOME={{ check_home }}
+      export ORACLE_SID={{ check_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+      set pagesize 0 feedback off verify off heading off echo off linesize 300
+      select round(sum(bytes)/1024/1024,2)||'|'||round(sum(case when autoextensible='YES' then nvl(maxbytes,bytes) else bytes end)/1024/1024,2)
+      from dba_data_files;
+      SQL
+  changed_when: true
+
+- name: "Run datafile-totals check for {{ check_sid }}"
+  ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} /tmp/oem_db_check_{{ incident.sys_id }}_{{ check_sid }}.sh"
+  register: oem_one_db_check
+  changed_when: false
+  failed_when: false
+
+- name: "Clean up check script for {{ check_sid }}"
+  ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ oem_ssh_target }} 'rm -f /tmp/oem_db_check_{{ incident.sys_id }}_{{ check_sid }}.sh'"
+  changed_when: false
+
+- name: "Determine if {{ check_sid }} was reachable and gave a valid result"
+  ansible.builtin.set_fact:
+    oem_one_db_reachable: >-
+      {{ (oem_one_db_check.rc == 0)
+         and (oem_one_db_check.stdout_lines | default([]) | length > 0)
+         and ('|' in (oem_one_db_check.stdout_lines[0] | default(''))) }}
+
+- name: "Record result for {{ check_sid }} (reachable)"
+  ansible.builtin.set_fact:
+    oem_db_check_results: >-
+      {{ (oem_db_check_results | default([])) + [{
+        'sid': check_sid,
+        'reachable': true,
+        'current_mb': (oem_one_db_check.stdout_lines[0].split('|')[0] | float),
+        'max_mb': (oem_one_db_check.stdout_lines[0].split('|')[1] | float)
+      }] }}
+  when: oem_one_db_reachable | bool
+
+- name: "Record result for {{ check_sid }} (unreachable)"
+  ansible.builtin.set_fact:
+    oem_db_check_results: >-
+      {{ (oem_db_check_results | default([])) + [{
+        'sid': check_sid,
+        'reachable': false,
+        'current_mb': 0,
+        'max_mb': 0
+      }] }}
+  when: not (oem_one_db_reachable | bool)

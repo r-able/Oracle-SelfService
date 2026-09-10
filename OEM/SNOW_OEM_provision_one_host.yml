@@ -1,0 +1,109 @@
+---
+# SNOW_OEM_provision_one_host.yml
+# Included per host by SNOW_OEM_provision_resource_manager.yml.
+# Expects loop_var `prov_host` - a key in oracle_instance_map.
+
+- name: "Set connection facts for {{ prov_host }}"
+  ansible.builtin.set_fact:
+    prov_sid: "{{ oracle_instance_map[prov_host].oracle_sid }}"
+    prov_home: "{{ oracle_instance_map[prov_host].oracle_home }}"
+    prov_ssh_target: "oracle@{{ hostvars[prov_host].ansible_host }}"
+    prov_cpu_count: "{{ oracle_instance_map[prov_host].cpu_count | default('') }}"
+
+- name: "Build the Resource Manager PL/SQL block for {{ prov_host }}/{{ prov_sid }}"
+  ansible.builtin.set_fact:
+    prov_plsql: |
+      BEGIN
+        BEGIN
+          DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+        EXCEPTION WHEN OTHERS THEN NULL; END;
+
+        -- Drop prior objects if they exist, so this is safely re-runnable
+        BEGIN DBMS_RESOURCE_MANAGER.DELETE_PLAN_CASCADE(PLAN => '{{ oem_cpu_plan_name }}'); EXCEPTION WHEN OTHERS THEN NULL; END;
+
+        DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP(
+          CONSUMER_GROUP => '{{ oem_cpu_critical_group }}',
+          COMMENT => 'Mission-critical services - guaranteed top CPU allocation');
+
+        DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP(
+          CONSUMER_GROUP => '{{ oem_cpu_adhoc_group }}',
+          COMMENT => 'Ad-hoc/reporting traffic - throttled, auto-cancelled if it runs long on CPU');
+
+      {% for svc in oem_cpu_protected_services %}
+        DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING(
+          ATTRIBUTE => DBMS_RESOURCE_MANAGER.SERVICE_NAME,
+          VALUE => '{{ svc }}',
+          CONSUMER_GROUP => '{{ oem_cpu_critical_group }}');
+      {% endfor %}
+
+      {% for combo in oem_cpu_low_impact_combos %}
+      {% if combo.program is defined and combo.program != "ANY" %}
+        DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING(
+          ATTRIBUTE => DBMS_RESOURCE_MANAGER.CLIENT_PROGRAM,
+          VALUE => '%{{ combo.program }}%',
+          CONSUMER_GROUP => '{{ oem_cpu_adhoc_group }}');
+      {% elif combo.service is defined and combo.service != "ANY" %}
+        DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING(
+          ATTRIBUTE => DBMS_RESOURCE_MANAGER.SERVICE_NAME,
+          VALUE => '{{ combo.service }}',
+          CONSUMER_GROUP => '{{ oem_cpu_adhoc_group }}');
+      {% endif %}
+      {% endfor %}
+
+        DBMS_RESOURCE_MANAGER.CREATE_PLAN(
+          PLAN => '{{ oem_cpu_plan_name }}',
+          COMMENT => 'Protects critical services from CPU contention; throttles ad-hoc traffic');
+
+        DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(
+          PLAN => '{{ oem_cpu_plan_name }}', GROUP_OR_SUBPLAN => '{{ oem_cpu_critical_group }}',
+          COMMENT => 'Guaranteed top allocation', MGMT_P1 => {{ oem_cpu_critical_mgmt_p1 }});
+
+        DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(
+          PLAN => '{{ oem_cpu_plan_name }}', GROUP_OR_SUBPLAN => '{{ oem_cpu_adhoc_group }}',
+          COMMENT => 'Throttled, auto-cancelled if it runs long on CPU',
+          MGMT_P1 => {{ oem_cpu_adhoc_mgmt_p1 }},
+          SWITCH_GROUP => 'CANCEL_SQL', SWITCH_TIME => {{ oem_cpu_adhoc_switch_time_secs }}, SWITCH_ESTIMATE => FALSE);
+
+        DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(
+          PLAN => '{{ oem_cpu_plan_name }}', GROUP_OR_SUBPLAN => 'OTHER_GROUPS',
+          COMMENT => 'Everything unclassified - default allocation', MGMT_P1 => 100 - {{ oem_cpu_critical_mgmt_p1 }} - {{ oem_cpu_adhoc_mgmt_p1 }});
+
+        DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+        DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+      END;
+      /
+
+      ALTER SYSTEM SET RESOURCE_MANAGER_PLAN = '{{ oem_cpu_plan_name }}' SCOPE=BOTH;
+      {% if prov_cpu_count | length > 0 %}
+      ALTER SYSTEM SET CPU_COUNT = {{ prov_cpu_count }} SCOPE=BOTH;
+      {% endif %}
+
+      SELECT name, is_top_plan FROM v$rsrc_plan;
+
+- name: "Write provisioning script for {{ prov_host }}"
+  ansible.builtin.shell: >
+    ssh -o StrictHostKeyChecking=accept-new {{ prov_ssh_target }}
+    "cat > /tmp/oem_cpu_provision_{{ prov_sid }}.sh && chmod 700 /tmp/oem_cpu_provision_{{ prov_sid }}.sh"
+  args:
+    stdin: |
+      #!/bin/bash
+      export ORACLE_HOME={{ prov_home }}
+      export ORACLE_SID={{ prov_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+      set echo off feedback on heading on linesize 200
+      {{ prov_plsql }}
+      SQL
+  changed_when: true
+
+- name: "Execute provisioning for {{ prov_host }}/{{ prov_sid }}"
+  ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ prov_ssh_target }} /tmp/oem_cpu_provision_{{ prov_sid }}.sh"
+  register: prov_result
+
+- name: "Show provisioning result for {{ prov_host }}"
+  ansible.builtin.debug:
+    msg: "{{ prov_result.stdout_lines }}"
+
+- name: "Clean up provisioning script for {{ prov_host }}"
+  ansible.builtin.shell: "ssh -o StrictHostKeyChecking=accept-new {{ prov_ssh_target }} 'rm -f /tmp/oem_cpu_provision_{{ prov_sid }}.sh'"
+  changed_when: false
