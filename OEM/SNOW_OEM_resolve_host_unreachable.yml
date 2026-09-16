@@ -1,0 +1,202 @@
+---
+###############################################################################
+# SNOW_OEM_resolve_host_unreachable.yml
+#
+# ENTRY POINT - unchanged filename/invocation from the cron wrapper, so no
+# change needed to SNOW_OEM_host_unreachable_cron_wrapper.sh.
+#
+# This file now only does what's common to every target type:
+#   1. Re-verify the alert is still real (emcli get_targets against the
+#      agent's own oracle_emd target, e.g. lnx001:3872 - NOT get_target_status,
+#      which does not exist in EM CLI; confirmed against real output 2026-09-12)
+#   2. Determine which resolver branch applies (via the router)
+#   3. Run that branch's tasks (populates diagnostic_log + remediated)
+#   4. Common outcome handling: OEM comment (success) or ServiceNow
+#      incident + OEM comment (escalation) - identical regardless of
+#      whether the target was a plain Linux host, an Exadata compute
+#      node, or an RDS Oracle instance.
+#
+# Branch-specific logic lives in:
+#   SNOW_OEM_resolve_router.yml                  (dispatch)
+#   SNOW_OEM_resolve_host_unreachable_tasks.yml   (Linux + Exadata ladder)
+#   SNOW_OEM_resolve_rds_unreachable.yml          (RDS status-check-and-act)
+###############################################################################
+
+- name: Resolve OEM Host/Agent Unreachable alert (multi-target-type)
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+  vars:
+    oem_oms_host: lnx003
+    oem_ssh_user: oracle
+    # Confirmed 2026-09-12: bare "emcli" fails over non-interactive SSH
+    # ("emcli: command not found") because ssh host "command" does not
+    # source oracle's shell profile/PATH the way an interactive login
+    # shell does. Every emcli call must use this absolute path instead.
+    # Two emcli binaries exist on lnx003 (/u01/app/oracle/emcli/emcli and
+    # this one); this is the one "which emcli" resolves to interactively,
+    # matching every manual verification command run so far.
+    emcli_bin: "/u01/app/oracle/product/19.3/middleware/bin/emcli"
+    # Confirmed 2026-09-12 against real lnx001/lnx002 (ps -ef | grep emagent):
+    # both hosts share identical paths. agent_home = software/binaries tree;
+    # agent_inst = separate instance tree holding live config/logs (NOT under
+    # agent_home - a real OEM install layout, not the single-tree assumption
+    # this playbook originally made). If a future host has a different
+    # version/path, move both into per-host inventory hostvars instead of
+    # hardcoding here - same pattern as Exadata's ilom_host.
+    agent_home: "/u01/app/oracle/product/21.0.0/agent/agent_13.5.0.0.0"
+    agent_inst: "/u01/app/oracle/product/21.0.0/agent/agent_inst"
+    resolved_host: "{{ hostvars[target_host].ansible_host | default(target_host) }}"
+    # Confirmed 2026-09-14: sn_instance in the real /etc/ansible/vars/main.yml
+    # is stored as a full URL (e.g. https://dev204190.service-now.com), not a
+    # bare instance name - a direct "https://{{ sn_instance }}.service-now.com"
+    # concatenation double-prefixes/double-suffixes it. This strips any
+    # existing scheme and .service-now.com suffix first, so the escalation
+    # URL below builds correctly regardless of which format sn_instance is
+    # actually stored in (bare name or full URL).
+    sn_instance_clean: "{{ sn_instance | regex_replace('^https?://', '') | regex_replace('\\.service-now\\.com/?$', '') }}"
+    heartbeat_wait_seconds: 60
+    diagnostic_log: []
+    remediated: false
+    suppress_outcome: false   # true only for a transient state (e.g. RDS 'stopping') - no comment, no ticket, re-check next tick
+    alert_target_type: "unknown"   # set by the router: linux_host | exadata_compute | rds_oracle
+
+  tasks:
+
+    - name: Re-verify the alert is still active before acting (checks the Agent's own target, not the host)
+      ansible.builtin.shell: |
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {{ oem_ssh_user }}@{{ oem_oms_host }} \
+          "{{ emcli_bin }} get_targets -targets='{{ target_host }}%:oracle_emd' -script"
+      register: current_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Extract the data line from get_targets output, if present (avoids risky inline indexing - see 2026-09-13 troubleshooting note below)
+      ansible.builtin.set_fact:
+        current_status_line: "{{ current_status.stdout_lines[1] if (current_status.stdout_lines is defined and (current_status.stdout_lines | length) > 1) else '' }}"
+
+    # NOTE (2026-09-13): the original single-expression version of this parse
+    # (a ternary embedding current_status.stdout_lines[1].split('\t')[1] inline)
+    # failed on ansible-core 2.21 with "object of type 'list' has no attribute
+    # 1" - the templating engine appears to evaluate both branches of the
+    # ternary rather than true short-circuiting, so the risky index/split ran
+    # even when the guard condition was false. Splitting into three small,
+    # single-purpose tasks (each gated by a fact already fully resolved in a
+    # prior completed task, not a sub-expression within the same template)
+    # avoids this entirely and is also much easier to debug via the
+    # intermediate facts if something goes wrong again.
+    - name: Split the data line into tab-separated columns
+      ansible.builtin.set_fact:
+        current_status_columns: "{{ current_status_line.split('\t') if current_status_line else [] }}"
+
+    - name: Extract the Status column (index 1), defaulting to UNKNOWN
+      ansible.builtin.set_fact:
+        current_status_value: "{{ (current_status_columns[1] | trim) if (current_status_columns | length) > 1 else 'UNKNOWN' }}"
+
+    - name: Record status check
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Pre-check via emcli get_targets (oracle_emd): status=' + current_status_value] }}"
+
+    - name: Stop here if the target already reports normal status
+      ansible.builtin.meta: end_play
+      when: >
+        current_status_value == 'Up' and alert_type != 'host_unreachable'
+
+    - name: Dispatch to the correct resolver branch
+      ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_OEM_resolve_router.yml
+
+    # ------------------------------------------------------------------
+    # Common outcome handling - identical for every target type
+    # ------------------------------------------------------------------
+    - name: Mirror success to OEM incident comment
+      ansible.builtin.shell: |
+        COMMENT_B64=$(echo "{{ (diagnostic_log + ['RESOLVED (' + alert_target_type + '): remediation succeeded, no ServiceNow incident created.']) | join('\n') | b64encode }}")
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {{ oem_ssh_user }}@{{ oem_oms_host }} \
+          "COMMENT=\$(echo $COMMENT_B64 | base64 -d) && {{ emcli_bin }} add_comment_to_incident -incident_id='{{ oem_incident_id }}' -comment=\"\$COMMENT\""
+      # Confirmed 2026-09-14: the polling fallback (Section 13 addendum)
+      # queues jobs with oem_incident_id="unknown", since it has no real OEM
+      # incident to reference - emcli rejects that outright ("Argument
+      # -incident_id is set to a non-integer value") rather than just failing
+      # to find it, so skip the attempt entirely in that case rather than
+      # generating a real but pointless error every poller-triggered run.
+      when: (remediated | default(false)) and not (suppress_outcome | default(false)) and oem_incident_id != 'unknown' and (oem_incident_id | regex_search('^[0-9]+$'))
+      changed_when: true
+      register: success_comment_result
+      # Confirmed 2026-09-13: OEM frequently auto-closes/renumbers an incident
+      # via its own independent heartbeat detection faster than this comment
+      # call runs (observed on incidents 835 and 843 - "Error: Unknown
+      # incident id"). The actual remediation already succeeded by this point
+      # regardless of whether the comment lands, so this is not treated as a
+      # pipeline failure - just logged as a best-effort audit note that didn't
+      # land.
+      ignore_errors: true
+
+    - name: Note when there was no real OEM incident to comment on (polling-fallback-triggered run)
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Note: no real OEM incident ID available (oem_incident_id=' + (oem_incident_id | string) + ') - likely detected via the polling fallback rather than a real OEM notification. Remediation itself was still successful.'] }}"
+      when: (remediated | default(false)) and not (suppress_outcome | default(false)) and (oem_incident_id == 'unknown' or not (oem_incident_id | regex_search('^[0-9]+$')))
+
+    - name: Note if the success comment could not be posted (non-fatal - remediation already succeeded)
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Note: could not post success comment to OEM incident ' + (oem_incident_id | string) + ' - likely already auto-closed by OEM before this ran. Remediation itself was already successful.'] }}"
+      when: (remediated | default(false)) and not (suppress_outcome | default(false)) and success_comment_result is defined and success_comment_result.failed | default(false)
+
+    - block:
+
+        - name: Create ServiceNow incident for L1 support (direct REST, not webhook)
+          ansible.builtin.uri:
+            url: "https://{{ sn_instance_clean }}.service-now.com/api/now/table/incident"
+            method: POST
+            user: "{{ sn_username }}"
+            password: "{{ sn_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              short_description: "OEM: {{ alert_type }} on {{ target_host }} ({{ alert_target_type }}) - Ansible remediation exhausted"
+              description: "{{ diagnostic_log | join('\n') }}"
+              urgency: "1"
+              category: "Infrastructure"
+              u_oem_target_name: "{{ target_host }}"
+              u_oem_host: "{{ target_host }}"
+              u_oem_incident_id: "{{ oem_incident_id }}"
+            status_code: [201]
+          register: snow_incident
+
+        - name: Mirror escalation to OEM incident comment
+          ansible.builtin.shell: |
+            COMMENT_B64=$(echo "{{ (diagnostic_log + ['ESCALATED (' + alert_target_type + '): Ansible remediation exhausted, ServiceNow incident opened for L1 support.']) | join('\n') | b64encode }}")
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {{ oem_ssh_user }}@{{ oem_oms_host }} \
+              "COMMENT=\$(echo $COMMENT_B64 | base64 -d) && {{ emcli_bin }} add_comment_to_incident -incident_id='{{ oem_incident_id }}' -comment=\"\$COMMENT\""
+          # Same "unknown" / non-numeric guard as the success-comment task -
+          # emcli rejects a non-integer -incident_id outright, so skip rather
+          # than generate a pointless real error on every poller-triggered
+          # escalation.
+          when: oem_incident_id != 'unknown' and (oem_incident_id | regex_search('^[0-9]+$'))
+          changed_when: true
+          register: escalation_comment_result
+          # Same tolerance as the success-comment task above - an escalation
+          # is already recorded in ServiceNow by this point regardless of
+          # whether OEM's own incident can still be commented on.
+          ignore_errors: true
+
+        - name: Note when there was no real OEM incident to comment on for this escalation (polling-fallback-triggered run)
+          ansible.builtin.set_fact:
+            diagnostic_log: "{{ diagnostic_log + ['Note: no real OEM incident ID available (oem_incident_id=' + (oem_incident_id | string) + ') to comment on - likely detected via the polling fallback. ServiceNow incident ' + (snow_incident.json.result.number | default(snow_incident.json.result.sys_id) | default('(id unknown)') | string) + ' was still created successfully.'] }}"
+          when: oem_incident_id == 'unknown' or not (oem_incident_id | regex_search('^[0-9]+$'))
+
+        - name: Note if the escalation comment could not be posted (non-fatal - ServiceNow incident already created)
+          ansible.builtin.set_fact:
+            diagnostic_log: "{{ diagnostic_log + ['Note: could not post escalation comment to OEM incident ' + (oem_incident_id | string) + ' - ServiceNow incident ' + (snow_incident.json.result.number | default(snow_incident.json.result.sys_id) | default('(id unknown)') | string) + ' was still created successfully.'] }}"
+          when: escalation_comment_result is defined and escalation_comment_result.failed | default(false)
+
+      when: not (remediated | default(false)) and not (suppress_outcome | default(false))
+
+    - name: Log-only note for a suppressed (transient-state) outcome - no OEM comment, no ServiceNow contact
+      ansible.builtin.debug:
+        msg: "Transient state detected - deliberately skipping both OEM comment and ServiceNow escalation this cycle: {{ diagnostic_log | last }}"
+      when: suppress_outcome | default(false)
+
+    - name: Final debug summary
+      ansible.builtin.debug:
+        msg: "{{ diagnostic_log }}"

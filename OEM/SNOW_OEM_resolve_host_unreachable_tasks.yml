@@ -1,0 +1,202 @@
+---
+###############################################################################
+# SNOW_OEM_resolve_host_unreachable_tasks.yml
+#
+# Included by SNOW_OEM_resolve_router.yml for both plain Linux hosts
+# (is_exadata: false) and Exadata compute nodes (is_exadata: true).
+# Identical ladder for both - ping, SSH, agent self-heal - with one
+# Exadata-only addition: when SSH fails, query the node's ILOM (out-of-band
+# management controller) for power/fault state before escalating, so the
+# resulting incident carries hardware-level context instead of just
+# "unreachable."
+#
+# No delegate_to is used against the target host anywhere in this file
+# (see design doc Section 6 / 4.5 for the ansible-core 2.21.1 delegate_to
+# bug this works around) - every remote action shells out via a literal
+# ssh command instead. ILOM/ipmitool calls run locally since they talk to
+# the management network directly, not through the target host's own OS.
+###############################################################################
+
+- name: Set alert_target_type for reporting
+  ansible.builtin.set_fact:
+    alert_target_type: "{{ 'exadata_compute' if is_exadata else 'linux_host' }}"
+
+# ------------------------------------------------------------------
+# Step 1: Ping
+# ------------------------------------------------------------------
+- name: Ping the target host
+  ansible.builtin.command: "ping -c 3 -W 2 {{ resolved_host }}"
+  register: ping_result
+  changed_when: false
+  ignore_errors: true
+
+- name: Record ping result
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['Ping ' + resolved_host + ': ' + (\"reachable\" if ping_result.rc == 0 else \"UNREACHABLE\")] }}"
+
+# ------------------------------------------------------------------
+# Step 2: SSH
+# ------------------------------------------------------------------
+- name: Check SSH reachability
+  ansible.builtin.command: >
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes
+    {{ oem_ssh_user }}@{{ resolved_host }} "echo ssh_ok"
+  register: ssh_result
+  changed_when: false
+  ignore_errors: true
+
+- name: Record SSH result
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['SSH to ' + resolved_host + ': ' + (\"reachable\" if ssh_result.rc == 0 else \"FAILED\")] }}"
+
+# ------------------------------------------------------------------
+# Case: SSH failed -> (Exadata only) pull ILOM diagnostics, then
+# escalate regardless. No power-on action is taken automatically -
+# see design doc rationale: redundant PSUs mean a real power-off
+# state is more likely a genuine fault or a deliberate/Clusterware
+# action than something safe to blindly reverse.
+# ------------------------------------------------------------------
+- block:
+
+    - name: (Exadata only) Query ILOM chassis/power status
+      ansible.builtin.command: >
+        ipmitool -I lanplus -H {{ hostvars[target_host].ilom_host }}
+        -U {{ ilom_username }} -P {{ ilom_password }} chassis status
+      register: ilom_status
+      ignore_errors: true
+      no_log: true
+
+    - name: (Exadata only) Pull system event log for real fault entries
+      ansible.builtin.command: >
+        ipmitool -I lanplus -H {{ hostvars[target_host].ilom_host }}
+        -U {{ ilom_username }} -P {{ ilom_password }} sel list
+      register: ilom_sel
+      ignore_errors: true
+      no_log: true
+
+    - name: Record ILOM diagnostics
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['ILOM chassis status: ' + (ilom_status.stdout | default('ILOM unreachable')), 'ILOM SEL entries: ' + ((ilom_sel.stdout_lines | default([])) | length | string) + ' lines captured (attached to incident, not itemized here)'] }}"
+
+  when: is_exadata and ssh_result.rc != 0
+
+- name: No further diagnosis possible without infra-level access (non-Exadata)
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['No IPMI/hypervisor access configured for this host class - cannot proceed past SSH failure. Escalating.'] }}"
+  when: (not is_exadata) and ssh_result.rc != 0
+
+- name: SSH failed - remediation not attempted, escalate
+  ansible.builtin.set_fact:
+    remediated: false
+  when: ssh_result.rc != 0
+
+# ------------------------------------------------------------------
+# Case: SSH OK -> agent self-heal ladder (identical for Linux/Exadata)
+# ------------------------------------------------------------------
+- block:
+
+    - name: Check current agent status
+      ansible.builtin.command: >
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10
+        {{ oem_ssh_user }}@{{ resolved_host }} "{{ agent_home }}/bin/emctl status agent"
+      register: agent_status
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record agent status
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Agent status: ' + (agent_status.stdout | default('unavailable'))] }}"
+
+    - name: Pull last lines of agent log for crash context
+      ansible.builtin.command: >
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10
+        {{ oem_ssh_user }}@{{ resolved_host }} "tail -60 {{ agent_inst }}/sysman/log/emagent.nohup"
+      register: agent_log_tail
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record agent log excerpt captured
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Last 60 lines of emagent.nohup captured for incident notes'] }}"
+
+    - name: Attempt 1 - clearstate and restart agent
+      ansible.builtin.command: >
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10
+        {{ oem_ssh_user }}@{{ resolved_host }}
+        "{{ agent_home }}/bin/emctl stop agent -force; {{ agent_home }}/bin/emctl clearstate agent; {{ agent_home }}/bin/emctl start agent"
+      register: restart_attempt_1
+      changed_when: true
+      ignore_errors: true
+
+    - name: Wait before re-checking heartbeat
+      ansible.builtin.pause:
+        seconds: "{{ heartbeat_wait_seconds }}"
+
+    - name: Re-check heartbeat via emcli after attempt 1 (Agent's own oracle_emd target)
+      ansible.builtin.shell: |
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {{ oem_ssh_user }}@{{ oem_oms_host }} \
+          "{{ emcli_bin }} get_targets -targets='{{ target_host }}%:oracle_emd' -script"
+      register: status_after_attempt_1
+      changed_when: false
+      ignore_errors: true
+
+    - name: Extract the data line from attempt 1's get_targets output, if present
+      ansible.builtin.set_fact:
+        status_after_attempt_1_line: "{{ status_after_attempt_1.stdout_lines[1] if (status_after_attempt_1.stdout_lines is defined and (status_after_attempt_1.stdout_lines | length) > 1) else '' }}"
+
+    - name: Split attempt 1's data line into tab-separated columns
+      ansible.builtin.set_fact:
+        status_after_attempt_1_columns: "{{ status_after_attempt_1_line.split('\t') if status_after_attempt_1_line else [] }}"
+
+    - name: Extract attempt 1's Status column (index 1), defaulting to UNKNOWN
+      ansible.builtin.set_fact:
+        status_after_attempt_1_value: "{{ (status_after_attempt_1_columns[1] | trim) if (status_after_attempt_1_columns | length) > 1 else 'UNKNOWN' }}"
+
+    - name: Record attempt 1 outcome
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['After clearstate+restart: status=' + status_after_attempt_1_value] }}"
+        remediated: "{{ status_after_attempt_1_value == 'Up' }}"
+
+    - block:
+
+        - name: Attempt 2 - re-secure agent and restart
+          ansible.builtin.command: >
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10
+            {{ oem_ssh_user }}@{{ resolved_host }}
+            "{{ agent_home }}/bin/emctl secure agent -emd_url {{ oem_emd_url | default('') }}; {{ agent_home }}/bin/emctl start agent"
+          register: restart_attempt_2
+          changed_when: true
+          ignore_errors: true
+
+        - name: Wait before re-checking heartbeat again
+          ansible.builtin.pause:
+            seconds: "{{ heartbeat_wait_seconds }}"
+
+        - name: Re-check heartbeat via emcli after attempt 2 (Agent's own oracle_emd target)
+          ansible.builtin.shell: |
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {{ oem_ssh_user }}@{{ oem_oms_host }} \
+              "{{ emcli_bin }} get_targets -targets='{{ target_host }}%:oracle_emd' -script"
+          register: status_after_attempt_2
+          changed_when: false
+          ignore_errors: true
+
+        - name: Extract the data line from attempt 2's get_targets output, if present
+          ansible.builtin.set_fact:
+            status_after_attempt_2_line: "{{ status_after_attempt_2.stdout_lines[1] if (status_after_attempt_2.stdout_lines is defined and (status_after_attempt_2.stdout_lines | length) > 1) else '' }}"
+
+        - name: Split attempt 2's data line into tab-separated columns
+          ansible.builtin.set_fact:
+            status_after_attempt_2_columns: "{{ status_after_attempt_2_line.split('\t') if status_after_attempt_2_line else [] }}"
+
+        - name: Extract attempt 2's Status column (index 1), defaulting to UNKNOWN
+          ansible.builtin.set_fact:
+            status_after_attempt_2_value: "{{ (status_after_attempt_2_columns[1] | trim) if (status_after_attempt_2_columns | length) > 1 else 'UNKNOWN' }}"
+
+        - name: Record attempt 2 outcome
+          ansible.builtin.set_fact:
+            diagnostic_log: "{{ diagnostic_log + ['After re-secure+restart: status=' + status_after_attempt_2_value] }}"
+            remediated: "{{ status_after_attempt_2_value == 'Up' }}"
+
+      when: not remediated
+
+  when: ssh_result.rc == 0

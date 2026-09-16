@@ -1,0 +1,47 @@
+---
+###############################################################################
+# SNOW_OEM_resolve_router.yml
+#
+# Included by SNOW_OEM_resolve_host_unreachable.yml. Determines which
+# resolver branch applies based on inventory group membership - NOT on
+# anything OEM reports directly, since OEM's own target type won't cleanly
+# distinguish "on-prem Linux host" from "Exadata compute node" from
+# "RDS Oracle instance" the way this routing needs.
+#
+# Requires /etc/ansible/hosts to define:
+#   [linux_hosts]            lnx001, lnx002, ...
+#   [exadata_compute_nodes]  exadb01, exadb02, ...
+#   [rds_oracle_targets]     <names matching the OEM target_name exactly>
+#
+# lnx003 (the OMS host) is deliberately never a member of any of these
+# groups as a remediation target - it is the system doing the observing.
+###############################################################################
+
+- name: Determine target's inventory groups
+  ansible.builtin.set_fact:
+    target_groups: "{{ hostvars[target_host].group_names | default([]) }}"
+
+- name: Route to RDS resolver
+  ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_OEM_resolve_rds_unreachable.yml
+  when: "'rds_oracle_targets' in target_groups"
+
+- name: Route to Exadata compute node resolver (shares the Linux ladder, ILOM diagnostics added)
+  ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_OEM_resolve_host_unreachable_tasks.yml
+  vars:
+    is_exadata: true
+  when: "'exadata_compute_nodes' in target_groups"
+
+- name: Route to plain Linux host resolver
+  ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_OEM_resolve_host_unreachable_tasks.yml
+  vars:
+    is_exadata: false
+  when: "'linux_hosts' in target_groups"
+
+- name: Fail loudly if a target matched no known group (avoid silently doing nothing)
+  ansible.builtin.fail:
+    msg: >
+      target_host '{{ target_host }}' did not match linux_hosts, exadata_compute_nodes,
+      or rds_oracle_targets in inventory. Add it to the correct group before this
+      alert type can be auto-remediated for it.
+  when: >
+    (target_groups | select('in', ['linux_hosts', 'exadata_compute_nodes', 'rds_oracle_targets']) | list | length) == 0

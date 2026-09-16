@@ -1,0 +1,128 @@
+---
+###############################################################################
+# SNOW_OEM_resolve_rds_unreachable.yml
+#
+# Included by SNOW_OEM_resolve_router.yml for targets in the
+# rds_oracle_targets inventory group. No ping/SSH/agent steps - RDS is a
+# managed service with no OS to reach and no OEM Management Agent running
+# on the instance. OEM monitors it as a Remote Database target over
+# SQL*Net, so "unreachable" here means "couldn't connect," which can mean
+# several different things that each need different handling:
+#   stopped                       -> safe to start
+#   stopping/starting/rebooting/
+#   backing-up/maintenance        -> transient, take no action, just log it
+#   available                     -> instance is fine; problem is network/
+#                                     security-group/DNS, not a lifecycle
+#                                     issue - do NOT act, escalate with context
+#   storage-full/incompatible-*/
+#   failed                        -> needs human/infra intervention, escalate
+#
+# Requires the amazon.aws collection and an IAM role/instance profile on
+# the control node scoped to exactly:
+#   rds:DescribeDBInstances, rds:StartDBInstance, rds:ListTagsForResource
+# on the specific instance ARNs - never rds:* and never long-lived access
+# keys stored in a vars file.
+###############################################################################
+
+- name: Get current RDS instance status
+  amazon.aws.rds_instance_info:
+    db_instance_identifier: "{{ target_host }}"
+  register: rds_status
+  ignore_errors: true
+
+- name: Fail gracefully if the instance itself can't be described (auth/name issue)
+  block:
+    - ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['rds_instance_info failed - check db_instance_identifier matches OEM target_name exactly, and IAM permissions'] }}"
+        remediated: false
+        alert_target_type: "rds_oracle"
+    - ansible.builtin.meta: end_play
+  when: rds_status.instances is not defined or (rds_status.instances | length) == 0
+
+- name: Record RDS status and set target type
+  ansible.builtin.set_fact:
+    alert_target_type: "rds_oracle"
+    current_rds_state: "{{ rds_status.instances[0].db_instance_status }}"
+    diagnostic_log: "{{ diagnostic_log + ['RDS instance status: ' + rds_status.instances[0].db_instance_status] }}"
+
+- name: Check for an intentional-stop tag before touching a stopped instance
+  amazon.aws.rds_instance_info:
+    db_instance_identifier: "{{ target_host }}"
+  register: rds_tags_check
+  when: current_rds_state == 'stopped'
+
+- name: Record intentional-stop tag if present
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['Instance tagged IntentionallyStopped=true - not starting automatically, escalating instead'] }}"
+    skip_auto_start: true
+  when: >
+    current_rds_state == 'stopped' and
+    (rds_tags_check.instances[0].tags.IntentionallyStopped | default('false') | lower) == 'true'
+
+- name: Set skip_auto_start false when not already set
+  ansible.builtin.set_fact:
+    skip_auto_start: "{{ skip_auto_start | default(false) }}"
+
+# ------------------------------------------------------------------
+# Case: cleanly stopped, no intentional-stop tag -> start it
+# ------------------------------------------------------------------
+- block:
+
+    - name: Start the RDS instance
+      amazon.aws.rds_instance:
+        db_instance_identifier: "{{ target_host }}"
+        state: started
+      register: rds_start_result
+
+    - name: Wait for the instance to become available (bounded)
+      amazon.aws.rds_instance_info:
+        db_instance_identifier: "{{ target_host }}"
+      register: wait_result
+      until: wait_result.instances[0].db_instance_status == 'available'
+      retries: 20
+      delay: 30
+      ignore_errors: true
+
+    - name: Record start outcome
+      ansible.builtin.set_fact:
+        diagnostic_log: "{{ diagnostic_log + ['Start command issued, final observed state: ' + (wait_result.instances[0].db_instance_status | default('unknown/timed out waiting'))] }}"
+        remediated: "{{ (wait_result.instances[0].db_instance_status | default('')) == 'available' }}"
+
+  when: current_rds_state == 'stopped' and not skip_auto_start
+
+- name: Stopped-with-intentional-tag -> do not act, escalate
+  ansible.builtin.set_fact:
+    remediated: false
+  when: current_rds_state == 'stopped' and skip_auto_start
+
+# ------------------------------------------------------------------
+# Case: transient lifecycle state -> take no action, just log and let
+# the next cron tick re-evaluate (acting here would be redundant or
+# disruptive to an in-progress operation)
+# ------------------------------------------------------------------
+- name: Transient state - no action, will re-verify next cycle
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['Transient state (' + current_rds_state + ') - taking no action, re-checking next cron tick rather than escalating prematurely'] }}"
+    suppress_outcome: true
+  when: current_rds_state in ['stopping', 'starting', 'rebooting', 'backing-up', 'maintenance']
+
+# ------------------------------------------------------------------
+# Case: instance reports available but OEM still can't connect ->
+# network/security-group/DNS problem, not a lifecycle problem.
+# Never attempt a start/reboot here - it wouldn't address the actual
+# cause and could mask it.
+# ------------------------------------------------------------------
+- name: Available but unreachable - likely network/SG/DNS, not instance state
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['Instance reports available but OEM cannot connect - likely security group, route table, or DNS/endpoint issue. Not an instance-lifecycle problem; no automated action taken.'] }}"
+    remediated: false
+  when: current_rds_state == 'available'
+
+# ------------------------------------------------------------------
+# Case: storage/parameter/failed states -> always escalate, never act
+# ------------------------------------------------------------------
+- name: Terminal/failure states - always escalate, never act
+  ansible.builtin.set_fact:
+    diagnostic_log: "{{ diagnostic_log + ['State ' + current_rds_state + ' requires manual intervention (storage, parameter group, or instance failure) - not attempting any automated action'] }}"
+    remediated: false
+  when: current_rds_state in ['storage-full', 'failed'] or (current_rds_state is match('incompatible-.*'))
