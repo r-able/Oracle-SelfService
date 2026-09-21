@@ -1,0 +1,22 @@
+# Install:
+#   sudo cp tablespace-webhook.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tablespace-webhook
+#
+# Logs: journalctl -u tablespace-webhook -f
+
+[Unit]
+Description=Closed-loop demo — ServiceNow webhook receiver
+After=network.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/tablespace-demo
+EnvironmentFile=/opt/tablespace-demo/.env
+ExecStart=/opt/tablespace-demo/venv/bin/gunicorn -w 2 -b 0.0.0.0:8443 webhook_receiver:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

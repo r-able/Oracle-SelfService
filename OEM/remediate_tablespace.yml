@@ -1,0 +1,954 @@
+---
+# remediate_tablespace.yml
+#
+# Called by run_playbook.sh as:
+#   ansible-playbook -i inventory.ini remediate_tablespace.yml \
+#     --extra-vars "change_number=CHG0033168 tablespace=USERS_TBS"
+#
+# Requires the servicenow.itsm collection:
+#   ansible-galaxy collection install servicenow.itsm
+#
+# Three plays, matching the house pattern used across the real Oracle
+# suite's ServiceNow conversion:
+#   PLAY 1 (localhost)   — verify the CR, walk it New -> Scheduled -> Implement
+#   PLAY 2 (the DB host) — diagnose -> act -> verify, over SSH as the oracle
+#                          OS user, wrapped in block/rescue so a genuine
+#                          failure doesn't abort the whole run and strand
+#                          the CR at Implement forever
+#   PLAY 3 (localhost)   — RCA writeup -> work note -> Review -> Closed,
+#                          on BOTH the success and failure path
+#
+# The CR must already exist (created by the forecasting job, not built
+# yet) as a Standard-type, pre-approved change — same no-approval pattern
+# as REF/CDP/PRF. This playbook does not set type or chg_model, only
+# state and work notes.
+#
+# Everything host/site-specific lives in vars/demo_vars.yml. Nothing here
+# is hardcoded to a specific host, PDB, or ServiceNow instance.
+#
+# NOT verified against a live ServiceNow instance — the servicenow.itsm
+# module parameter names below match the collection's documented shape
+# and the conventions already proven in the production suite, but per
+# your own lookup-first discipline: confirm number-based lookup, work_notes
+# support, and close_code values against sys_choice on YOUR instance
+# before trusting this against anything real.
+
+# =====================================================================
+# PLAY 1 — verify the CR, walk it to Implement
+# =====================================================================
+- name: Verify CR and move it into Implement
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/demo_vars.yml
+
+  tasks:
+    - name: Look up the change request by number
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+      register: cr_lookup
+
+    - name: Fail loudly if the CR doesn't exist — nothing to remediate against
+      ansible.builtin.fail:
+        msg: "No change request found for number {{ change_number }}. Check the number and try again."
+      when: cr_lookup.records | default([]) | length == 0
+
+    - name: Record the CR's sys_id and current state
+      ansible.builtin.set_fact:
+        cr_sys_id: "{{ cr_lookup.records[0].sys_id }}"
+        cr_state_at_start: "{{ cr_lookup.records[0].state }}"
+
+    - name: Warn (don't fail) if the CR isn't where we expect it
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ change_number }} is in state '{{ cr_state_at_start }}',
+          not 'New'. Proceeding anyway, but this usually means something
+          upstream (the forecasting job, or a human) already touched this CR.
+      when: cr_state_at_start | lower != 'new'
+
+    - name: Set the assignment group BEFORE attempting any state transition
+      # The "New to Scheduled" transition condition on the Standard model
+      # ("Assignment group is not empty") is evaluated against the record's
+      # already-committed state, not against fields bundled into the same
+      # API call as the state change. Setting state+assignment_group in one
+      # call (the original version of this task) fails the condition even
+      # though the group IS being set — confirmed by reading the actual
+      # Model State Transition record on the instance, not guessed.
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+        assignment_group: "{{ sn_assignment_group }}"
+      when: cr_state_at_start | lower == 'new'
+
+    - name: Move to Scheduled (Standard changes can't jump straight to Implement)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+        state: "{{ sn_change_state_scheduled }}"
+        assignment_group: "{{ sn_assignment_group }}"
+      when: cr_state_at_start | lower == 'new'
+
+    - name: Post the "starting" work note (separately from the state change,
+        same reasoning as the assignment_group fix above — don't bundle
+        non-state fields with a state transition, in case this edge has its
+        own condition too)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+        other:
+          work_notes: >-
+            🤖 Closed-loop automation picked this up. Diagnosing
+            {{ tablespace }} on {{ oracle_target_host }}/{{ pdb_name }} now.
+
+    - name: Move to Implement
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+        state: "{{ sn_change_state_implement }}"
+        assignment_group: "{{ sn_assignment_group }}"
+
+# =====================================================================
+# PLAY 2 — diagnose, act, verify (on the actual DB host)
+# =====================================================================
+- name: Diagnose and remediate the tablespace
+  hosts: "{{ oracle_target_host }}"
+  gather_facts: false
+  become: true
+  become_user: "{{ oracle_os_user | default('oracle') }}"
+  vars_files:
+    - vars/demo_vars.yml
+
+  tasks:
+    - name: Run the diagnose/act/verify sequence, tolerating failure
+      block:
+        # --- DIAGNOSE -----------------------------------------------
+        # One JSON object per datafile row — far more robust than parsing
+        # pipe-delimited SQL*Plus output, and Oracle 21c+ (this
+        # environment) supports JSON_OBJECT natively.
+        - name: Write diagnostic SQL
+          ansible.builtin.copy:
+            dest: /tmp/{{ change_number }}_diagnose.sql
+            mode: "0600"
+            content: |
+              SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINES 500 TRIMSPOOL ON
+              {% if pdb_name | default('') | length > 0 %}
+              ALTER SESSION SET CONTAINER = {{ pdb_name }};
+              {% endif %}
+              SELECT JSON_OBJECT(
+                       'file_name' VALUE df.file_name,
+                       'size_mb' VALUE ROUND(df.bytes/1024/1024),
+                       'free_mb' VALUE ROUND(NVL(fs.bytes,0)/1024/1024),
+                       'autoextensible' VALUE df.autoextensible,
+                       'maxsize_mb' VALUE ROUND(df.maxbytes/1024/1024),
+                       'pct_used' VALUE ROUND((1 - NVL(fs.bytes,0)/df.bytes) * 100, 1)
+                     )
+              FROM dba_data_files df
+              LEFT JOIN (SELECT file_id, SUM(bytes) bytes FROM dba_free_space GROUP BY file_id) fs
+                ON fs.file_id = df.file_id
+              WHERE df.tablespace_name = UPPER('{{ tablespace }}')
+              ORDER BY df.file_name;
+              EXIT;
+
+        - name: Build the connect-and-run wrapper
+          # become_user strips ORACLE_SID/ORACLE_HOME from the environment,
+          # so (same fix as the rest of the suite) we export them explicitly
+          # inside a temp script rather than relying on the inherited shell env.
+          ansible.builtin.copy:
+            dest: /tmp/{{ change_number }}_run_diagnose.sh
+            mode: "0700"
+            content: |
+              #!/usr/bin/env bash
+              export ORACLE_SID={{ oracle_sid }}
+              export ORACLE_HOME={{ oracle_home }}
+              export PATH=$ORACLE_HOME/bin:$PATH
+              sqlplus -s / as sysdba @/tmp/{{ change_number }}_diagnose.sql
+
+        - name: Run diagnostics
+          ansible.builtin.command: /tmp/{{ change_number }}_run_diagnose.sh
+          register: diag_raw
+          changed_when: false
+
+        - name: Parse diagnostic output (one JSON object per line)
+          ansible.builtin.set_fact:
+            datafiles: >-
+              {{ diag_raw.stdout_lines
+                 | select('search', '^\{')
+                 | map('from_json')
+                 | list }}
+
+        - name: Fail loudly if no datafiles matched (bad tablespace name, wrong PDB, etc.)
+          ansible.builtin.fail:
+            msg: >-
+              No datafiles found for tablespace '{{ tablespace }}' in PDB
+              '{{ pdb_name }}' on {{ inventory_hostname }}. Check the
+              tablespace name and pdb_name var before re-running. Raw
+              output was: {{ diag_raw.stdout }}
+          when: datafiles | length == 0
+
+        - name: Pick the fullest datafile (that's the one we'll act on)
+          ansible.builtin.set_fact:
+            target_file: "{{ (datafiles | sort(attribute='pct_used'))[-1] }}"
+
+        - name: Record before-state for the RCA writeup later
+          ansible.builtin.set_fact:
+            before_pct_used: "{{ target_file.pct_used }}"
+            before_size_mb: "{{ target_file.size_mb }}"
+            datafile_path: "{{ target_file.file_name }}"
+            autoextend_was: "{{ target_file.autoextensible }}"
+
+        - name: Post diagnostic query note (real SQL and real result)
+          # Ported from the proven OEM incident resolver's note-posting
+          # granularity — one note per real step, with the actual SQL
+          # included, not a condensed summary at the end.
+          ansible.builtin.include_tasks: COMMON_post_cr_note.yml
+          vars:
+            note_text: |-
+              Diagnostic query executed on {{ oracle_target_host }} (ORACLE_SID={{ oracle_sid }}{{ ', PDB=' ~ pdb_name if pdb_name | default('') | length > 0 else '' }}):
+
+              SELECT JSON_OBJECT('file_name' VALUE df.file_name, 'size_mb' VALUE ROUND(df.bytes/1024/1024), 'autoextensible' VALUE df.autoextensible, 'maxsize_mb' VALUE ROUND(df.maxbytes/1024/1024), 'pct_used' VALUE ROUND((1 - NVL(fs.bytes,0)/df.bytes) * 100, 1)) FROM dba_data_files df LEFT JOIN dba_free_space fs ON fs.file_id = df.file_id WHERE df.tablespace_name = UPPER('{{ tablespace }}');
+
+              Result: {{ target_file.file_name }} — {{ target_file.size_mb }}MB, {{ target_file.pct_used }}% used, autoextensible={{ target_file.autoextensible }}, current MAXSIZE={{ target_file.maxsize_mb }}MB.
+
+        # --- Compute the resize target ------------------------------
+        # Ported from the proven OEM logic: target a specific FREE
+        # percentage rather than an arbitrary flat growth increment.
+        #
+        # Decided early (before growth_mb, the disk checks, or the
+        # capacity safeguard) because a REAL bug surfaced in testing:
+        # the raw target_free_pct math can compute a total SMALLER than
+        # whatever ceiling/size is already configured — e.g. a datafile
+        # already had autoextend MAXSIZE=20000MB from an earlier run, but
+        # this run's raw math wanted only 74MB, and the unguarded version
+        # of this code actually SHRANK the ceiling to 74MB. A "safety"
+        # action must never move a limit in the unsafe direction, so a
+        # floor against the existing value is applied before anything
+        # downstream (including the capacity safeguard's own math) uses
+        # this number.
+        - name: Decide the action — raise the MAXSIZE ceiling, or resize directly
+          ansible.builtin.set_fact:
+            remediation_action: >-
+              {{ 'raise_maxsize' if target_file.autoextensible == 'YES' else 'resize' }}
+
+        - name: Compute currently-used MB from size and pct_used
+          ansible.builtin.set_fact:
+            used_mb: "{{ (target_file.size_mb | float) * (target_file.pct_used | float) / 100 }}"
+
+        - name: Compute the raw target total size (bring tablespace to target_free_pct free)
+          ansible.builtin.set_fact:
+            raw_new_total_mb: "{{ ((used_mb | float) / (1 - (target_free_pct | float / 100))) | round(0, 'ceil') | int }}"
+
+        - name: Identify the existing ceiling this action must never shrink below
+          ansible.builtin.set_fact:
+            existing_ceiling_mb: >-
+              {{ target_file.maxsize_mb if remediation_action == 'raise_maxsize' else target_file.size_mb }}
+
+        - name: Apply the never-shrink floor — this is the value everything downstream uses
+          ansible.builtin.set_fact:
+            new_total_mb: "{{ [raw_new_total_mb | int, existing_ceiling_mb | int] | max }}"
+
+        - name: Compute growth needed (floored target vs. current physical file size)
+          ansible.builtin.set_fact:
+            growth_mb: "{{ (new_total_mb | int) - (target_file.size_mb | int) }}"
+
+        # --- Disk safety checks --------------------------------------
+        # All run locally on this host (already here via become_user:
+        # oracle) — unlike the OEM version this was ported from, which
+        # SSH'd out from a localhost-based play; we're already directly
+        # on the target host, so no SSH-to-self is needed.
+        - name: Determine mount point backing the datafile
+          ansible.builtin.command: "df --output=target {{ datafile_path | dirname }}"
+          register: mount_point_raw
+          changed_when: false
+
+        - name: Parse mount point
+          ansible.builtin.set_fact:
+            mount_point: "{{ mount_point_raw.stdout_lines[-1] | trim }}"
+
+        - name: Check available disk space on that mount
+          ansible.builtin.command: "df --output=avail -BM {{ mount_point }}"
+          register: disk_avail_raw
+          changed_when: false
+
+        - name: Check total disk capacity on that mount
+          ansible.builtin.command: "df --output=size -BM {{ mount_point }}"
+          register: disk_total_raw
+          changed_when: false
+
+        - name: Parse disk avail/total (strip the trailing M)
+          ansible.builtin.set_fact:
+            disk_avail_mb: "{{ disk_avail_raw.stdout_lines[-1] | trim | regex_replace('M$', '') | int }}"
+            disk_total_mb: "{{ disk_total_raw.stdout_lines[-1] | trim | regex_replace('M$', '') | int }}"
+
+        # --- System-wide MAXSIZE check: EVERY database in /etc/oratab, ---
+        # --- not just this one PDB/CDB ------------------------------------
+        - name: Read /etc/oratab entries on this host
+          ansible.builtin.command:
+            argv:
+              - grep
+              - -Ev
+              - '^#|^\s*$'
+              - /etc/oratab
+          register: oratab_raw
+          changed_when: false
+          failed_when: false
+
+        - name: Parse oratab entries into sid/home pairs
+          ansible.builtin.set_fact:
+            oratab_parsed: >-
+              {{ oratab_raw.stdout_lines | default([])
+                 | map('trim')
+                 | select('search', ':')
+                 | map('split', ':')
+                 | list }}
+
+        - name: Reset database check results list
+          ansible.builtin.set_fact:
+            db_check_results: []
+
+        - name: Check every database listed in /etc/oratab
+          ansible.builtin.include_tasks: check_one_database_local.yml
+          loop: "{{ oratab_parsed }}"
+          loop_control:
+            loop_var: oratab_entry
+          vars:
+            check_sid: "{{ oratab_entry[0] }}"
+            check_home: "{{ oratab_entry[1] }}"
+
+        - name: Aggregate system-wide totals across all reachable databases
+          ansible.builtin.set_fact:
+            sys_current_mb: "{{ db_check_results | selectattr('reachable') | map(attribute='current_mb') | sum }}"
+            sys_theoretical_max_mb: "{{ db_check_results | selectattr('reachable') | map(attribute='max_mb') | sum }}"
+            oratab_reachable_count: "{{ db_check_results | selectattr('reachable') | list | length }}"
+            oratab_unreachable_sids: "{{ db_check_results | rejectattr('reachable') | map(attribute='sid') | list }}"
+            oratab_total_count: "{{ db_check_results | length }}"
+
+        - name: Build oratab summary text for the note
+          ansible.builtin.set_fact:
+            oratab_summary: >-
+              {% if oratab_total_count | int == 1 %}
+              Only one database ({{ db_check_results[0].sid }}) found in
+              /etc/oratab on {{ oracle_target_host }} - no other databases
+              present on this host to check.
+              {% else %}
+              {{ oratab_total_count }} databases found in /etc/oratab on
+              {{ oracle_target_host }}: {{ db_check_results | map(attribute='sid') | join(', ') }}.
+              {% endif %}
+              {% for r in db_check_results %}
+              {{ r.sid }}: {{ 'current=' ~ r.current_mb ~ 'MB, max=' ~ r.max_mb ~ 'MB' if r.reachable else 'UNREACHABLE - excluded from aggregate, verify manually' }}
+              {% endfor %}
+
+        # --- CAPACITY SAFEGUARD: host-wide committed-MAXSIZE ceiling ------
+        # Ported from the ALR-era design (SNOW_ALR_tablespace_resolution.yml)
+        # — a stricter, HOST-WIDE gate distinct from the per-resize
+        # mount-space check below. If this remediation would push total
+        # committed MAXSIZE across every database on this host past
+        # capacity_safety_pct of the mount's total size, no resize
+        # happens — instead two follow-up CRs are opened (storage + DBA)
+        # and this CR is left at its current state rather than closed,
+        # matching the real system's "leave In Progress" behavior.
+        #
+        # KNOWN LIMITATION inherited from the source: the oratab sweep's
+        # SQL queries dba_data_files without switching PDB, so on a
+        # multi-tenant CDB (like lnx001/CDB1) this only sees the root
+        # container's own datafiles, not each PDB's — the same limitation
+        # the real OEM system has, not something newly introduced here.
+        - name: Compute this datafile's OLD contribution to the system-wide aggregate
+          ansible.builtin.set_fact:
+            old_contribution_mb: >-
+              {{ target_file.maxsize_mb if target_file.autoextensible == 'YES' else target_file.size_mb }}
+
+        - name: Compute the PROJECTED system-wide total if this remediation proceeds
+          ansible.builtin.set_fact:
+            projected_sys_max_mb: >-
+              {{ (sys_theoretical_max_mb | float) - (old_contribution_mb | float) + (new_total_mb | float) }}
+
+        - name: Compute the capacity safety threshold
+          ansible.builtin.set_fact:
+            capacity_threshold_mb: "{{ (disk_total_mb | float) * (capacity_safety_pct | float) }}"
+
+        - name: Determine if this remediation is safe under the host-wide capacity ceiling
+          ansible.builtin.set_fact:
+            capacity_safe: "{{ (projected_sys_max_mb | float) <= (capacity_threshold_mb | float) }}"
+            capacity_blocked: "{{ (projected_sys_max_mb | float) > (capacity_threshold_mb | float) }}"
+
+        - name: Post capacity-warning note on this CR
+          ansible.builtin.include_tasks: COMMON_post_cr_note.yml
+          vars:
+            note_text: |-
+              ⚠️ CAPACITY WARNING (non-blocking): growing {{ datafile_path }}
+              to {{ new_total_mb }}MB would push total committed MAXSIZE
+              across every database in /etc/oratab on {{ oracle_target_host }}
+              to {{ projected_sys_max_mb | round(1) }}MB, exceeding
+              {{ (capacity_safety_pct | float * 100) | int }}% of this
+              mount's total capacity ({{ capacity_threshold_mb | round(1) }}MB
+              of {{ disk_total_mb }}MB).
+
+              This is a THEORETICAL ceiling, not immediate physical disk
+              consumption — MAXSIZE only gets consumed if and when
+              autoextend actually needs the space, which may be months or
+              years away depending on real growth rate. Given that,
+              remediation is PROCEEDING despite this warning rather than
+              blocking on it. Opening follow-up Change Requests for the
+              storage and DBA teams so the underlying capacity trend gets
+              real attention, without holding up today's fix.
+          when: capacity_blocked | bool
+
+        - name: Open storage team follow-up CR (capacity warning)
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            type: normal
+            state: new
+            short_description: >-
+              Storage capacity warning for tablespace {{ tablespace }}
+              on {{ oracle_target_host }} - mount {{ mount_point }} at
+              {{ ((projected_sys_max_mb | float / disk_total_mb | float) * 100) | round(1) }}%
+              of committed capacity
+            description: >-
+              Automated tablespace remediation ({{ change_number }})
+              proceeded despite a capacity warning: growing tablespace
+              {{ tablespace }} pushes committed MAXSIZE totals on mount
+              {{ mount_point }} to {{ projected_sys_max_mb | round(1) }}MB,
+              exceeding the {{ (capacity_safety_pct | float * 100) | int }}%
+              safety threshold of {{ capacity_threshold_mb | round(1) }}MB
+              (mount total: {{ disk_total_mb }}MB). This is a committed
+              MAXSIZE ceiling, not current physical usage — no immediate
+              outage risk — but worth planning additional physical storage
+              on this mount before real usage catches up to what's now
+              committed.
+            category: hardware
+            assignment_group: "{{ sn_hardware_assignment_group }}"
+          delegate_to: localhost
+          become: false
+          register: storage_cr
+          when: capacity_blocked | bool
+
+        - name: Open DBA team follow-up CR (capacity warning)
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            type: normal
+            state: new
+            short_description: >-
+              Tablespace {{ tablespace }} on {{ oracle_target_host }} grew
+              past the host-wide capacity warning threshold (see linked
+              storage CR)
+            description: >-
+              Tablespace {{ tablespace }} on {{ oracle_target_host }} was
+              grown by automated remediation ({{ change_number }}) despite
+              triggering the host-wide capacity warning (mount
+              {{ mount_point }} at
+              {{ ((projected_sys_max_mb | float / disk_total_mb | float) * 100) | round(1) }}%
+              of committed capacity). Storage CR
+              {{ storage_cr.record.number | default('N/A') }} has been
+              opened to track adding physical storage. No immediate action
+              required — this is for awareness and planning, since MAXSIZE
+              is a ceiling, not current usage.
+            category: database
+            assignment_group: "{{ sn_assignment_group }}"
+          delegate_to: localhost
+          become: false
+          register: dba_cr
+          when: capacity_blocked | bool
+
+        - name: Attempt the resize
+          # NOTE: this used to be gated behind `when: not (capacity_blocked)`,
+          # treating the host-wide MAXSIZE ceiling as a hard stop. Changed
+          # (2026-09-20, explicit decision): MAXSIZE is a theoretical
+          # autoextend ceiling, not immediate physical disk consumption —
+          # a committed-total warning shouldn't block fixing today's real
+          # problem. The safeguard now WARNS and escalates (the two
+          # follow-up CRs above still fire) but no longer blocks the
+          # resize itself. capacity_blocked is still computed and still
+          # true/false in the notes/RCA below, purely for visibility.
+          block:
+          - name: Set disk safety facts
+            ansible.builtin.set_fact:
+              disk_safe: >-
+                {{ ((disk_avail_mb | int) - (growth_mb | int)) >= (min_disk_headroom_mb | int) }}
+              systemwide_risk: >-
+                {{ (sys_theoretical_max_mb | float) > (disk_total_mb | int) }}
+
+          - name: Post disk safety check note
+            ansible.builtin.include_tasks: COMMON_post_cr_note.yml
+            vars:
+              note_text: |-
+                Disk safety check on {{ oracle_target_host }}:
+
+                df --output=target {{ datafile_path | dirname }} -> mount point: {{ mount_point }}
+                df --output=avail -BM {{ mount_point }} -> available: {{ disk_avail_mb }}MB
+                df --output=size -BM {{ mount_point }} -> total capacity: {{ disk_total_mb }}MB
+
+                Planned growth for this remediation: {{ growth_mb }}MB (target:
+                bring {{ tablespace }} to ~{{ target_free_pct }}% free; new
+                target size {{ new_total_mb }}MB, current physical file size
+                {{ target_file.size_mb }}MB, current MAXSIZE {{ target_file.maxsize_mb }}MB)
+
+                Required headroom after growth: {{ min_disk_headroom_mb }}MB
+                Safe to proceed: {{ disk_safe }}
+
+                System-wide MAXSIZE check (every database in /etc/oratab on
+                {{ oracle_target_host }}, not just this one):
+                {{ oratab_summary }}
+
+                Aggregate across {{ oratab_reachable_count }} reachable
+                database(s): if every autoextensible datafile on this host
+                grew to its configured MAXSIZE simultaneously, total
+                allocated would be {{ sys_theoretical_max_mb }}MB against
+                {{ disk_total_mb }}MB total disk capacity on this mount.
+                {{ 'WARNING: theoretical max EXCEEDS disk capacity - review MAXSIZE settings fleet-wide.' if (systemwide_risk | bool) else 'Within capacity.' }}
+                {{ ('WARNING: ' ~ (oratab_unreachable_sids | join(', ')) ~ ' could not be reached and were excluded from the aggregate - verify these manually.') if (oratab_unreachable_sids | length > 0) else '' }}
+
+          - name: Post abort note if disk space is insufficient
+            ansible.builtin.include_tasks: COMMON_post_cr_note.yml
+            vars:
+              note_text: >-
+                Auto-remediation ABORTED: growing {{ datafile_path }} from
+                {{ target_file.size_mb }}MB to {{ new_total_mb }}MB needs
+                {{ growth_mb }}MB, but only {{ disk_avail_mb }}MB is free on
+                {{ mount_point }} (after reserving {{ min_disk_headroom_mb }}MB
+                headroom). Manual DBA intervention required.
+            when: not (disk_safe | bool)
+
+          - name: Abort — insufficient disk space for this resize
+            ansible.builtin.fail:
+              msg: >-
+                Insufficient disk space: need {{ growth_mb }}MB, only
+                {{ disk_avail_mb }}MB free on {{ mount_point }} (after
+                reserving {{ min_disk_headroom_mb }}MB headroom).
+            when: not (disk_safe | bool)
+
+          # --- ACT ------------------------------------------------------
+          # Action was already decided earlier (before the resize-target
+          # math and the capacity safeguard, both of which depend on it).
+          - name: Render the remediation SQL text (captured as a var, not
+              just written to the remote file, so the note below can quote
+              it without a cross-host file lookup — lookup('file', ...)
+              always reads from the control node, not the remote host this
+              file gets written to)
+            ansible.builtin.set_fact:
+              remediate_sql_text: |-
+                SET PAGESIZE 0 FEEDBACK ON VERIFY OFF HEADING OFF ECHO OFF
+                {% if pdb_name | default('') | length > 0 %}
+                ALTER SESSION SET CONTAINER = {{ pdb_name }};
+                {% endif %}
+                {% if remediation_action == 'raise_maxsize' %}
+                ALTER DATABASE DATAFILE '{{ datafile_path }}' AUTOEXTEND ON MAXSIZE {{ new_total_mb }}M;
+                {% else %}
+                ALTER DATABASE DATAFILE '{{ datafile_path }}' RESIZE {{ new_total_mb }}M;
+                {% endif %}
+                EXIT;
+
+          - name: Write remediation SQL
+            ansible.builtin.copy:
+              dest: /tmp/{{ change_number }}_remediate.sql
+              mode: "0600"
+              content: "{{ remediate_sql_text }}"
+
+          - name: Build the connect-and-run wrapper for remediation
+            ansible.builtin.copy:
+              dest: /tmp/{{ change_number }}_run_remediate.sh
+              mode: "0700"
+              content: |
+                #!/usr/bin/env bash
+                export ORACLE_SID={{ oracle_sid }}
+                export ORACLE_HOME={{ oracle_home }}
+                export PATH=$ORACLE_HOME/bin:$PATH
+                sqlplus -s / as sysdba @/tmp/{{ change_number }}_remediate.sql
+
+          - name: Apply the fix
+            ansible.builtin.command: /tmp/{{ change_number }}_run_remediate.sh
+            register: remediate_raw
+            changed_when: "'altered' in remediate_raw.stdout | lower"
+            failed_when: "'ORA-' in remediate_raw.stdout"
+
+          - name: Post remediation SQL and raw result note
+            ansible.builtin.include_tasks: COMMON_post_cr_note.yml
+            vars:
+              note_text: |-
+                Remediation executed on {{ oracle_target_host }} (ORACLE_SID={{ oracle_sid }}):
+                {{ 'Raised MAXSIZE (autoextend already handles physical growth)' if remediation_action == 'raise_maxsize' else 'Direct resize (autoextend is not enabled on this datafile)' }}.
+
+                {{ remediate_sql_text }}
+
+                Raw output:
+                {{ remediate_raw.stdout }}
+
+                {{ datafile_path }}: current physical size {{ target_file.size_mb }}MB,
+                previous MAXSIZE {{ target_file.maxsize_mb }}MB -> new target {{ new_total_mb }}MB
+                (was {{ target_file.pct_used }}% used against the previous ceiling).
+
+          # --- VERIFY -----------------------------------------------------
+          - name: Re-run diagnostics to confirm the fix actually took
+            ansible.builtin.command: /tmp/{{ change_number }}_run_diagnose.sh
+            register: verify_raw
+            changed_when: false
+
+          - name: Parse post-fix output
+            ansible.builtin.set_fact:
+              datafiles_after: >-
+                {{ verify_raw.stdout_lines
+                   | select('search', '^\{')
+                   | map('from_json')
+                   | list }}
+
+          - name: Extract the same datafile's after-state
+            ansible.builtin.set_fact:
+              after_row: "{{ datafiles_after | selectattr('file_name', 'equalto', datafile_path) | list | first }}"
+
+          - name: Record after-state
+            ansible.builtin.set_fact:
+              after_pct_used: "{{ after_row.pct_used }}"
+              after_size_mb: "{{ after_row.size_mb }}"
+
+          - name: Verification gate — did the fix actually help?
+            ansible.builtin.set_fact:
+              remediation_verified: "{{ (after_pct_used | float) < (before_pct_used | float) or remediation_action == 'raise_maxsize' }}"
+              remediation_failed: false
+
+      rescue:
+        # Anything above threw — don't abort the whole playbook and strand
+        # the CR at Implement. Capture what we know and let PLAY 3 close
+        # this out honestly as a failed remediation.
+        - name: Record the failure
+          ansible.builtin.set_fact:
+            remediation_failed: true
+            remediation_error: "{{ ansible_failed_result.msg | default(ansible_failed_result.stdout) | default('unknown error') }}"
+            remediation_verified: false
+            before_pct_used: "{{ before_pct_used | default('unknown') }}"
+            after_pct_used: "{{ after_pct_used | default('unknown') }}"
+            remediation_action: "{{ remediation_action | default('none — failed before a fix was attempted') }}"
+            datafile_path: "{{ datafile_path | default('unknown') }}"
+
+      always:
+        - name: Clean up temp files (best-effort — some may not exist if we failed early)
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - /tmp/{{ change_number }}_diagnose.sql
+            - /tmp/{{ change_number }}_remediate.sql
+            - /tmp/{{ change_number }}_run_diagnose.sh
+            - /tmp/{{ change_number }}_run_remediate.sh
+          ignore_errors: true
+
+# =====================================================================
+# PLAY 3 — RCA writeup, work note, Review -> Closed (success OR failure)
+# =====================================================================
+- name: Confirm and close the loop
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/demo_vars.yml
+  vars:
+    # pull the facts set in PLAY 2 for the host we just worked on
+    # (oracle_target_host must be the exact inventory_hostname used in PLAY 2)
+    remediation_failed: "{{ hostvars[oracle_target_host].remediation_failed | default(true) }}"
+    before_pct_used: "{{ hostvars[oracle_target_host].before_pct_used | default('unknown') }}"
+    after_pct_used: "{{ hostvars[oracle_target_host].after_pct_used | default('unknown') }}"
+    action_taken: "{{ hostvars[oracle_target_host].remediation_action | default('none') }}"
+    verified: "{{ hostvars[oracle_target_host].remediation_verified | default(false) }}"
+    datafile_path: "{{ hostvars[oracle_target_host].datafile_path | default('unknown') }}"
+    remediation_error: "{{ hostvars[oracle_target_host].remediation_error | default('') }}"
+    capacity_blocked: "{{ hostvars[oracle_target_host].capacity_blocked | default(false) }}"
+
+  tasks:
+    - name: Everything else — always runs now (capacity warnings no longer block closure)
+      # Previously this whole block was skipped when capacity_blocked was
+      # true, leaving the CR at Implement pending storage follow-up.
+      # Changed (2026-09-20, explicit decision): the capacity check is now
+      # a non-blocking warning — PLAY 2 still opens the follow-up CRs and
+      # posts the warning note, but this CR always proceeds through its
+      # normal RCA/close sequence regardless of capacity_blocked.
+      block:
+        - name: Build the RCA prompt (success path)
+          ansible.builtin.set_fact:
+            rca_prompt: >-
+              Write a short, plain-English root-cause writeup (4-6 sentences, no
+              headers or bullet points) for a change request work note. Facts:
+              tablespace {{ tablespace }} on {{ oracle_target_host }} was at
+              {{ before_pct_used }}% used. Automation applied this fix:
+              {{ 'raised the MAXSIZE ceiling on ' + datafile_path if action_taken == 'raise_maxsize'
+                 else 'resized ' + datafile_path + ' upward' }}.
+              It is now at {{ after_pct_used }}% used.
+              {% if capacity_blocked | default(false) | bool %}
+              One more fact to mention: this fix also triggered a host-wide
+              capacity warning — growing this tablespace pushes total
+              committed MAXSIZE across every database on this host close to
+              its disk capacity limit. This didn't block the fix (MAXSIZE is
+              a future ceiling, not current usage), but follow-up Change
+              Requests were opened for the storage and DBA teams to plan
+              additional physical storage. Mention this briefly.
+              {% endif %}
+              Explain what happened, what was done, and why it's resolved, in
+              a tone a DBA would actually write — no corporate filler.
+          when: not remediation_failed
+
+        - name: Build the RCA prompt (failure path)
+          ansible.builtin.set_fact:
+            rca_prompt: >-
+              Write a short, plain-English writeup (4-6 sentences, no headers or
+              bullet points) for a change request work note explaining that
+              automated remediation of tablespace {{ tablespace }} on
+              {{ oracle_target_host }} FAILED. Error detail: {{ remediation_error }}.
+              Note that this needs human follow-up. No corporate filler.
+          when: remediation_failed
+
+        # --- Default: no AI proof/metadata unless a real call succeeds below ---
+        - name: Default AI-generation tracking facts
+          ansible.builtin.set_fact:
+            ai_generation_succeeded: false
+            ai_provider_label: "none"
+
+        # ---- Option A: local Ollama (default, $0) ----
+        - name: Generate RCA via local Ollama
+          when: llm_provider == 'ollama'
+          block:
+            - name: Call Ollama
+              ansible.builtin.uri:
+                url: "{{ ollama_host }}/api/generate"
+                method: POST
+                body_format: json
+                body:
+                  model: "{{ ollama_model }}"
+                  prompt: "{{ rca_prompt }}"
+                  stream: false
+                  keep_alive: "30m"   # keep the model loaded between calls —
+                                      # avoids paying the full cold-load cost
+                                      # on every remediation during a demo
+                                      # session with several runs close together
+                timeout: "{{ ollama_timeout_sec | default(300) }}"
+              register: ollama_result
+              ignore_errors: true  # fall through to the raw-facts RCA below rather than aborting the whole run
+
+            - name: Extract RCA text and real generation telemetry
+              # Ollama's own API response includes genuine token counts and
+              # timing — surfaced explicitly below as concrete proof a real
+              # model call happened, not just prose that could have been
+              # hand-written or templated.
+              ansible.builtin.set_fact:
+                rca_text: "{{ ollama_result.json.response | trim }}"
+                ai_generation_succeeded: true
+                ai_provider_label: "Local Ollama (self-hosted, $0 per call)"
+                ai_model_name: "{{ ollama_model }}"
+                ai_prompt_tokens: "{{ ollama_result.json.prompt_eval_count | default('unknown') }}"
+                ai_response_tokens: "{{ ollama_result.json.eval_count | default('unknown') }}"
+                ai_gen_duration_sec: "{{ (ollama_result.json.eval_duration | default(0) | int / 1000000000) | round(2) }}"
+                ai_total_duration_sec: "{{ (ollama_result.json.total_duration | default(0) | int / 1000000000) | round(2) }}"
+                ai_tokens_per_sec: >-
+                  {{ ((ollama_result.json.eval_count | default(0) | int) / (ollama_result.json.eval_duration | default(1) | int / 1000000000)) | round(1)
+                     if (ollama_result.json.eval_duration | default(0) | int) > 0 else 'N/A' }}
+              when: ollama_result is succeeded
+
+        # ---- Option B: AWS Bedrock (metered, opt-in) ----
+        - name: Generate RCA via AWS Bedrock
+          when: llm_provider == 'bedrock'
+          block:
+            - name: Write the Bedrock request body
+              vars:
+                bedrock_request_body:
+                  anthropic_version: "bedrock-2023-05-31"
+                  max_tokens: 300
+                  messages:
+                    - role: user
+                      content: "{{ rca_prompt }}"
+              ansible.builtin.copy:
+                dest: /tmp/{{ change_number }}_bedrock_body.json
+                mode: "0600"
+                content: "{{ bedrock_request_body | to_json }}"
+
+            - name: Invoke Bedrock via the AWS CLI
+              # Shelling out to the CLI sidesteps SigV4 signing in Ansible directly —
+              # requires `aws configure` (or an instance role) on the control node.
+              ansible.builtin.command: >
+                aws bedrock-runtime invoke-model
+                --model-id {{ bedrock_model_id }}
+                --region {{ aws_region }}
+                --body file:///tmp/{{ change_number }}_bedrock_body.json
+                --cli-binary-format raw-in-base64-out
+                /tmp/{{ change_number }}_bedrock_response.json
+              changed_when: false
+              register: bedrock_invoke
+              ignore_errors: true
+
+            - name: Read the Bedrock response
+              ansible.builtin.slurp:
+                src: /tmp/{{ change_number }}_bedrock_response.json
+              register: bedrock_raw
+              when: bedrock_invoke is succeeded
+              ignore_errors: true
+
+            - name: Extract RCA text and real generation telemetry
+              # Bedrock's response includes real token usage counts (usage.
+              # input_tokens/output_tokens); wall-clock duration comes from
+              # Ansible's own command timing (bedrock_invoke.delta), since
+              # Bedrock doesn't return generation-time metrics in the body.
+              ansible.builtin.set_fact:
+                rca_text: "{{ (bedrock_raw.content | b64decode | from_json).content[0].text | trim }}"
+                ai_generation_succeeded: true
+                ai_provider_label: "AWS Bedrock (metered — real per-call cost, not $0)"
+                ai_model_name: "{{ bedrock_model_id }}"
+                ai_prompt_tokens: "{{ (bedrock_raw.content | b64decode | from_json).usage.input_tokens | default('unknown') }}"
+                ai_response_tokens: "{{ (bedrock_raw.content | b64decode | from_json).usage.output_tokens | default('unknown') }}"
+                ai_total_duration_sec: "{{ bedrock_invoke.delta | default('unknown') }}"
+                ai_gen_duration_sec: "{{ bedrock_invoke.delta | default('unknown') }}"
+                ai_tokens_per_sec: "N/A"
+              when: bedrock_invoke is succeeded and bedrock_raw is succeeded
+
+            - name: Clean up Bedrock temp files
+              ansible.builtin.file:
+                path: "{{ item }}"
+                state: absent
+              loop:
+                - /tmp/{{ change_number }}_bedrock_body.json
+                - /tmp/{{ change_number }}_bedrock_response.json
+              ignore_errors: true
+
+        - name: Fallback RCA text if the LLM call produced nothing usable
+          # pct_used comes back from Oracle as a real JSON number, not a string,
+          # so it's a numeric type in Jinja here too — '+' requires matching
+          # types and breaks on that ("can only concatenate str (not
+          # _AnsibleTaggedInt) to str"). '~' concatenates AND auto-stringifies,
+          # which is what this actually needs.
+          ansible.builtin.set_fact:
+            rca_text: >-
+              {{ ('FAILED. ' ~ remediation_error) if remediation_failed else
+                 (tablespace ~ ' was at ' ~ before_pct_used ~ '% used on ' ~ oracle_target_host ~
+                  '. Automation applied ' ~ action_taken ~ ' on ' ~ datafile_path ~ '; it is now at ' ~
+                  after_pct_used ~ '% used.') }}
+              (LLM writeup unavailable — showing raw facts.)
+          when: rca_text is not defined or rca_text | length == 0
+
+        - name: Post the RCA as a work note
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+            other:
+              work_notes: >-
+                {{ '✅ Verified fixed.' if (verified and not remediation_failed) else ('⚠️ Fix applied but verification was inconclusive — please review.' if not remediation_failed else '⚠️ Remediation FAILED — needs human follow-up.') }}
+
+
+                {{ ('🤖 AI-GENERATED ANALYSIS — Model: ' ~ ai_model_name ~ ' (' ~ ai_provider_label ~ ')') if (ai_generation_succeeded | bool) else '⚠️ AI writeup unavailable this run — showing raw facts below (not AI-generated).' }}
+
+
+                {{ rca_text }}
+
+
+        - name: Post AI execution log — concrete proof of the actual model call
+          # Separate, dedicated note (matching the same granularity as the
+          # SQL/diagnostic notes) specifically so anyone reviewing this CR
+          # sees the exact prompt sent, the exact raw response, and real
+          # API telemetry (token counts, generation time) — not just prose
+          # that could plausibly have been hand-written or templated.
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+            other:
+              work_notes: |-
+                🤖 AI EXECUTION LOG (technical proof of AI involvement)
+
+                Provider: {{ ai_provider_label }}
+                Model: {{ ai_model_name }}
+                Endpoint: {{ ollama_host ~ '/api/generate' if llm_provider == 'ollama' else ('AWS Bedrock runtime, region ' ~ aws_region) }}
+
+                --- PROMPT SENT TO THE MODEL ---
+                {{ rca_prompt }}
+
+                --- RAW MODEL RESPONSE (verbatim, unedited) ---
+                {{ rca_text }}
+
+                --- REAL GENERATION METRICS (from the model API's own response, not estimated) ---
+                Prompt tokens processed: {{ ai_prompt_tokens }}
+                Tokens generated: {{ ai_response_tokens }}
+                Generation time: {{ ai_gen_duration_sec }}s
+                Total request time (incl. model load if cold): {{ ai_total_duration_sec }}s
+                Throughput: {{ ai_tokens_per_sec }} tokens/sec
+          when: ai_generation_succeeded | bool
+
+        - name: Move to Review
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+            state: "{{ sn_change_state_review }}"
+            assignment_group: "{{ sn_assignment_group }}"
+
+        - name: Set close_code and close_notes BEFORE attempting the Closed transition
+          # Same fix as the New->Scheduled edge: if this instance's Review->Closed
+          # transition also has a "close_code/close_notes is not empty" condition
+          # (unconfirmed, but the same Standard model already proved this pattern
+          # once), bundling them with the state change would fail it the same way.
+          # Committing them first is defensive and costs nothing if the condition
+          # turns out not to exist.
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+            close_code: "{{ sn_close_code_failure if remediation_failed else sn_close_code_success }}"
+            close_notes: "{{ rca_text }}"
+
+        - name: Move to Closed (success or failure — both paths must reach Closed)
+          servicenow.itsm.change_request:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+            state: "{{ sn_change_state_closed }}"
+            assignment_group: "{{ sn_assignment_group }}"
+            close_code: "{{ sn_close_code_failure if remediation_failed else sn_close_code_success }}"
+            close_notes: "{{ rca_text }}"
+          register: close_result
+
+        - name: Re-query to confirm the state actually stuck
+          # Same "don't trust the reported result, verify what actually
+          # happened" discipline as the rest of the suite.
+          servicenow.itsm.change_request_info:
+            instance:
+              host: "{{ sn_instance }}"
+              username: "{{ sn_username }}"
+              password: "{{ sn_password }}"
+            number: "{{ change_number }}"
+          register: final_check
+
+        - name: WARNING — CR did not actually reach Closed
+          ansible.builtin.debug:
+            msg: >-
+              {{ change_number }} is in state '{{ final_check.records[0].state }}',
+              not Closed. Some ServiceNow instances require additional fields
+              (approval, CAB, a specific close_code choice value) before a
+              Closed transition is accepted — check sys_choice on this instance
+              for the real close_code values rather than assuming these ones.
+          when: final_check.records[0].state | lower != 'closed'

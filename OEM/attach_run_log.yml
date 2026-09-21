@@ -1,0 +1,73 @@
+---
+# attach_run_log.yml
+#
+# Uploads the completed run log for a remediation as an attachment on its
+# Change Request — genuine, unedited proof of exactly what ran, not just a
+# summary note.
+#
+# Deliberately a SEPARATE playbook, invoked by run_playbook.sh AFTER the
+# main remediation playbook finishes and its log file is fully closed out.
+# The log is written by run_playbook.sh's own redirect, which wraps the
+# ENTIRE ansible-playbook invocation (>> "$LOG_FILE" 2>&1) — if the
+# remediation playbook tried to upload its own still-open log file
+# mid-run, the attachment would be missing everything from that point
+# onward, including the final "finished remediation" line. Running this
+# as a second, separate playbook after the redirect block closes is what
+# actually gets the complete file.
+#
+# Called as:
+#   ansible-playbook -i inventory.ini attach_run_log.yml \
+#     --extra-vars "change_number=CHG0000000 log_file_path=/path/to/the.log"
+#
+# Deliberately tolerant of failure — a log-attachment problem (network
+# hiccup, permissions) shouldn't be treated as a remediation failure; the
+# remediation itself already fully recorded its own success/failure on
+# the CR before this ever runs.
+
+- name: Attach the completed run log to its Change Request
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/demo_vars.yml
+
+  tasks:
+    - name: Confirm the log file actually exists before trying to upload it
+      ansible.builtin.stat:
+        path: "{{ log_file_path }}"
+      register: log_file_stat
+
+    - name: Skip quietly if the log file wasn't found
+      ansible.builtin.debug:
+        msg: "Log file {{ log_file_path }} not found — skipping attachment."
+      when: not log_file_stat.stat.exists
+
+    - name: Look up the change request's sys_id
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        number: "{{ change_number }}"
+      register: cr_lookup
+      when: log_file_stat.stat.exists
+      ignore_errors: true
+
+    - name: Skip quietly if the CR can't be found
+      ansible.builtin.debug:
+        msg: "Could not find {{ change_number }} to attach the log to — skipping."
+      when: log_file_stat.stat.exists and (cr_lookup.records | default([]) | length == 0)
+
+    - name: Upload the run log as an attachment
+      servicenow.itsm.attachment_upload:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        table_name: change_request
+        table_sys_id: "{{ cr_lookup.records[0].sys_id }}"
+        attachments:
+          - path: "{{ log_file_path }}"
+            name: "{{ change_number }}_ansible_run.log"
+      when: log_file_stat.stat.exists and (cr_lookup.records | default([]) | length > 0)
+      ignore_errors: true

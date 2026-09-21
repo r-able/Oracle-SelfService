@@ -1,0 +1,67 @@
+---
+# check_one_database_local.yml
+# Included per /etc/oratab entry, looped from remediate_tablespace.yml.
+# Runs locally on the already-become(oracle) host — no self-SSH needed,
+# unlike the OEM version this was adapted from (that one ran from a
+# localhost play via delegate_to, which needed to SSH out; we're already
+# directly on the target host via become_user: oracle, so a plain local
+# command is enough). The SQL itself is unchanged from the proven OEM
+# version.
+#
+# Expects vars: check_sid, check_home, change_number (for temp filenames).
+# Appends a result dict to db_check_results (reset before the loop).
+
+- name: "Write datafile-totals check script for {{ check_sid }}"
+  ansible.builtin.copy:
+    dest: "/tmp/{{ change_number }}_dbcheck_{{ check_sid }}.sh"
+    mode: "0700"
+    content: |
+      #!/bin/bash
+      export ORACLE_HOME={{ check_home }}
+      export ORACLE_SID={{ check_sid }}
+      export PATH=$ORACLE_HOME/bin:$PATH
+      $ORACLE_HOME/bin/sqlplus -s / as sysdba <<SQL
+      set pagesize 0 feedback off verify off heading off echo off linesize 300
+      select round(sum(bytes)/1024/1024,2)||'|'||round(sum(case when autoextensible='YES' then nvl(maxbytes,bytes) else bytes end)/1024/1024,2)
+      from dba_data_files;
+      SQL
+
+- name: "Run datafile-totals check for {{ check_sid }}"
+  ansible.builtin.command: "/tmp/{{ change_number }}_dbcheck_{{ check_sid }}.sh"
+  register: one_db_check
+  changed_when: false
+  failed_when: false
+
+- name: "Clean up check script for {{ check_sid }}"
+  ansible.builtin.file:
+    path: "/tmp/{{ change_number }}_dbcheck_{{ check_sid }}.sh"
+    state: absent
+
+- name: "Determine if {{ check_sid }} was reachable and gave a valid result"
+  ansible.builtin.set_fact:
+    one_db_reachable: >-
+      {{ (one_db_check.rc == 0)
+         and (one_db_check.stdout_lines | default([]) | length > 0)
+         and ('|' in (one_db_check.stdout_lines[0] | default(''))) }}
+
+- name: "Record result for {{ check_sid }} (reachable)"
+  ansible.builtin.set_fact:
+    db_check_results: >-
+      {{ (db_check_results | default([])) + [{
+        'sid': check_sid,
+        'reachable': true,
+        'current_mb': (one_db_check.stdout_lines[0].split('|')[0] | float),
+        'max_mb': (one_db_check.stdout_lines[0].split('|')[1] | float)
+      }] }}
+  when: one_db_reachable | bool
+
+- name: "Record result for {{ check_sid }} (unreachable)"
+  ansible.builtin.set_fact:
+    db_check_results: >-
+      {{ (db_check_results | default([])) + [{
+        'sid': check_sid,
+        'reachable': false,
+        'current_mb': 0,
+        'max_mb': 0
+      }] }}
+  when: not (one_db_reachable | bool)

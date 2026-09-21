@@ -1,0 +1,24 @@
+---
+# COMMON_post_cr_note.yml
+# Reusable include: posts a work note to the Change Request identified by
+# change_number. Mirrors the role of COMMON_snow_oem_post_note.yml from
+# the OEM incident pipeline, but uses the servicenow.itsm.change_request
+# module (number-based, already proven against the real assignment_group/
+# close_code requirements) rather than a raw uri PATCH against sys_id —
+# incident and change_request have different required-field models, and
+# reusing the proven module avoids reintroducing bugs already fixed
+# earlier this session (missing assignment_group, close_code placement).
+#
+# Expects: note_text. Does not set state — pure work-note posting only.
+
+- name: "Post work note to {{ change_number }}"
+  become: false
+  delegate_to: localhost
+  servicenow.itsm.change_request:
+    instance:
+      host: "{{ sn_instance }}"
+      username: "{{ sn_username }}"
+      password: "{{ sn_password }}"
+    number: "{{ change_number }}"
+    other:
+      work_notes: "{{ note_text }}"

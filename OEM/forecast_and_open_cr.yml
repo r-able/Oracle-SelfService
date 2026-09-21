@@ -1,0 +1,198 @@
+---
+# forecast_and_open_cr.yml
+#
+# The "Predict" stage. Run daily via cron (see run_forecast.sh), once per
+# tracked tablespace. Reuses the exact diagnostic SQL already proven in
+# remediate_tablespace.yml — same JSON_OBJECT approach, same reasoning.
+#
+# CR creation uses the module's `template:` parameter rather than setting
+# type/chg_model directly — after the New->Scheduled saga in the
+# remediation playbook, hand-managing chg_model a second time here isn't
+# worth the risk. A cloned Standard Change Template (see setup notes)
+# already carries the correct Model/Type pairing the way the UI's own
+# "Create a change request" gallery does it.
+#
+# Call as:
+#   ansible-playbook -i inventory.ini forecast_and_open_cr.yml \
+#     --extra-vars "tablespace=USERS"
+
+- name: Forecast tablespace growth and open a CR if a breach is projected soon
+  hosts: "{{ oracle_target_host }}"
+  gather_facts: false
+  become: true
+  become_user: "{{ oracle_os_user | default('oracle') }}"
+  vars_files:
+    - vars/demo_vars.yml
+
+  tasks:
+    # --- SENSE (today's reading) --------------------------------------
+    # Same JSON_OBJECT diagnostic query as remediate_tablespace.yml.
+    - name: Write diagnostic SQL
+      ansible.builtin.copy:
+        dest: /tmp/forecast_{{ tablespace }}_diagnose.sql
+        mode: "0600"
+        content: |
+          SET PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING OFF ECHO OFF LINES 500 TRIMSPOOL ON
+          ALTER SESSION SET CONTAINER = {{ pdb_name }};
+          SELECT JSON_OBJECT(
+                   'file_name' VALUE df.file_name,
+                   'size_mb' VALUE ROUND(df.bytes/1024/1024),
+                   'free_mb' VALUE ROUND(NVL(fs.bytes,0)/1024/1024),
+                   'autoextensible' VALUE df.autoextensible,
+                   'maxsize_mb' VALUE ROUND(df.maxbytes/1024/1024),
+                   'pct_used' VALUE ROUND((1 - NVL(fs.bytes,0)/df.bytes) * 100, 1)
+                 )
+          FROM dba_data_files df
+          LEFT JOIN (SELECT file_id, SUM(bytes) bytes FROM dba_free_space GROUP BY file_id) fs
+            ON fs.file_id = df.file_id
+          WHERE df.tablespace_name = UPPER('{{ tablespace }}')
+          ORDER BY df.file_name;
+          EXIT;
+
+    - name: Build the connect-and-run wrapper
+      ansible.builtin.copy:
+        dest: /tmp/forecast_{{ tablespace }}_run.sh
+        mode: "0700"
+        content: |
+          #!/usr/bin/env bash
+          export ORACLE_SID={{ oracle_sid }}
+          export ORACLE_HOME={{ oracle_home }}
+          export PATH=$ORACLE_HOME/bin:$PATH
+          sqlplus -s / as sysdba @/tmp/forecast_{{ tablespace }}_diagnose.sql
+
+    - name: Run diagnostics
+      ansible.builtin.command: /tmp/forecast_{{ tablespace }}_run.sh
+      register: diag_raw
+      changed_when: false
+
+    - name: Parse diagnostic output
+      ansible.builtin.set_fact:
+        datafiles: >-
+          {{ diag_raw.stdout_lines
+             | select('search', '^\{')
+             | map('from_json')
+             | list }}
+
+    - name: Fail loudly if no datafiles matched
+      ansible.builtin.fail:
+        msg: "No datafiles found for tablespace '{{ tablespace }}' in PDB '{{ pdb_name }}' on {{ inventory_hostname }}."
+      when: datafiles | length == 0
+
+    - name: Take the fullest datafile as today's reading (same logic as remediate_tablespace.yml)
+      ansible.builtin.set_fact:
+        today_pct_used: "{{ (datafiles | sort(attribute='pct_used'))[-1].pct_used }}"
+
+    - name: Clean up diagnostic temp files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/forecast_{{ tablespace }}_diagnose.sql
+        - /tmp/forecast_{{ tablespace }}_run.sh
+
+    # --- PREDICT --------------------------------------------------------
+    - name: Run the forecasting helper (updates history, computes trend)
+      ansible.builtin.command:
+        argv:
+          - "{{ forecast_python | default('python3') }}"
+          - "{{ forecast_script_path }}"
+          - --tablespace
+          - "{{ tablespace }}"
+          - --pct-used
+          - "{{ today_pct_used }}"
+          - --history-file
+          - "{{ forecast_history_dir }}/{{ tablespace }}.jsonl"
+          - --breach-threshold
+          - "{{ breach_threshold_pct | default(95) }}"
+          - --warn-days
+          - "{{ warn_days_threshold | default(4) }}"
+      delegate_to: localhost
+      become: false
+      register: forecast_raw
+      changed_when: true
+
+    - name: Parse the forecast result
+      ansible.builtin.set_fact:
+        forecast: "{{ forecast_raw.stdout | from_json }}"
+
+    - name: Show the forecast (useful when watching this run live for the demo)
+      ansible.builtin.debug:
+        var: forecast
+
+# =====================================================================
+# Only reaches here if should_alert is true — separate play so the
+# ServiceNow calls (localhost-only) don't need `become`/`become_user`
+# inherited from the Oracle-host play above.
+# =====================================================================
+- name: Open a Change Request if a breach is projected soon
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/demo_vars.yml
+  vars:
+    forecast: "{{ hostvars[oracle_target_host].forecast }}"
+
+  tasks:
+    - name: Nothing to do — no breach projected within the warning window
+      ansible.builtin.debug:
+        msg: >-
+          {{ tablespace }}: {{ forecast.note | default('on track, no alert needed') }}
+          (days_to_breach={{ forecast.days_to_breach }}, data_points={{ forecast.data_points }})
+      when: not forecast.should_alert
+
+    - name: Check for an already-open alert for this tablespace
+      # Client-side state filtering rather than a `!=`/NOT IN query
+      # operator — the query DSL's operator support beyond `=`/`LIKE`
+      # isn't something I've confirmed, and this is cheap either way.
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        query:
+          - short_description: "LIKE Capacity alert: {{ tablespace }}"
+      register: existing_crs
+      when: forecast.should_alert
+
+    - name: Filter to only still-open ones (not Closed/Canceled)
+      ansible.builtin.set_fact:
+        open_existing_crs: >-
+          {{ existing_crs.records
+             | default([])
+             | rejectattr('state', 'in', ['closed', 'canceled'])
+             | list }}
+      when: forecast.should_alert
+
+    - name: Skip — an alert for this tablespace is already open
+      ansible.builtin.debug:
+        msg: >-
+          {{ tablespace }}: projected breach in {{ forecast.days_to_breach }} days,
+          but {{ open_existing_crs[0].number }} is already open for this. Not
+          creating a duplicate.
+      when: forecast.should_alert and open_existing_crs | length > 0
+
+    - name: Open the Change Request (no open alert exists yet)
+      servicenow.itsm.change_request:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        template: "{{ sn_standard_template_name }}"
+        short_description: >-
+          Capacity alert: {{ tablespace }} projected to breach in
+          {{ forecast.days_to_breach }} days
+        description: >-
+          Automated forecast: {{ tablespace }} on {{ oracle_target_host }} is at
+          {{ forecast.current_pct_used }}% used, growing ~{{ forecast.slope_per_day }}%/day.
+          Projected to hit the {{ breach_threshold_pct | default(95) }}% threshold in
+          {{ forecast.days_to_breach }} days. Opened automatically so closed-loop
+          remediation can pick it up before that happens.
+        requested_by: "{{ sn_username }}"
+      register: new_cr
+      when: forecast.should_alert and open_existing_crs | length == 0
+
+    - name: Show the new CR number
+      ansible.builtin.debug:
+        msg: "Opened {{ new_cr.record.number }} for {{ tablespace }}"
+      when: forecast.should_alert and open_existing_crs | length == 0 and new_cr is not skipped

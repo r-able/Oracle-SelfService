@@ -1,0 +1,60 @@
+---
+# dispatch_remediation.yml
+#
+# Polls ServiceNow for open "Capacity alert" Change Requests and launches
+# remediate_tablespace.yml for each one found — the SAME outbound-only
+# polling pattern already proven working for the OEM incident
+# auto-resolution pipeline (SNOW_OEM_oracle_auto_resolve.yml). Used
+# instead of a push-webhook because HPsuperdome isn't reachable from the
+# public internet and a webhook receiver would need to be. Polling only
+# ever makes OUTBOUND calls to ServiceNow, so no inbound exposure,
+# port-forward, or tunnel is needed at all — same reasoning that already
+# made the OEM pipeline work without one.
+#
+# Run via cron (see run_dispatcher.sh). No extra-vars needed.
+
+- name: Find and dispatch open capacity-alert Change Requests
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars/demo_vars.yml
+
+  tasks:
+    - name: Query ServiceNow for New capacity-alert CRs
+      # Matches the exact short_description prefix forecast_and_open_cr.yml
+      # sets, and the same "New" state a freshly-created CR starts in.
+      servicenow.itsm.change_request_info:
+        instance:
+          host: "{{ sn_instance }}"
+          username: "{{ sn_username }}"
+          password: "{{ sn_password }}"
+        query:
+          - short_description: "LIKE Capacity alert:"
+            state: "= new"
+      register: pending_crs
+
+    - name: Nothing to do this tick
+      ansible.builtin.debug:
+        msg: "No open capacity-alert CRs found."
+      when: pending_crs.records | default([]) | length == 0
+
+    - name: Dispatch each pending CR to remediate_tablespace.yml, fire-and-forget
+      # async+poll:0 starts run_playbook.sh and returns immediately rather
+      # than blocking here until remediation finishes (which can take
+      # 30-60+ seconds) — matches the same non-blocking spawn the old
+      # webhook receiver used via subprocess.Popen. run_playbook.sh's own
+      # per-CR-number PID lock (same one the old webhook path already
+      # relied on) still protects against duplicate concurrent runs for
+      # the same CR if two dispatcher ticks somehow overlap.
+      ansible.builtin.command:
+        argv:
+          - "{{ dispatcher_run_script | default('/etc/ansible/OEM/run_playbook.sh') }}"
+          - "{{ item.number }}"
+          - "{{ item.short_description | regex_search('Capacity alert:\\s*(\\S+)', '\\1') | first }}"
+      loop: "{{ pending_crs.records | default([]) }}"
+      loop_control:
+        label: "{{ item.number }}"
+      async: 3600
+      poll: 0
+      when: pending_crs.records | default([]) | length > 0
