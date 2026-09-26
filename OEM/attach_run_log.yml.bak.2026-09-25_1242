@@ -29,7 +29,7 @@
   connection: local
   gather_facts: false
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
 
   tasks:
     - name: Confirm the log file actually exists before trying to upload it

@@ -23,7 +23,7 @@
 # as REF/CDP/PRF. This playbook does not set type or chg_model, only
 # state and work notes.
 #
-# Everything host/site-specific lives in /etc/ansible/vars/main.yml. Nothing here
+# Everything host/site-specific lives in vars/demo_vars.yml. Nothing here
 # is hardcoded to a specific host, PDB, or ServiceNow instance.
 #
 # NOT verified against a live ServiceNow instance — the servicenow.itsm
@@ -41,7 +41,7 @@
   connection: local
   gather_facts: false
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
 
   tasks:
     - name: Look up the change request by number
@@ -133,7 +133,7 @@
   become: true
   become_user: "{{ oracle_os_user | default('oracle') }}"
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
 
   tasks:
     - name: Run the diagnose/act/verify sequence, tolerating failure
@@ -661,7 +661,7 @@
   connection: local
   gather_facts: false
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
   vars:
     # pull the facts set in PLAY 2 for the host we just worked on
     # (oracle_target_host must be the exact inventory_hostname used in PLAY 2)

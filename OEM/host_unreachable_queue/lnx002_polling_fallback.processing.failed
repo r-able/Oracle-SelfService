@@ -1,0 +1,9 @@
+{
+  "host": "lnx002",
+  "target_name": "lnx002:3872",
+  "alert_type": "polling_fallback",
+  "metric_name": "Agent Unreachable (detected by polling fallback, not OEM notification)",
+  "oem_incident_id": "unknown",
+  "detected_time": "2026-09-22 05:35:01 (first observed non-Up at 2026-09-22 05:25:45)",
+  "queued_time": "2026-09-22 05:35:01"
+}

@@ -1,0 +1,104 @@
+---
+###############################################################################
+# SNOW_UNR_dispatcher.yml - OEM Host/Agent/Instance/Listener Unreachable
+# Finds New ServiceNow incidents created by the /unr webhook
+# (correlation_display=OEM_UNR), claims each, triages, acts, records.
+# Resolution is NOT done here - OEM's CLEAR event resolves via the webhook.
+###############################################################################
+- name: OEM Unreachable - dispatch New OEM_UNR incidents
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+  vars:
+    unr_emctl: /u01/app/oracle/product/21.0.0/agent/agent_13.5.0.0.0/bin/emctl
+    unr_api: "{{ sn_instance }}/api/2177274/oem_alr_webhook"
+    unr_routes:
+      HOST_DOWN:            { group: "Hardware",         urgency: "1", text: "Host does not answer ping or SSH - routed to infrastructure." }
+      SSH_FAILING:          { group: "Hardware",         urgency: "2", text: "Host answers ping but SSH fails - routed to infrastructure." }
+      INSTANCE_DOWN:        { group: "Database Atlanta", urgency: "1", text: "Database instance is down (no pmon). Automation never starts databases - routed to DBA." }
+      INSTANCE_NOT_OPEN:    { group: "Database Atlanta", urgency: "1", text: "Instance process running but database not OPEN/ACTIVE - routed to DBA." }
+      LISTENER_DOWN:        { group: "Database Atlanta", urgency: "2", text: "Listener is down - routed to DBA." }
+      AGENT_RESTART_LIMIT:  { group: "Database Atlanta", urgency: "3", text: "Agent restart limit reached for this host (repeat offender) - no further automatic restart, routed to DBA." }
+      AGENT_RESTART_FAILED: { group: "Database Atlanta", urgency: "2", text: "Automated agent restart did not bring the agent up - routed to DBA." }
+
+  tasks:
+    - name: Run id
+      ansible.builtin.set_fact:
+        unr_run_id: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+    - name: Read automation config (kill switch, limits) from ServiceNow
+      ansible.builtin.uri:
+        url: "{{ unr_api }}/unr_config"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: unr_cfg_raw
+
+    - name: Config values
+      ansible.builtin.set_fact:
+        unr_cfg: "{{ unr_cfg_raw.json.result }}"
+
+    - name: Show config
+      ansible.builtin.debug:
+        msg: "run={{ unr_run_id }} automation_enabled={{ unr_cfg.automation_enabled }} max_agent_restarts_24h={{ unr_cfg.max_agent_restarts_24h }}"
+
+    - name: Kill switch - stop here if automation is disabled (tickets are still created by the webhook)
+      ansible.builtin.meta: end_play
+      when: (unr_cfg.automation_enabled | string | lower) != 'true'
+
+    - name: Find held incidents whose change window has ended
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query={{ 'correlation_display=OEM_UNR^state=3^u_triage_outcome=PLANNED_CHANGE^u_held_changeISNOTEMPTY^u_held_change.end_date<javascript:gs.nowNoTZ()' | urlencode }}&sysparm_fields=sys_id,number&sysparm_limit=20"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: unr_held_raw
+
+    - name: Change window ended but OEM has not cleared - return to New for normal triage
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident/{{ held.sys_id }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          state: "1"
+          hold_reason: ""
+          u_held_change: ""
+          work_notes: "[AUTOMATION] Change window has ended and OEM has not cleared - returned to New for normal triage."
+        status_code: 200
+      loop: "{{ unr_held_raw.json.result | default([]) }}"
+      loop_control:
+        loop_var: held
+        label: "{{ held.number }}"
+
+    - name: Find New OEM_UNR incidents
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query={{ 'correlation_display=OEM_UNR^state=1^ORDERBYsys_created_on' | urlencode }}&sysparm_fields=sys_id,number,u_oem_host,u_oem_target_type,u_oem_target_name,u_oem_open_ids&sysparm_limit=20"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: unr_new_raw
+
+    - name: New incident list
+      ansible.builtin.set_fact:
+        unr_new: "{{ unr_new_raw.json.result | default([]) }}"
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ unr_new | length }} New OEM_UNR incident(s): {{ unr_new | map(attribute='number') | list }}"
+
+    - name: Triage each incident
+      ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_UNR_triage_one.yml
+      loop: "{{ unr_new }}"
+      loop_control:
+        loop_var: inc
+        label: "{{ inc.number }} {{ inc.u_oem_host }}"

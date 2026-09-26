@@ -1,0 +1,222 @@
+---
+###############################################################################
+# SNOW_UNR_triage_one.yml - included once per New OEM_UNR incident.
+# Claim -> diagnose (ping, SSH, agent, pmon, v$instance, listener) ->
+# classify -> act (agent restart only) or route -> record evidence.
+###############################################################################
+- name: "{{ inc.number }} - per-incident facts"
+  ansible.builtin.set_fact:
+    t_host: "{{ inc.u_oem_host }}"
+    t_inst: "{{ oracle_instance_map[inc.u_oem_host] | default({}) }}"
+    t_url: "{{ sn_instance }}/api/now/table/incident/{{ inc.sys_id }}"
+    t_restarts: 0
+    t_restart_ok: false
+    t_restart_out: ""
+
+- name: "{{ inc.number }} - SID and ORACLE_HOME for this host (from oracle_instance_map)"
+  ansible.builtin.set_fact:
+    t_sid: "{{ t_inst.oracle_sid | default('') }}"
+    t_ohome: "{{ t_inst.oracle_home | default('') }}"
+
+- name: "{{ inc.number }} - re-read state (skip if OEM already cleared it)"
+  ansible.builtin.uri:
+    url: "{{ t_url }}?sysparm_fields=state,urgency"
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers: { Accept: application/json }
+  register: t_fresh
+
+- name: "{{ inc.number }} - triage"
+  when: (t_fresh.json.result.state | string) == '1'
+  block:
+    - name: "{{ inc.number }} - claim (New -> In Progress)"
+      ansible.builtin.uri:
+        url: "{{ t_url }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          state: "2"
+          work_notes: "[AUTOMATION] Claimed by SNOW_UNR_dispatcher run {{ unr_run_id }} - starting triage of {{ t_host }}."
+        status_code: 200
+
+    - name: "{{ inc.number }} - ping"
+      ansible.builtin.command: "ping -c 3 -W 2 {{ t_host }}"
+      register: t_ping
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ inc.number }} - SSH"
+      ansible.builtin.command: "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no oracle@{{ t_host }} echo ssh_ok"
+      register: t_ssh
+      changed_when: false
+      failed_when: false
+
+    - name: "{{ inc.number }} - build remote diagnostic script"
+      ansible.builtin.set_fact:
+        t_script: |
+          EMCTL={{ unr_emctl }}
+          if timeout 60 $EMCTL status agent 2>/dev/null | grep -q "Agent is Running and Ready"; then echo AGENT=UP; else echo AGENT=DOWN; fi
+          SID="{{ t_sid }}"; OH="{{ t_ohome }}"
+          if [ -z "$SID" ]; then echo PMON=NA; echo INSTANCE=NA; echo LISTENER=NA; exit 0; fi
+          export ORACLE_SID=$SID ORACLE_HOME=$OH PATH=$OH/bin:$PATH
+          if ps -ef | grep -q "[o]ra_pmon_${SID}\$"; then echo PMON=UP; else echo PMON=DOWN; fi
+          INST=$(timeout 60 sqlplus -s / as sysdba <<'SQL'
+          set head off feed off pages 0 verify off
+          select status||'/'||database_status from v$instance;
+          exit
+          SQL
+          )
+          echo "INSTANCE=$(echo "$INST" | tr -d ' \n' | cut -c1-60)"
+          if timeout 30 lsnrctl status 2>&1 | grep -q "The command completed successfully"; then echo LISTENER=UP; else echo LISTENER=DOWN; fi
+          echo "UPTIME=$(uptime | tr -s ' ')"
+
+    - name: "{{ inc.number }} - remote diagnostics (single SSH, script on stdin)"
+      ansible.builtin.shell: "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no oracle@{{ t_host }} bash -s"
+      args:
+        stdin: "{{ t_script }}"
+      register: t_diag
+      changed_when: false
+      failed_when: false
+      when: t_ssh.rc == 0
+
+    - name: "{{ inc.number }} - parse diagnostics"
+      ansible.builtin.set_fact:
+        t_agent: "{{ ((t_diag.stdout | default('') | regex_search('AGENT=(\\S+)', '\\1')) or ['NA']) | first }}"
+        t_pmon: "{{ ((t_diag.stdout | default('') | regex_search('PMON=(\\S+)', '\\1')) or ['NA']) | first }}"
+        t_instance: "{{ ((t_diag.stdout | default('') | regex_search('INSTANCE=(\\S+)', '\\1')) or ['NA']) | first }}"
+        t_listener: "{{ ((t_diag.stdout | default('') | regex_search('LISTENER=(\\S+)', '\\1')) or ['NA']) | first }}"
+        t_uptime: "{{ ((t_diag.stdout | default('') | regex_search('UPTIME=(.*)', '\\1')) or ['uptime n/a']) | first }}"
+
+    - name: "{{ inc.number }} - classify"
+      ansible.builtin.set_fact:
+        t_outcome: >-
+          {%- if t_ssh.rc != 0 and t_ping.rc != 0 -%}HOST_DOWN
+          {%- elif t_ssh.rc != 0 -%}SSH_FAILING
+          {%- elif t_pmon == 'DOWN' -%}INSTANCE_DOWN
+          {%- elif t_pmon == 'UP' and not t_instance.startswith('OPEN') -%}INSTANCE_NOT_OPEN
+          {%- elif t_listener == 'DOWN' -%}LISTENER_DOWN
+          {%- elif t_agent == 'DOWN' -%}AGENT_ONLY
+          {%- else -%}TRANSIENT{%- endif -%}
+
+    - name: "{{ inc.number }} - evidence text"
+      ansible.builtin.set_fact:
+        t_evidence: |-
+          [AUTOMATION] Triage result: {{ t_outcome }}
+          Host {{ t_host }}  ping: {{ 'ok' if t_ping.rc == 0 else 'NO REPLY' }}  ssh: {{ 'ok' if t_ssh.rc == 0 else 'FAILED' }}
+          Agent: {{ t_agent }}   pmon ({{ t_sid if t_sid else 'n/a' }}): {{ t_pmon }}   v$instance: {{ t_instance }}   listener: {{ t_listener }}
+          {{ t_uptime }}
+
+    # ---------------- AGENT_ONLY: guarded restart ----------------
+    - name: "{{ inc.number }} - count automatic agent restarts on this host in last 24h"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query={{ ('u_oem_host=' ~ t_host ~ '^u_auto_action=Agent restart^sys_created_on>=javascript:gs.hoursAgoStart(24)') | urlencode }}&sysparm_fields=number"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: t_rc
+      when: t_outcome == 'AGENT_ONLY'
+
+    - name: "{{ inc.number }} - restart count"
+      ansible.builtin.set_fact:
+        t_restarts: "{{ t_rc.json.result | length }}"
+      when: t_outcome == 'AGENT_ONLY'
+
+    - name: "{{ inc.number }} - restart the agent (stop/start, verify)"
+      ansible.builtin.shell: "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no oracle@{{ t_host }} bash -s"
+      args:
+        stdin: |
+          EMCTL={{ unr_emctl }}
+          timeout 120 $EMCTL stop agent >/dev/null 2>&1
+          timeout 240 $EMCTL start agent 2>&1 | tail -2
+          sleep 10
+          timeout 60 $EMCTL status agent 2>&1 | grep -E "Agent is Running|Heartbeat Status|Last successful heartbeat"
+      register: t_restart
+      changed_when: true
+      failed_when: false
+      when: t_outcome == 'AGENT_ONLY' and (t_restarts | int) < (unr_cfg.max_agent_restarts_24h | int)
+
+    - name: "{{ inc.number }} - restart result"
+      ansible.builtin.set_fact:
+        t_restart_ok: "{{ 'Agent is Running and Ready' in (t_restart.stdout | default('')) }}"
+        t_restart_out: "{{ t_restart.stdout | default('') }}"
+      when: t_restart is defined and t_restart.stdout is defined
+
+    # ---------------- decide: fixed, waiting, or route ----------------
+    - name: "{{ inc.number }} - decide route"
+      ansible.builtin.set_fact:
+        t_route_key: >-
+          {%- if t_outcome == 'AGENT_ONLY' -%}
+            {%- if (t_restarts | int) >= (unr_cfg.max_agent_restarts_24h | int) -%}AGENT_RESTART_LIMIT
+            {%- elif not (t_restart_ok | bool) -%}AGENT_RESTART_FAILED
+            {%- else -%}NONE{%- endif -%}
+          {%- elif t_outcome == 'TRANSIENT' -%}NONE
+          {%- else -%}{{ t_outcome }}{%- endif -%}
+
+    - name: "{{ inc.number }} - record: agent restarted"
+      ansible.builtin.uri:
+        url: "{{ t_url }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          u_triage_outcome: "AGENT_ONLY"
+          u_auto_action: "Agent restart"
+          work_notes: "{{ t_evidence }}\nAction: emctl stop/start agent (automatic restart {{ (t_restarts | int) + 1 }} of {{ unr_cfg.max_agent_restarts_24h | int }} allowed in 24h)\n{{ t_restart_out }}\nAwaiting OEM Clear to resolve this incident."
+        status_code: 200
+      when: t_outcome == 'AGENT_ONLY' and t_route_key == 'NONE'
+
+    - name: "{{ inc.number }} - record: transient, waiting for OEM Clear"
+      ansible.builtin.uri:
+        url: "{{ t_url }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          u_triage_outcome: "TRANSIENT"
+          u_auto_action: "Waited for Clear"
+          work_notes: "{{ t_evidence }}\nAll checks healthy - no action taken. Waiting for OEM Clear to resolve this incident."
+        status_code: 200
+      when: t_outcome == 'TRANSIENT'
+
+    - name: "{{ inc.number }} - look up assignment group for routing"
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/sys_user_group?sysparm_query={{ ('name=' ~ unr_routes[t_route_key].group) | urlencode }}&sysparm_fields=sys_id,name"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: t_grp
+      when: t_route_key != 'NONE'
+
+    - name: "{{ inc.number }} - record: route to team"
+      ansible.builtin.uri:
+        url: "{{ t_url }}"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          assignment_group: "{{ (t_grp.json.result | first).sys_id | default('') }}"
+          urgency: "{{ [unr_routes[t_route_key].urgency | int, t_fresh.json.result.urgency | int] | min }}"
+          u_triage_outcome: "{{ t_route_key }}"
+          u_auto_action: "None - escalated"
+          work_notes: "{{ t_evidence }}\n{{ t_restart_out }}\nROUTED to {{ unr_routes[t_route_key].group }} (urgency {{ unr_routes[t_route_key].urgency }}): {{ unr_routes[t_route_key].text }}"
+        status_code: 200
+      when: t_route_key != 'NONE'
+
+    - name: "{{ inc.number }} - summary"
+      ansible.builtin.debug:
+        msg: "{{ inc.number }} {{ t_host }} outcome={{ t_outcome }} route={{ t_route_key }} restarts_24h={{ t_restarts }} restart_ok={{ t_restart_ok }}"

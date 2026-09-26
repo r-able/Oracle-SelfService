@@ -1,0 +1,231 @@
+---
+###############################################################################
+# SNOW_UNR_rca_one.yml - included once per incident by SNOW_UNR_rca.yml.
+# Gather facts -> deterministic classification -> Ollama narrative ->
+# grounding check -> work notes + u_rca_state.
+###############################################################################
+- name: "{{ r.number }} - base facts"
+  ansible.builtin.set_fact:
+    r_url: "{{ sn_instance }}/api/now/table/incident/{{ r.sys_id }}"
+    r_outcome: "{{ r.u_triage_outcome | default('', true) | trim or 'NOT_TRIAGED' }}"
+    r_action: "{{ r.u_auto_action | default('', true) | trim or 'none' }}"
+    r_duration: >-
+      {%- if r.resolved_at | default('') | length > 0 -%}
+      {%- set s = ((r.resolved_at | to_datetime('%Y-%m-%d %H:%M:%S')) - (r.opened_at | to_datetime('%Y-%m-%d %H:%M:%S'))).total_seconds() | int -%}
+      {{ s // 60 }} min {{ s % 60 }} s
+      {%- else -%}still open{%- endif -%}
+    r_change: >-
+      {%- if r.get('u_held_change.number','') | length > 0 -%}
+      {{ r.get('u_held_change.number','') }} "{{ r.get('u_held_change.short_description','') }}" (window {{ r.get('u_held_change.start_date','') }} to {{ r.get('u_held_change.end_date','') }} UTC)
+      {%- else -%}none{%- endif -%}
+
+- name: "{{ r.number }} - classification (deterministic)"
+  ansible.builtin.set_fact:
+    r_cat: "{{ rca_catalog[r_outcome] | default({'category': 'Unclassified (' ~ r_outcome ~ ')', 'recovered_by': 'not recorded', 'db_fault': false, 'host_fault': true, 'guidance': 'Unknown triage outcome - describe only what the timeline shows.'}) }}"
+
+# ---------------- event timeline (oldest first) ----------------
+- name: "{{ r.number }} - work-note timeline from sys_journal_field"
+  ansible.builtin.uri:
+    url: "{{ sn_instance }}/api/now/table/sys_journal_field?sysparm_query={{ ('element_id=' ~ r.sys_id ~ '^element=work_notes^ORDERBYsys_created_on') | urlencode }}&sysparm_fields=sys_created_on,value&sysparm_limit=200"
+    method: GET
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    headers: { Accept: application/json }
+  register: r_journal
+  failed_when: false
+
+- name: "{{ r.number }} - timeline entries (skipping earlier AI notes)"
+  ansible.builtin.set_fact:
+    r_tl_list: "{{ (r_journal.json.result | default([])) | rejectattr('value', 'match', '\\[AI (RCA|EXEC LOG)\\]') | list }}"
+    r_fb_text: ""
+    r_root_event: "not recorded"
+    r_timeline_order: "oldest first, UTC"
+
+- name: "{{ r.number }} - collapse repeated notes (a flapping ticket repeats the same text)"
+  ansible.builtin.set_fact:
+    r_tl_dedup: >-
+      {%- set seen = {} -%}{%- set out = [] -%}
+      {%- for n in r_tl_list -%}
+      {%- if n.value in seen -%}{%- set _ = seen.update({n.value: seen[n.value] + 1}) -%}
+      {%- else -%}{%- set _ = seen.update({n.value: 1}) -%}{%- set _ = out.append(n) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set res = [] -%}
+      {%- for n in out -%}{%- set _ = res.append({'sys_created_on': n.sys_created_on, 'value': n.value ~ ((' (repeated ' ~ seen[n.value] ~ 'x)') if seen[n.value] > 1 else '')}) -%}{%- endfor -%}
+      {{ res }}
+
+- name: "{{ r.number }} - one line per note: '<time> UTC | <text>'"
+  ansible.builtin.set_fact:
+    r_tl_lines: "{{ r_tl_dedup | map(attribute='sys_created_on') | zip(r_tl_dedup | map(attribute='value') | map('regex_replace', '\\s*\\n\\s*', ' / ') | map('truncate', 450)) | map('join', ' UTC | ') | list }}"
+    r_root_event: "{{ ((r_tl_list | map(attribute='value') | select('match', '\\[OEM FIRE\\]') | first | default('')) | regex_replace('\\s*\\n.*', '', multiline=False) | regex_replace('^\\[OEM FIRE\\]\\s*', '') | truncate(200)) or 'not recorded' }}"
+
+# Fallback if the service account cannot read sys_journal_field (ACL):
+# the incident's own work_notes display value is readable with incident
+# read access, but it comes back newest-first. Earlier AI notes are
+# stripped so a replay never feeds the model its own previous output.
+- name: "{{ r.number }} - fallback timeline via incident work_notes display value"
+  when: r_tl_list | length == 0
+  block:
+    - name: "{{ r.number }} - read work_notes display value"
+      ansible.builtin.uri:
+        url: "{{ r_url }}?sysparm_fields=work_notes&sysparm_display_value=true"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: r_wn
+
+    # Display value is newest-first, so all earlier AI notes sit at the top.
+    # AI EXEC LOG notes embed a whole previous prompt - including lines that
+    # look exactly like real journal headers - so header-based splitting
+    # alone cannot strip them (that leak made the model copy its own
+    # previous answer). Instead: skip past the LAST '--- RAW RESPONSE ---'
+    # (the oldest exec log, which is complete), then to the next real
+    # header, then drop any remaining [AI ...] blocks (RCA notes embed
+    # nothing). If anything AI-shaped survives, withhold the timeline.
+    - name: "{{ r.number }} - strip earlier AI notes from the display value"
+      ansible.builtin.set_fact:
+        r_wn_text: "{{ r_wn.json.result.work_notes | default('') }}"
+
+    - name: "{{ r.number }} - cut to genuine notes"
+      ansible.builtin.set_fact:
+        r_wn_clean: >-
+          {%- set t = r_wn_text -%}
+          {%- set i = t.rfind('--- RAW RESPONSE ---') -%}
+          {%- if i >= 0 -%}{%- set t = t[i:] | regex_replace('(?s)\A.*?(?=^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} - )', '', multiline=True) -%}{%- endif -%}
+          {{ t | regex_replace('(?ms)^[^\n]*\(Work notes\)\n\[AI (RCA|EXEC LOG)\].*?(?=^\d{4}-\d{2}-\d{2} |\Z)', '') | trim }}
+
+    - name: "{{ r.number }} - use it (or withhold it if AI text survived)"
+      ansible.builtin.set_fact:
+        r_fb_text: >-
+          {{ ('(timeline withheld: earlier AI notes could not be separated from real notes - use the FACTS only)')
+             if ('[AI RCA]' in r_wn_clean or '[AI EXEC LOG]' in r_wn_clean or 'RAW RESPONSE' in r_wn_clean)
+             else (r_wn_clean | truncate(6000)) }}
+        r_timeline_order: "NEWEST FIRST, instance display time zone"
+        r_root_event: "{{ (r_wn_clean | regex_findall('\\[OEM FIRE\\]\\s*([^\\n]*)') | last | default('not recorded')) | truncate(200) }}"
+
+# ---------------- prompt ----------------
+- name: "{{ r.number }} - build prompt"
+  ansible.builtin.set_fact:
+    r_prompt: |-
+      You are writing the root-cause analysis note for a resolved ServiceNow incident about an Oracle Enterprise Manager (OEM) availability alert. Use ONLY the facts below. Do not invent error messages, causes, commands, people, or actions. If something is not in the facts, leave it out.
+
+      FACTS
+      Incident: {{ r.number }}   Host: {{ r.u_oem_host }}
+      Opened: {{ r.opened_at }} UTC   Resolved: {{ r.resolved_at | default('not yet', true) }} UTC   Duration: {{ r_duration }}
+      Root-cause category (decided by automation, do not change it): {{ r_cat.category }}
+      Recovered by: {{ r_cat.recovered_by }}
+      Root event (the first OEM alert, which the others followed from): {{ r_root_event }}
+      Automation action taken: {{ r_action }}
+      Related change request: {{ r_change }}
+      Meaning of this category: {{ r_cat.guidance }}
+
+      HOW OEM REPORTS THIS
+      The OEM Management Agent on the host monitors the host, the database and the listener. When the agent or the host is down, OEM marks the other targets as "AGENT DOWN" or "UP (UNMONITORED)". Those alerts are symptoms of lost monitoring, not separate failures. Describe the outage and the recovery in terms of the root event's target (for example "the agent was restarted", not "the host was recovered"). {% if not r_cat.db_fault %}In this incident the database and listener did NOT fail - never say they failed, crashed, or went down.{% endif %}{% if not r_cat.host_fault %} The host itself stayed up - never say the host went down or was recovered.{% endif %}
+
+
+      EVENT TIMELINE ({{ r_timeline_order }})
+      {% if r_tl_lines | length > 0 %}
+      {% for l in r_tl_lines %}
+      {{ l }}
+      {% endfor %}
+      {% else %}
+      {{ r_fb_text }}
+      {% endif %}
+
+      Write 4 to 6 plain sentences, no headers, no bullet points, no preamble, in the voice of a DBA writing for other DBAs. Begin with the category. Cover what happened, the root cause, how it was recovered, how long it lasted, and whether any follow-up is needed.
+
+# ---------------- generate ----------------
+- name: "{{ r.number }} - call Ollama"
+  ansible.builtin.uri:
+    url: "{{ rca_ollama_host }}/api/generate"
+    method: POST
+    body_format: json
+    body:
+      model: "{{ rca_ollama_model }}"
+      prompt: "{{ r_prompt }}"
+      stream: false
+      keep_alive: "30m"
+      options:
+        temperature: 0.2
+        num_predict: 400
+    timeout: "{{ rca_ollama_timeout | int }}"
+  register: r_llm
+  ignore_errors: true
+
+- name: "{{ r.number }} - result"
+  ansible.builtin.set_fact:
+    r_ai_ok: "{{ (r_llm is succeeded) and ((r_llm.json.response | default('') | trim | length) > 0) }}"
+    r_text: "{{ r_llm.json.response | default('') | trim }}"
+
+- name: "{{ r.number }} - facts-only fallback text"
+  ansible.builtin.set_fact:
+    r_text: >-
+      {{ r_cat.category }} on {{ r.u_oem_host }}. {{ r_cat.guidance }}
+      Recovered by {{ r_cat.recovered_by }}. Automation action: {{ r_action }}.
+      Related change: {{ r_change }}. Duration: {{ r_duration }}.
+      (LLM writeup unavailable - raw facts only.)
+  when: not (r_ai_ok | bool)
+
+# ---------------- grounding check ----------------
+# Flags text claiming a database/listener failure when triage evidence says
+# there was none. Does not block - marks the ticket REVIEW for a human.
+- name: "{{ r.number }} - grounding check"
+  ansible.builtin.set_fact:
+    r_ground_hits: >-
+      {{ ([] if (r_cat.db_fault | bool) else
+          (r_text | lower | regex_findall('(?:database|instance|listener|perf|cdb1|pdb)[^.]{0,40}?(?:failed|crashed|went down|was down|were down|outage|stopped)')))
+         + ([] if (r_cat.host_fault | default(true) | bool) else
+          (r_text | lower | regex_findall('(?:host[^.]{0,40}?(?:went down|was down|crashed|rebooted|outage)|(?:recover|restor|reboot|restart)\w*\s+the\s+host)'))) }}
+
+- name: "{{ r.number }} - final state"
+  ansible.builtin.set_fact:
+    r_state: "{{ 'FALLBACK' if not (r_ai_ok | bool) else ('REVIEW' if (r_ground_hits | length) > 0 else 'DONE') }}"
+
+# ---------------- record ----------------
+- name: "{{ r.number }} - post RCA note and set u_rca_state"
+  ansible.builtin.uri:
+    url: "{{ r_url }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      u_rca_state: "{{ r_state }}"
+      work_notes: |-
+        [AI RCA] Category: {{ r_cat.category }} | Recovered by: {{ r_cat.recovered_by }} | Duration: {{ r_duration }}
+        {{ ('Written by ' ~ rca_ollama_model ~ ' (local Ollama, $0 per call) from the facts and timeline on this ticket.') if (r_ai_ok | bool) else 'AI writeup unavailable this run - raw facts only (not AI-generated).' }}
+
+        {{ r_text }}
+        {% if r_ground_hits | length > 0 %}
+
+        GROUNDING CHECK FAILED - offending text: {{ r_ground_hits | join(' | ') }}. Claims a database/listener/host failure the triage evidence does not support. Treat this writeup as unreliable; state set to REVIEW.
+        {% endif %}
+    status_code: 200
+
+- name: "{{ r.number }} - post AI execution log (prompt, raw response, real metrics)"
+  ansible.builtin.uri:
+    url: "{{ r_url }}"
+    method: PATCH
+    user: "{{ sn_username }}"
+    password: "{{ sn_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      work_notes: |-
+        [AI EXEC LOG] Provider: local Ollama ($0) | Model: {{ rca_ollama_model }} | Endpoint: {{ rca_ollama_host }}/api/generate
+        Prompt tokens: {{ r_llm.json.prompt_eval_count | default('unknown') }} | Generated tokens: {{ r_llm.json.eval_count | default('unknown') }} | Generation: {{ ((r_llm.json.eval_duration | default(0) | int) / 1000000000) | round(1) }}s | Total incl. load: {{ ((r_llm.json.total_duration | default(0) | int) / 1000000000) | round(1) }}s
+
+        --- PROMPT (indented) ---
+        {{ r_prompt | regex_replace('(?m)^', '    ') }}
+
+        --- RAW RESPONSE ---
+        {{ r_llm.json.response | default('') }}
+    status_code: 200
+  when: r_ai_ok | bool
+
+- name: "{{ r.number }} - summary"
+  ansible.builtin.debug:
+    msg: "{{ r.number }} {{ r.u_oem_host }} outcome={{ r_outcome }} rca_state={{ r_state }} duration={{ r_duration }} grounding_hits={{ r_ground_hits }}"

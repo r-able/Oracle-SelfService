@@ -23,7 +23,7 @@
   become: true
   become_user: "{{ oracle_os_user | default('oracle') }}"
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
 
   tasks:
     # --- SENSE (today's reading) --------------------------------------
@@ -132,7 +132,7 @@
   connection: local
   gather_facts: false
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
   vars:
     forecast: "{{ hostvars[oracle_target_host].forecast }}"
 

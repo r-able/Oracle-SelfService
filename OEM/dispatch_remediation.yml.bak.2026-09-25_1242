@@ -18,7 +18,7 @@
   connection: local
   gather_facts: false
   vars_files:
-    - /etc/ansible/vars/main.yml
+    - vars/demo_vars.yml
 
   tasks:
     - name: Query ServiceNow for New capacity-alert CRs

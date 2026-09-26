@@ -1,0 +1,94 @@
+# /etc/ansible/OEM/test_rca_field.yml
+# 1) u_rca_state read/write (already passed - kept as a regression check)
+# 2) incident.rfc diagnosis: is it empty on INC0010288, and can the
+#    service account write it? Setting it to CHG0033246 is the correct
+#    value for this ticket anyway, so the write is left in place.
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+  vars:
+    inc: INC0010288
+    chg: CHG0033246
+  tasks:
+    # ---------------- 1) u_rca_state ----------------
+    - name: Read u_rca_state
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query=number={{ inc }}&sysparm_fields=sys_id,number,u_rca_state"
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: rd
+
+    - name: u_rca_state exists
+      ansible.builtin.assert:
+        that: "'u_rca_state' in rd.json.result[0]"
+        fail_msg: "u_rca_state not returned - field missing or misnamed"
+        success_msg: "u_rca_state exists, current value '{{ rd.json.result[0].u_rca_state }}'"
+
+    # ---------------- 2) rfc ----------------
+    - name: Read rfc as stored (raw sys_id + dot-walked number)
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident/{{ rd.json.result[0].sys_id }}?sysparm_fields=rfc,rfc.number,rfc.end_date"
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: rf_before
+
+    - name: rfc BEFORE
+      ansible.builtin.debug:
+        msg: "rfc='{{ rf_before.json.result.rfc | default('') }}' rfc.number='{{ rf_before.json.result['rfc.number'] | default('(not returned)') }}'"
+
+    - name: Look up the change sys_id
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/change_request?sysparm_query=number={{ chg }}&sysparm_fields=sys_id,number,state,end_date"
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: ch
+
+    - name: Change must be readable by the service account
+      ansible.builtin.assert:
+        that: ch.json.result | length == 1
+        fail_msg: "{{ chg }} not visible to {{ sn_username }} - read ACL on change_request"
+        success_msg: "{{ chg }} sys_id={{ ch.json.result[0].sys_id }} state={{ ch.json.result[0].state }} end={{ ch.json.result[0].end_date }}"
+
+    - name: Try to write rfc
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident/{{ rd.json.result[0].sys_id }}?sysparm_fields=rfc"
+        method: PATCH
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        body_format: json
+        body: { rfc: "{{ ch.json.result[0].sys_id }}" }
+        headers: { Accept: application/json }
+      register: rf_write
+
+    - name: Re-read rfc AFTER (don't trust the PATCH echo)
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident/{{ rd.json.result[0].sys_id }}?sysparm_fields=rfc,rfc.number,rfc.end_date"
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: rf_after
+
+    - name: rfc AFTER
+      ansible.builtin.debug:
+        msg: "rfc='{{ rf_after.json.result.rfc | default('') }}' rfc.number='{{ rf_after.json.result['rfc.number'] | default('(not returned)') }}' rfc.end_date='{{ rf_after.json.result['rfc.end_date'] | default('(not returned)') }}'"
+
+    - name: Verdict
+      ansible.builtin.assert:
+        that: rf_after.json.result['rfc.number'] | default('') == chg
+        fail_msg: >-
+          rfc did NOT persist - {{ sn_username }} cannot write incident.rfc
+          (field-level write ACL or a business rule clearing it). PATCH returned
+          HTTP {{ rf_write.status }}. Next: as admin, set Change Request on
+          {{ inc }} by hand and re-run; if that sticks, it is the account's ACL.
+        success_msg: >-
+          rfc write works now. If BEFORE was empty, the triage PATCH failed for
+          another reason (check the dispatcher log for the hold task at 20:08:22).

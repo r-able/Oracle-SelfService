@@ -1,0 +1,131 @@
+---
+###############################################################################
+# SNOW_UNR_rca.yml - AI root-cause writeup for resolved OEM_UNR incidents.
+#
+# Runs SEPARATELY from SNOW_UNR_dispatcher.yml (own cron entry, own lock):
+# a CPU-bound Ollama generation can take ~2 minutes, and inside the
+# dispatcher's flock that would delay triage of brand-new outages.
+#
+# Design rule: the RCA category, the root event and "recovered by" are
+# decided DETERMINISTICALLY from the triage fields (u_triage_outcome,
+# u_auto_action, u_held_change). The LLM only turns supplied facts into a narrative.
+# A post-generation grounding check flags any text that claims a database
+# or listener failure the triage evidence does not support.
+#
+#   Normal (cron): ansible-playbook SNOW_UNR_rca.yml
+#   Replay:        ansible-playbook SNOW_UNR_rca.yml -e rca_incident=INC0010288
+#                  (ignores u_rca_state, so it re-runs on an already-done ticket)
+#
+# Requires one new incident field: u_rca_state (String, 20)
+#   values written: DONE | REVIEW (grounding check tripped) | FALLBACK (LLM failed)
+###############################################################################
+- name: OEM Unreachable - AI RCA for resolved incidents
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - /etc/ansible/vars/main.yml
+  vars:
+    rca_max_per_run: 3
+    rca_lookback_hours: 48
+    rca_ollama_host: "{{ ollama_host | default('http://localhost:11434') }}"
+    rca_ollama_model: "{{ ollama_model | default('llama3.1:8b') }}"
+    # Own timeout, deliberately NOT the shared ollama_timeout_sec: the first
+    # real replay took 251.6s (cold load + 1,384-token prompt on CPU).
+    rca_ollama_timeout: 600
+
+    # Deterministic meaning of each triage outcome. 'db_fault' = the triage
+    # evidence itself shows a database/listener problem, so the grounding
+    # check allows the text to say so.
+    rca_catalog:
+      PLANNED_CHANGE:
+        category: "Planned maintenance"
+        recovered_by: "the change implementer, as planned"
+        db_fault: false
+        host_fault: true
+        guidance: "Expected outage inside an approved change window. Not a fault. No follow-up needed beyond the change itself."
+      AGENT_ONLY:
+        category: "OEM agent failure - auto-remediated"
+        recovered_by: "automation (emctl stop/start of the OEM Management Agent)"
+        db_fault: false
+        host_fault: false
+        guidance: "Only the OEM Management Agent was down; triage found host, database and listener healthy - the host itself never went down. The other target alerts were a monitoring blind spot, not outages."
+      TRANSIENT:
+        category: "Transient - self-recovered"
+        recovered_by: "nobody - it recovered without intervention"
+        db_fault: false
+        host_fault: false
+        guidance: "Every check was healthy when triage ran. Likely a brief network or agent blip. Only worth follow-up if it repeats."
+      NOT_TRIAGED:
+        category: "Transient - cleared before triage"
+        recovered_by: "nobody recorded - OEM cleared it before automation triage ran"
+        db_fault: false
+        host_fault: true
+        guidance: "OEM cleared the alert before triage started. No action was taken by automation. Do not claim any action or cause."
+      AGENT_RESTART_LIMIT:
+        category: "Repeat OEM agent failure - escalated"
+        recovered_by: "the DBA team (their manual action is not recorded by automation)"
+        db_fault: false
+        host_fault: false
+        guidance: "The automatic agent restart limit for this host was reached, so automation did not act. Follow-up: find out why this agent keeps failing."
+      AGENT_RESTART_FAILED:
+        category: "OEM agent failure - restart failed, escalated"
+        recovered_by: "the DBA team (their manual action is not recorded by automation)"
+        db_fault: false
+        host_fault: false
+        guidance: "Automation restarted the agent but it did not come back. Follow-up: agent logs on the host."
+      HOST_DOWN:
+        category: "Host outage"
+        recovered_by: "the infrastructure team (their manual action is not recorded by automation)"
+        db_fault: false
+        host_fault: true
+        guidance: "The host answered neither ping nor SSH. Database and listener alerts were consequences of the host being down, not separate failures."
+      SSH_FAILING:
+        category: "Host partially reachable (SSH failing)"
+        recovered_by: "the infrastructure team (their manual action is not recorded by automation)"
+        db_fault: false
+        host_fault: true
+        guidance: "Host answered ping but not SSH, so database state could not be checked."
+      INSTANCE_DOWN:
+        category: "Database instance down"
+        recovered_by: "the DBA team (their manual action is not recorded by automation)"
+        db_fault: true
+        host_fault: false
+        guidance: "Triage found no pmon process. Automation never starts databases. Follow-up: alert log for why it stopped."
+      INSTANCE_NOT_OPEN:
+        category: "Database instance not open"
+        recovered_by: "the DBA team (their manual action is not recorded by automation)"
+        db_fault: true
+        host_fault: false
+        guidance: "The instance process was running but the database was not OPEN. Follow-up: alert log."
+      LISTENER_DOWN:
+        category: "Listener down"
+        recovered_by: "the DBA team (their manual action is not recorded by automation)"
+        db_fault: true
+        host_fault: false
+        guidance: "The listener was down while the instance was up."
+
+  tasks:
+    - name: Candidate query (replay one ticket, or all resolved without an RCA)
+      ansible.builtin.set_fact:
+        rca_query: "{{ ('correlation_display=OEM_UNR^number=' ~ rca_incident) if (rca_incident is defined) else ('correlation_display=OEM_UNR^stateIN6,7^u_rca_stateISEMPTY^resolved_at>=javascript:gs.hoursAgoStart(' ~ rca_lookback_hours ~ ')^ORDERBYresolved_at') }}"
+
+    - name: Find incidents needing an RCA
+      ansible.builtin.uri:
+        url: "{{ sn_instance }}/api/now/table/incident?sysparm_query={{ rca_query | urlencode }}&sysparm_fields=sys_id,number,state,opened_at,resolved_at,u_oem_host,u_triage_outcome,u_auto_action,u_held_change.number,u_held_change.short_description,u_held_change.start_date,u_held_change.end_date,assignment_group.name&sysparm_limit={{ rca_max_per_run }}"
+        method: GET
+        user: "{{ sn_username }}"
+        password: "{{ sn_password }}"
+        force_basic_auth: true
+        headers: { Accept: application/json }
+      register: rca_raw
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "{{ rca_raw.json.result | length }} incident(s) for RCA: {{ rca_raw.json.result | map(attribute='number') | list }}"
+
+    - name: Write RCA for each incident
+      ansible.builtin.include_tasks: /etc/ansible/OEM/SNOW_UNR_rca_one.yml
+      loop: "{{ rca_raw.json.result | default([]) }}"
+      loop_control:
+        loop_var: r
+        label: "{{ r.number }} {{ r.u_oem_host }}"
